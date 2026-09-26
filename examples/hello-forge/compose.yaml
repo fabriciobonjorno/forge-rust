@@ -1,0 +1,20 @@
+# Runs the production image locally. This is a development convenience,
+# not a production orchestration contract.
+services:
+  app:
+    build: .
+    image: hello-forge:dev
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      FORGE_LOG: info
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Must exceed FORGE_SHUTDOWN_GRACE_SECS (15s by default).
+    stop_grace_period: 20s

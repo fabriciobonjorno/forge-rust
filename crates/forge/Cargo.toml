@@ -1,0 +1,20 @@
+[package]
+name = "forge"
+description = "Application runtime facade for Forge applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+forge-config = { path = "../forge-config" }
+forge-core = { path = "../forge-core" }
+forge-http = { path = "../forge-http" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

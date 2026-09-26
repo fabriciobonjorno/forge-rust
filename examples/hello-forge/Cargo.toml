@@ -1,0 +1,29 @@
+[package]
+name = "hello-forge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hello-forge"
+path = "src/main.rs"
+
+[dependencies]
+forge = { path = "../../crates/forge" }
+serde = { version = "1", features = ["derive"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+expect_used = "deny"
+unwrap_used = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

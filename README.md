@@ -1,0 +1,170 @@
+# Forge
+
+Forge is an opinionated Rust framework for long-lived services. It sets the
+architecture of the application it generates (hexagonal rings with an enforced
+dependency direction), the process lifecycle, secure defaults, and the delivery
+path, starting with a production-oriented container image. It does not replace
+Tokio, hyper, or Cargo. It builds on them and wires them together.
+
+Like `rails new` in Rails 8, `forge new` generates a `Dockerfile`,
+`.dockerignore`, a CI workflow and a Dependabot configuration by default, so a
+fresh application can be built, checked and run as a container from its first
+commit.
+
+## Status
+
+Forge is early and has not been released. It is not production-certified, and
+no performance results are published yet. The
+[performance targets](docs/performance-targets.md) are budgets to measure, not
+results.
+
+| Phase | Scope | State |
+| --- | --- | --- |
+| 0 | Architecture, ADRs, threat model, dependency and test policy | Done |
+| 1 | Runtime, CLI, configuration, HTTP, graceful shutdown, health, Docker | Implemented, unreleased |
+| 2+ | PostgreSQL, auth/tenancy, jobs/events, telemetry, OpenAPI, AI, hardening | Design only |
+
+See the [delivery sequence](docs/architecture.md#delivery-sequence-and-exit-criteria).
+
+## Quickstart
+
+Install the CLI from Git:
+
+```sh
+cargo install --locked --git https://github.com/fabriciobonjorno/forge-rust forge-cli
+```
+
+Create and run an application:
+
+```sh
+forge new shop
+cd shop
+cargo run
+curl localhost:3000/health/live
+```
+
+Build and run the container image. It is a distroless runtime running as a
+non-root user, with a built-in health check:
+
+```sh
+docker build -t shop .
+docker run --rm -p 3000:3000 shop
+```
+
+Or use the generated Compose file as a local convenience. It publishes the port
+on `127.0.0.1:3000` only:
+
+```sh
+docker compose up --build
+```
+
+> **Before the first tag:** generated applications depend on `forge` through the
+> Git tag `v<cli version>` (for example `v0.1.0`). Until that tag is pushed, the
+> dependency cannot resolve and `cargo run` fails in a freshly generated app.
+> Framework contributors generate against a local checkout instead:
+>
+> ```sh
+> cargo run -p forge-cli -- new shop --forge-path /absolute/path/to/forge-rust/crates/forge
+> ```
+>
+> A path dependency that points outside the application directory is not part
+> of the Docker build context, so `docker build` cannot use it directly.
+> `scripts/e2e-generated-app.sh` handles this by vendoring a copy of the
+> framework into the generated app.
+
+The full command reference is in [docs/cli.md](docs/cli.md). Container,
+Kubernetes and systemd deployment is covered in
+[docs/deployment.md](docs/deployment.md).
+
+## What a generated application gets
+
+- A plain Cargo package with `src/{domain,application,adapters,infrastructure,bootstrap}`
+  and a `tests/architecture.rs` test that fails when the domain or application
+  rings import forbidden layers or protocol crates.
+- `forge::App`: the framework owns the Tokio runtime, structured logging (JSON in
+  production), SIGTERM/SIGINT graceful shutdown with a drain deadline, and the
+  `/health`, `/health/live` and `/health/ready` routes.
+- Binary subcommands: `serve` (default), `healthcheck`, `version`, `help`.
+- Typed `FORGE_*` environment configuration. Unknown `FORGE_*` keys are
+  rejected at startup.
+- HTTP defaults: request and header-read timeouts, a body size limit, bounded
+  connections, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  and UUIDv7 `x-request-id`.
+- A multi-stage `Dockerfile`, `.dockerignore`, `compose.yaml` and a
+  `tests/container.rs` test that keeps the Dockerfile's Rust version in sync
+  with `rust-toolchain.toml` (skip all four with `--skip-docker`), plus `.github/workflows/ci.yml` and `.github/dependabot.yml`
+  (skip with `--skip-ci`).
+
+## Workspace layout
+
+```text
+crates/
+├── forge          # facade: forge::App, re-exports forge-core/config/http
+├── forge-core     # lifecycle, errors, UUIDv7 identifiers
+├── forge-config   # typed FORGE_* configuration and validation
+├── forge-http     # HTTP server, limits, health routes, request IDs
+└── forge-cli      # the `forge` executable and application generator
+examples/
+└── hello-forge    # committed `forge new` output; standalone package (not a
+                   # workspace member) with its own Cargo.lock; golden-tested
+scripts/
+└── e2e-generated-app.sh   # generated-app host + container end-to-end test
+docs/              # architecture, ADRs, policies, CLI and deployment guides
+```
+
+## Development
+
+The toolchain is pinned in `rust-toolchain.toml`, and rustup installs it on
+first use. CI runs these same commands (see `.github/workflows/ci.yml`):
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo test --workspace --doc --locked
+
+# Generated-app end-to-end test (requires bash, curl and Docker)
+bash scripts/e2e-generated-app.sh
+# Host checks only, skipping the container part
+FORGE_E2E_SKIP_DOCKER=1 bash scripts/e2e-generated-app.sh
+
+# examples/hello-forge is excluded from the workspace; check it like a user app
+cargo fmt --manifest-path examples/hello-forge/Cargo.toml --all -- --check
+cargo clippy --manifest-path examples/hello-forge/Cargo.toml --all-targets --locked -- -D warnings
+cargo test --manifest-path examples/hello-forge/Cargo.toml --all-targets --locked
+```
+
+`examples/hello-forge` must match generator output exactly; the golden test in
+`forge-cli` enforces this. Its `Cargo.lock` is not generator output: it is
+created separately, committed, and left untouched by regeneration. After an
+intentional template change, regenerate the example and review the diff:
+
+```sh
+FORGE_BLESS=1 cargo test -p forge-cli hello_forge_example_matches_generator_output
+git diff examples/hello-forge
+```
+
+When a dependency requirement in the template changes, also run
+`cargo update --manifest-path examples/hello-forge/Cargo.toml` so the
+`--locked` checks pass.
+
+Contribution rules:
+
+- New dependencies go through [admission review](docs/dependency-policy.md).
+- Decisions that affect public contracts, security or several crates need an
+  [ADR](docs/adr/README.md).
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Architecture Decision Records](docs/adr/README.md)
+- [CLI reference](docs/cli.md)
+- [Deployment](docs/deployment.md)
+- [Threat model](docs/threat-model.md)
+- [Dependency policy](docs/dependency-policy.md)
+- [Test strategy](docs/test-strategy.md)
+- [Performance targets](docs/performance-targets.md)
+
+## License
+
+The workspace manifest declares `MIT OR Apache-2.0`.

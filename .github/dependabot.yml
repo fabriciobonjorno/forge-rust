@@ -1,0 +1,34 @@
+# Dependency update pull requests for the framework repository.
+# Updates run the full CI gate; they are never merged without review
+# (see docs/dependency-policy.md).
+#
+# The Docker base images used by generated applications are defined in the
+# forge-cli generator source, not in a Dockerfile at this repository's root,
+# so Dependabot cannot update them here.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+
+  # examples/hello-forge is a standalone package outside the workspace with its
+  # own Cargo.lock. Its Cargo.toml is generator output enforced by a golden
+  # test, so only the lockfile may be updated here.
+  - package-ecosystem: cargo
+    directory: /examples/hello-forge
+    versioning-strategy: lockfile-only
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps(example)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"

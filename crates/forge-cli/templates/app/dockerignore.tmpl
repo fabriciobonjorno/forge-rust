@@ -1,0 +1,15 @@
+# Keep the image build context small and free of secrets.
+/.git
+/.github
+**/target
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+/Dockerfile
+/.dockerignore
+/compose.yaml
+/README.md
+# The builder image pins the same toolchain through RUST_VERSION;
+# tests/container.rs fails when the two versions drift apart.
+/rust-toolchain.toml

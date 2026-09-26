@@ -1,0 +1,33 @@
+//! Forge application facade.
+//!
+//! Generated applications depend on this crate only. [`App`] owns the process
+//! lifecycle: command-line dispatch, configuration loading, logging, the Tokio
+//! runtime, signal handling, graceful shutdown, and the container health probe.
+//!
+//! ```no_run
+//! use forge::http::{Method, Response, StatusCode};
+//!
+//! fn main() -> std::process::ExitCode {
+//!     forge::App::new("my-service")
+//!         .version(env!("CARGO_PKG_VERSION"))
+//!         .routes(|router| {
+//!             router.route(Method::GET, "/hello", |_| async {
+//!                 Response::new(StatusCode::OK, "hello")
+//!             })?;
+//!             Ok(())
+//!         })
+//!         .run()
+//! }
+//! ```
+
+mod app;
+mod cli;
+mod logging;
+mod probe;
+mod signal;
+
+pub use forge_config as config;
+pub use forge_core as core;
+pub use forge_http as http;
+
+pub use app::App;

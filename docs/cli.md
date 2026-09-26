@@ -1,0 +1,177 @@
+# Forge CLI Reference
+
+Status: Phase 1. This page documents the `forge` executable (crate `forge-cli`)
+and the subcommands built into every generated application binary.
+
+## Installation
+
+```sh
+cargo install --locked --git https://github.com/fabriciobonjorno/forge-rust forge-cli
+```
+
+`--locked` installs with the dependency graph from the repository's committed
+`Cargo.lock`. Framework contributors can use `cargo run -p forge-cli -- <command>`
+from a checkout.
+
+## Command summary
+
+```text
+forge id
+forge new <name> [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
+forge check
+forge test
+forge format
+forge lint
+forge build
+```
+
+The quality and build commands run `cargo` directly (no shell) in the current
+directory. They are thin wrappers, and the underlying Cargo commands are always
+valid to run yourself. A failed Cargo invocation makes `forge` exit with a
+non-zero status.
+
+## `forge id`
+
+Prints a new UUIDv7 identifier to standard output. UUIDv7 values sort by
+creation time and are Forge's default identifier format
+([ADR 0003](adr/0003-uuidv7-default-identifiers.md)).
+
+## `forge new <name>`
+
+Creates a new application in `./<name>`. `<name>` becomes the Cargo package name
+and the binary name. It must be a valid Cargo package name: start with a
+lowercase ASCII letter and use only lowercase letters, digits, `-` and `_`.
+`forge new` refuses to write into an existing path.
+
+| Flag | Effect |
+| --- | --- |
+| `--skip-docker` | Do not generate `Dockerfile`, `.dockerignore` or `compose.yaml`. |
+| `--skip-ci` | Do not generate `.github/workflows/ci.yml` or `.github/dependabot.yml`. |
+| `--skip-lockfile` | Do not run `cargo generate-lockfile` after generation. |
+| `--forge-path <PATH>` | Depend on a local `forge` crate by path instead of the Git tag. For framework contributors, similar to `rails new --dev`. |
+
+### The `forge` dependency
+
+By default the generated `Cargo.toml` depends on `forge` from this repository at
+Git tag `v<cli version>`, so an application is created against the same
+framework version as the CLI that generated it. Until a release tag such as
+`v0.1.0` is pushed, that dependency cannot resolve. Use `--forge-path` with a
+local checkout in the meantime.
+
+`--forge-path` writes a Cargo path dependency, which Cargo resolves relative to
+the generated application's directory. An absolute path avoids confusion. A path
+outside the application directory is not visible to `docker build`, because
+the build context is the application directory. Vendor the framework into the
+application first, as `scripts/e2e-generated-app.sh` does.
+
+### Lockfile
+
+After writing files, `forge new` runs `cargo generate-lockfile` in the new
+application unless `--skip-lockfile` is given. The generated Dockerfile builds
+with `--locked` and needs a committed `Cargo.lock`. If lockfile generation fails
+(for example, offline or before the release tag exists), the application is kept
+and `forge new` prints a warning explaining how to create the lockfile before
+running `docker build`.
+
+### Generated tree
+
+`forge new shop` produces (optional files annotated):
+
+```text
+shop/
+├── .dockerignore            # omitted with --skip-docker; excludes rust-toolchain.toml
+├── .github/                 # omitted with --skip-ci
+│   ├── dependabot.yml       #   cargo, docker, github-actions updates
+│   └── workflows/
+│       └── ci.yml           #   fmt check, clippy -D warnings, tests, image build
+├── .gitignore
+├── Cargo.lock               # omitted with --skip-lockfile (or if generation fails)
+├── Cargo.toml               # package `shop`, lib `app`, deps: forge, serde
+├── Dockerfile               # omitted with --skip-docker
+├── README.md
+├── compose.yaml             # omitted with --skip-docker; 127.0.0.1:3000, stop_grace_period 20s
+├── rust-toolchain.toml      # pinned to the framework toolchain
+├── src/
+│   ├── main.rs              # binary `shop`: calls app::bootstrap::run()
+│   ├── lib.rs               # library `app`: declares the rings
+│   ├── domain/
+│   ├── application/
+│   ├── adapters/
+│   ├── infrastructure/
+│   └── bootstrap/
+└── tests/
+    ├── architecture.rs      # ring import boundaries
+    └── container.rs         # omitted with --skip-docker; Dockerfile RUST_VERSION == toolchain
+```
+
+[`examples/hello-forge`](../examples/hello-forge) is the committed output of
+`forge new hello-forge --skip-ci --skip-lockfile --forge-path ../../crates/forge`
+and is the authoritative reference for exact file contents. A golden test in
+`forge-cli` fails if generator output drifts from it. Like a real user
+application, it is a standalone package outside the framework workspace. Its
+`Cargo.lock` is created separately and committed. Framework CI runs format,
+Clippy and tests against it.
+
+Notes on the generated package:
+
+- It is a standalone package with no `[workspace]` table.
+- `src/main.rs` only calls `app::bootstrap::run()`. The composition root in
+  `src/bootstrap/mod.rs` builds `forge::App`, which owns the Tokio runtime, so
+  the application never uses `#[tokio::main]`:
+
+  ```rust
+  pub fn run() -> ExitCode {
+      forge::App::new(env!("CARGO_PKG_NAME"))
+          .version(env!("CARGO_PKG_VERSION"))
+          .routes(crate::adapters::http::routes)
+          .run()
+  }
+  ```
+
+- `tests/architecture.rs` is a real test that scans source imports. It fails
+  when `src/domain` imports `application`, `adapters`, `infrastructure`,
+  `bootstrap`, `forge::http`, or protocol/runtime crates such as `tokio`,
+  `hyper` or `sqlx`, and when `src/application` imports `adapters`,
+  `infrastructure`, `bootstrap` or `forge::http`
+  ([ADR 0002](adr/0002-hexagonal-boundaries.md)).
+- `tests/container.rs` (generated only with the Docker assets) fails when the
+  Dockerfile's `ARG RUST_VERSION` differs from the channel in
+  `rust-toolchain.toml`. The builder image therefore always uses the same
+  toolchain as local builds. `.dockerignore` excludes `rust-toolchain.toml`,
+  so the builder image uses its preinstalled toolchain instead of downloading
+  components.
+- The Docker assets are described in [deployment](deployment.md#container-image).
+- No database service is generated. PostgreSQL arrives in Phase 2.
+
+## `forge check`, `forge test`, `forge format`, `forge lint`
+
+| Command | Runs |
+| --- | --- |
+| `forge check` | `cargo check --all-targets --all-features` |
+| `forge test` | `cargo test --all-targets --all-features` |
+| `forge format` | `cargo fmt --all` |
+| `forge lint` | `cargo clippy --all-targets --all-features -- -D warnings` |
+
+## `forge build`
+
+Runs `cargo build --release --locked`, producing `target/release/<name>`. This
+is the same release build the Dockerfile performs. It requires a `Cargo.lock`
+that is up to date with `Cargo.toml`.
+
+## Generated application binary
+
+Every application built with `forge::App` accepts these subcommands:
+
+| Command | Behavior |
+| --- | --- |
+| `serve` (default) | Loads and validates `FORGE_*` configuration, starts the HTTP server, and shuts down gracefully on SIGTERM/SIGINT. |
+| `healthcheck` | Sends `GET /health/live` to the loopback address on the configured port. Exits `0` if healthy, `1` otherwise. |
+| `version` | Prints the application version. |
+| `help` | Prints usage. |
+
+`healthcheck` exists because the distroless runtime image has no shell or
+`curl`. The Dockerfile's exec-form `HEALTHCHECK` runs `<binary> healthcheck`.
+Configuration variables are listed in
+[deployment](deployment.md#configuration).
+
+See also [ADR 0009](adr/0009-rails-style-generated-delivery-assets.md).

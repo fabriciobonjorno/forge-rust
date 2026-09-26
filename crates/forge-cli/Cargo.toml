@@ -1,0 +1,22 @@
+[package]
+name = "forge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Command-line tooling for the Forge application framework"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

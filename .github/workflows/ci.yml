@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+# Third-party actions are referenced by major-version tag during early
+# development. Per docs/dependency-policy.md, pin every action to a full commit
+# SHA (keeping the version as a trailing comment) before the first release.
+#
+# No toolchain action is used: rustup is preinstalled on GitHub-hosted runners,
+# and the first `cargo` invocation installs the channel and components pinned in
+# rust-toolchain.toml. (`rustup show` no longer installs it since rustup 1.28.)
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: cargo --version
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: cargo --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (warnings denied)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            examples/hello-forge
+      - name: Unit, integration and golden tests
+        run: cargo test --workspace --all-targets --locked
+      - name: Doctests
+        run: cargo test --workspace --doc --locked
+      # examples/hello-forge is a standalone package (excluded from the
+      # workspace) with its own Cargo.lock, checked like a real generated app.
+      - name: hello-forge format check
+        run: cargo fmt --manifest-path examples/hello-forge/Cargo.toml --all -- --check
+      - name: hello-forge clippy
+        run: cargo clippy --manifest-path examples/hello-forge/Cargo.toml --all-targets --locked -- -D warnings
+      - name: hello-forge tests
+        run: cargo test --manifest-path examples/hello-forge/Cargo.toml --all-targets --locked
+
+  e2e:
+    name: e2e (generated app, host and container)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: cargo --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Show Docker version
+        run: docker version
+      - name: Generated application end-to-end
+        run: bash scripts/e2e-generated-app.sh
