@@ -43,6 +43,11 @@ pub(crate) enum Command {
         #[arg(long, value_name = "PATH")]
         forge_path: Option<String>,
     },
+    /// Generate application artifacts.
+    Generate {
+        #[command(subcommand)]
+        generator: GenerateCommand,
+    },
     /// Type-check the current application.
     Check,
     /// Run the current application's tests.
@@ -53,4 +58,14 @@ pub(crate) enum Command {
     Lint,
     /// Build the optimized release binary from the locked dependency graph.
     Build,
+}
+
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum GenerateCommand {
+    /// Create a reversible SQL migration in migrations/.
+    Migration {
+        /// Human-readable migration name.
+        name: String,
+    },
 }
