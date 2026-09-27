@@ -1,84 +1,172 @@
 # AGENTS.md
 
-## Engineering Operating Mode
+## Mission
 
-This repository uses the global Codex engineering instructions plus the
-project-specific rules defined here.
+Build Forge as a serious, production-grade Rust application framework: Rails-level productivity with Rust safety, explicit architecture, secure defaults, cloud-native operations, and first-class AI infrastructure.
 
-### Mandatory workflow
+This repository is not a tutorial and must not accumulate placeholder crates, fake providers, duplicated implementations, or broad skeletons with no executable vertical behavior.
 
-UNDERSTAND → INSPECT → PLAN → IMPLEMENT → VERIFY → REVIEW
+## Mandatory workflow
 
-### Project rules
+UNDERSTAND → INSPECT → PLAN → IMPLEMENT → VERIFY → REVIEW → REPORT
 
-Add repository-specific rules below, for example:
+Before changing code:
 
--   architecture and module boundaries;
--   approved frameworks/libraries;
--   forbidden dependencies;
--   database access conventions;
--   API conventions;
--   security requirements;
--   naming conventions;
--   commands for lint/typecheck/test/build;
--   deployment constraints.
+1. Read the relevant ADRs, architecture, threat model, dependency policy, and tests.
+2. Inspect existing implementations and generated output before creating new abstractions.
+3. Identify the current delivery phase and its exit criteria.
+4. Prefer the smallest vertical slice that leaves executable software.
+5. Preserve user work and avoid unrelated refactors.
 
-### Before changing code
+## Architecture
 
-Inspect the relevant repository context first. Determine requested
-behavior, affected components, existing patterns, dependencies, tests,
-and potential regressions.
+Forge uses strict Hexagonal Architecture / Ports & Adapters.
 
-Search before creating. Reuse existing components and abstractions when
-appropriate.
+Generated applications have these rings:
 
-### Scope
+- `domain`: entities, value objects, domain services, events, typed domain errors.
+- `application`: commands, queries, use cases, and ports.
+- `adapters`: HTTP, persistence, messaging, storage, email, and AI translation.
+- `infrastructure`: database, cache, queue, telemetry, and security mechanisms.
+- `bootstrap`: the composition root and process lifecycle.
 
-Make the smallest coherent change that fully solves the request.
+Dependency direction is inward. Domain code must not depend on HTTP, SQLx, PostgreSQL, Redis, filesystems, cloud vendors, AI SDKs, Tokio, or outer application rings. Application code must not depend on concrete adapters or infrastructure.
 
-Do not refactor unrelated code, rename unrelated symbols, change public
-contracts unnecessarily, introduce abstractions without concrete need,
-or silently expand scope.
+Architecture tests are product code: a change that weakens dependency enforcement requires an ADR and explicit review.
 
-### Debugging
+## Rust rules
 
-REPRODUCE → INVESTIGATE → ROOT CAUSE → FIX → REGRESSION TEST → VERIFY
+Use Rust's strengths as architectural constraints, not decoration:
 
-Do not patch symptoms when the underlying cause can reasonably be
-identified.
+- ownership, borrowing, lifetimes, traits, generics, enums, and zero-cost abstractions;
+- typed errors rather than stringly typed failures;
+- typed IDs where entity confusion is possible;
+- compile-time validation and typestate only where they materially improve correctness;
+- explicit cancellation, deadlines, backpressure, bounded concurrency, and graceful shutdown.
 
-### Validation
+Do not use advanced Rust merely to demonstrate sophistication.
 
-Run the relevant project checks after implementation:
+Framework-authored code forbids unsafe Rust by default. If unsafe becomes unavoidable, isolate it, document invariants and soundness reasoning, test it, and require dedicated review.
 
-1.  targeted tests
-2.  formatter
-3.  lint
-4.  typecheck/static analysis
-5.  broader tests when justified
-6.  build when applicable
+Avoid `unwrap()` and `expect()` in production paths unless a documented invariant makes failure impossible. Do not suppress warnings or Clippy findings merely to make CI green.
 
-Then inspect version-control status and the final diff.
+## Identifiers
 
-Never claim a check passed unless it was actually executed successfully.
+UUIDv7 is mandatory by default. Never introduce UUIDv4 as the framework default.
 
-### Safety
+Generated entities and framework identity helpers must naturally support UUIDv7 generation, validation, serialization, sorting, database integration, test helpers, and CLI generation.
 
-Never expose secrets or credentials. Preserve existing user changes.
-Avoid destructive operations unless required and explicitly justified.
+## Persistence
 
-### Definition of Done
+Forge is PostgreSQL-first. SQLx is the initial low-level adapter.
 
-A task is complete only when the requested behavior is implemented,
-relevant validation passes, the final diff is reviewed, accidental
-changes are absent, and unresolved risks are disclosed.
+Do not introduce a custom ORM that hides SQL. SQLx/vendor types must not leak into stable domain/application contracts unless an ADR explicitly accepts that coupling.
 
-### Final response
+Required persistence capabilities include migrations, transactions, pooling, advisory locks, optimistic locking, cursor pagination, JSONB, constraints, indexes, PostgreSQL RLS, and checked queries where practical.
+
+Multi-database support is not a Phase 2 goal. Another primary database requires a separate capability and architecture review.
+
+## Tenancy and security
+
+Multi-tenancy is first-class and fail-closed.
+
+Tenant-sensitive operations require explicit tenant context. Never silently fall back to a global tenant. PostgreSQL RLS is defense in depth, not a replacement for application authorization.
+
+Security is secure-by-default. Reuse maintained, audited crates for cryptography and password/session primitives. Never implement custom cryptography.
+
+AI or tool execution must follow:
+
+Intent → Policy → Authorization → Validation → Approval when required → Execution → Audit
+
+AI-generated code or commands are untrusted input and must never gain unrestricted filesystem, process, network, or secret access.
+
+## Async and lifecycle
+
+Every async task has an owner and lifecycle. Avoid detached tasks, unbounded channels, hidden background work, and unbounded concurrency.
+
+Tokio is the initial runtime implementation, but application contracts should not unnecessarily expose runtime-specific types.
+
+## Delivery phases
+
+Work vertically. Do not start a later phase while an earlier phase is left in a broken or placeholder state.
+
+1. Runtime, CLI, configuration, HTTP, health, graceful shutdown, Docker.
+2. UUIDv7, PostgreSQL, migrations, repositories, transactions.
+3. Authentication, authorization, RBAC, tenancy, RLS, audit logging.
+4. Jobs, scheduler, events, outbox, idempotent consumers.
+5. End-to-end logs, traces, metrics, correlation.
+6. Contract-derived OpenAPI, conservative code generation, macros.
+7. AI providers, routing, streaming, accounting, secure execution.
+8. Security hardening and abuse tests.
+9. Performance profiling and optimization.
+10. Production certification, SBOM, signed artifacts, release checklist.
+
+Every phase must end with executable software and passing applicable gates.
+
+## Dependencies
+
+Dependencies are security-sensitive.
+
+Before adding a direct dependency, evaluate maintenance, advisory history, unsafe/native code, build scripts/proc macros, license, MSRV, transitive impact, default features, public API leakage, and replacement strategy.
+
+Prefer focused mature crates. Keep dependency graphs small. Do not add a dependency until the same change uses it.
+
+## Generators and CLI
+
+Generated code is production code.
+
+Generators must be deterministic, refuse unsafe overwrites, render every placeholder, preserve architecture boundaries, and produce code that formats, builds, tests, migrates, starts, serves, and shuts down.
+
+Never generate duplicate or temporary names such as `*_v2`, `*_final`, `*_new`, or `*_backup`.
+
+CLI behavior should remain transparent wrappers around documented Rust/Cargo operations where possible.
+
+## Required validation
+
+Run the narrowest relevant checks first, then broader gates:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo test --workspace --doc --locked
+```
+
+For generated applications also run the golden/generated-app checks and, when relevant, the host/container E2E path in `scripts/e2e-generated-app.sh`.
+
+Database, security, tenancy, jobs/events, AI, and release changes require their subsystem-specific integration/security gates described in `docs/test-strategy.md`.
+
+Never claim a check passed unless it actually executed successfully.
+
+## Agent orchestration
+
+Use the least expensive/capable agent or model that can safely solve the subtask:
+
+- simple searches, mechanical edits, formatting, and isolated tests: fast/low-cost agent;
+- ordinary implementation and debugging: standard engineering agent;
+- architecture, security boundaries, concurrency, migrations, tenancy/RLS, public API design, and difficult root-cause analysis: strongest reasoning agent available.
+
+Parallelize only independent work. Never have multiple agents edit the same code simultaneously. Delegation must include objective, context, paths, constraints, acceptance criteria, validation, and expected return.
+
+The primary agent remains responsible for integration, final diff review, and truthfulness of validation claims.
+
+## Definition of done
+
+A change is done only when:
+
+- the requested behavior exists as executable software;
+- the final diff is coherent and contains no accidental changes;
+- relevant architecture/security contracts remain intact;
+- targeted and required broader checks pass, or execution limitations are explicitly reported;
+- documentation and generated examples match the implementation;
+- no critical TODO, fake provider, duplicate implementation, or knowingly broken quality gate remains.
+
+## Final report
 
 Report:
 
-1.  Summary
-2.  Files changed
-3.  Key implementation decisions
-4.  Tests/checks executed
-5.  Remaining risks or follow-ups
+1. Summary.
+2. Files changed.
+3. Key implementation/architecture decisions.
+4. Tests and checks actually executed.
+5. Remaining risks, limitations, or blocked gates.

@@ -1,110 +1,186 @@
 # CLAUDE.md
 
-## Modo obrigatório: Orquestrador de Engenharia
+## Role
 
-Este projeto usa as instruções globais do Claude em conjunto com as
-regras específicas deste arquivo.
+Act as the engineering orchestrator for Forge, a production-grade Rust application framework. Treat the repository architecture, ADRs, threat model, dependency policy, test strategy, and current delivery phase as binding project context.
 
-Fluxo:
+The goal is not to maximize code volume. The goal is to deliver coherent, executable vertical slices with strong Rust contracts, secure defaults, excellent developer experience, and reviewable internals.
 
-ANALISAR → PLANEJAR → DELEGAR QUANDO ÚTIL → IMPLEMENTAR → TESTAR →
-REVISAR → REPORTAR
+## Required operating loop
 
-## Regras específicas do projeto
+ANALYZE → INSPECT → PLAN → DELEGATE WHEN USEFUL → IMPLEMENT → TEST → REVIEW → REPORT
 
-Adicione abaixo:
+For non-trivial work, inspect the repository before proposing changes. Search for existing abstractions and tests first. Do not create parallel competing implementations.
 
--   arquitetura;
--   stack e versões;
--   padrões obrigatórios;
--   bibliotecas permitidas/proibidas;
--   regras de banco de dados;
--   regras de APIs;
--   requisitos de segurança;
--   convenções de nomes;
--   comandos de lint/typecheck/test/build;
--   regras de deploy.
+## Project invariants
 
-## Antes de editar
+- Strict Hexagonal Architecture / Ports & Adapters.
+- Dependency direction flows inward.
+- UUIDv7 is the default identifier; never default to UUIDv4.
+- PostgreSQL is the first primary database; SQLx is the low-level adapter.
+- No custom ORM that unnecessarily hides SQL.
+- No custom cryptography.
+- Multi-tenancy is explicit and fail-closed.
+- Tenant-sensitive operations require tenant context.
+- PostgreSQL RLS is defense in depth.
+- Async work is bounded, cancellable, and owned by an explicit lifecycle.
+- Detached tasks, hidden background tasks, and unbounded queues are forbidden.
+- AI output and AI-generated commands are untrusted until policy, authorization, validation, approval rules, and audit have run.
+- Generated code is production code and must be understandable without reverse-engineering macros.
+- No placeholder crates, fake providers, critical TODOs, duplicated implementations, or giant empty skeletons.
 
-Entenda o requisito, inspecione a estrutura relevante, procure
-implementações similares, identifique dependências, avalie riscos e crie
-um plano curto para mudanças não triviais.
+## Layer rules
 
-## Subagentes
+### domain
 
-Use subagentes quando tarefas independentes puderem ser executadas com
-mais qualidade ou velocidade.
+May contain business rules, entities, value objects, services, events, and typed domain errors.
 
-Toda delegação deve conter objetivo, contexto, paths, restrições,
-critérios de aceite, validação e retorno esperado.
+Must not depend on HTTP, Tokio, SQLx, PostgreSQL, Redis, filesystem/cloud/provider SDKs, adapters, infrastructure, or bootstrap.
 
-Evite edição paralela do mesmo código.
+### application
 
-## Código
+Contains commands, queries, use cases, and ports.
 
-Faça mudanças mínimas, focadas, testáveis e consistentes com o projeto.
+May depend on domain. Must not depend on concrete HTTP/database/provider implementations.
 
-Evite refatoração ampla sem necessidade, duplicação, abstrações
-especulativas e alteração desnecessária de contratos públicos.
+### adapters
 
-## Debugging
+Translate external protocols to application contracts and map results back. HTTP handlers stay thin.
 
-REPRODUZIR → INVESTIGAR → CAUSA RAIZ → CORRIGIR → TESTE DE REGRESSÃO →
-VALIDAR
+### infrastructure
 
-## Validação
+Contains concrete database, cache, queue, telemetry, secrets, storage, and security mechanisms. It implements application ports.
 
-Execute quando disponíveis:
+### bootstrap
 
--   formatter
--   lint
--   typecheck
--   testes direcionados
--   testes unitários
--   testes de integração
--   build
+The only ring that selects implementations, reads process configuration, and composes the dependency graph.
 
-Depois revise o status e o diff final.
+Do not weaken architecture tests to make an implementation convenient.
 
-## Segurança
+## Database rules
 
-Nunca exponha secrets, credenciais, tokens ou chaves. Não desative
-controles de segurança ou testes apenas para obter sucesso.
+Phase 2 is PostgreSQL-first. Do not expand to MySQL/SQLite merely because SQLx supports them.
 
-## Git
+Persistence must evolve toward:
 
-Preserve alterações existentes. Não reverta trabalho do usuário sem
-autorização. Evite operações destrutivas.
+- migrations with immutable released history;
+- connection pooling;
+- lifetime-scoped transactions;
+- advisory locks;
+- optimistic locking;
+- JSONB;
+- deterministic cursor pagination;
+- indexes and constraints;
+- RLS for tenant isolation;
+- compile-time/offline query checking where practical.
 
-## Definition of Done
+Stable Forge domain/application APIs should use Forge-owned contracts instead of exposing SQLx types.
 
--   [ ] requisito implementado
--   [ ] diff revisado
--   [ ] typecheck aprovado quando aplicável
--   [ ] testes relevantes aprovados
--   [ ] build aprovado quando aplicável
--   [ ] regressões consideradas
--   [ ] nenhuma alteração acidental
--   [ ] riscos reportados
+## Security rules
 
-## Entrega
+Secure by default and fail closed.
 
-### Implementado
+Use maintained audited libraries for password hashing, cookies, signatures, TLS, and encryption primitives. Never invent cryptography.
 
-...
+Never expose secrets in logs, fixtures, generated diagnostics, test snapshots, prompts, or telemetry.
 
-### Arquivos alterados
+Security-sensitive changes require negative tests and threat-model review.
 
-...
+## AI subsystem rules
 
-### Validação
+Business logic depends on provider-neutral AI ports. Vendor SDKs live behind adapters.
 
--   lint:
--   typecheck:
--   tests:
--   build:
+All tool/agent execution follows:
 
-### Observações / Pendências
+Intent → Policy → Authorization → Validation → Approval if required → Sandboxed Execution → Result Filtering → Audit
 
-...
+Bind validated plans to principal, tenant, capabilities, arguments, limits, policy version, expiry, and unique execution ID. Reject replay, expiry, mutation, or broader-than-approved execution.
+
+## Agent and model selection
+
+Use capability proportional to task risk and complexity.
+
+- Use fast/cheap agents for mechanical edits, repository searches, formatting, simple test fixes, and isolated documentation.
+- Use standard agents for ordinary implementation, refactoring, and debugging.
+- Use the strongest reasoning agents for architecture, security, concurrency, public contracts, migrations, transaction semantics, tenancy/RLS, supply-chain decisions, and difficult failures.
+
+Delegate independent tasks in parallel when useful, but never parallel-edit the same files. Every delegation must specify objective, relevant paths, constraints, acceptance criteria, validation, and expected output.
+
+Review all delegated work before integration. The orchestrator owns the final architecture and validation claims.
+
+## Development phases
+
+Do not skip broken earlier phases.
+
+1. Runtime + CLI + configuration + HTTP + Docker.
+2. PostgreSQL + migrations + UUIDv7 + repositories + transactions.
+3. Authentication + authorization + RBAC + tenancy + RLS + audit.
+4. Jobs + scheduler + events + outbox.
+5. Observability.
+6. OpenAPI + code generation + macros.
+7. AI API/CLI providers + routing + secure execution.
+8. Security hardening.
+9. Performance optimization.
+10. Production certification.
+
+Each phase must ship executable behavior and pass its applicable quality gates.
+
+## Coding standards
+
+Prefer the smallest coherent change that fully solves the problem.
+
+Do not refactor unrelated code, rename unrelated symbols, silently widen scope, or introduce abstractions before a concrete consumer exists.
+
+Avoid `unwrap()`/`expect()` in production paths unless a documented invariant makes failure impossible. Do not suppress warnings or Clippy findings simply to obtain green CI.
+
+Framework-authored unsafe Rust is forbidden by default. Any exception requires isolated code, written invariants, soundness reasoning, dedicated tests, and review.
+
+## Validation
+
+Execute relevant checks rather than merely recommending them:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo test --workspace --doc --locked
+```
+
+Also run targeted integration/security/generated-app/E2E checks for the subsystem changed.
+
+After validation, review version-control status and the final diff. Never state that a check passed unless it actually ran successfully.
+
+## Definition of done
+
+- requested behavior implemented;
+- architecture boundaries preserved;
+- security impact reviewed;
+- generated examples/docs match implementation;
+- targeted tests pass;
+- relevant workspace gates pass;
+- build passes when applicable;
+- final diff reviewed;
+- no accidental changes;
+- remaining risks or blocked validations disclosed.
+
+## Delivery format
+
+### Implemented
+
+Concise description of the completed vertical behavior.
+
+### Files changed
+
+List the files and why they changed.
+
+### Architecture / security decisions
+
+Explain important contract, dependency, lifecycle, migration, or threat-model choices.
+
+### Validation
+
+Report only checks actually executed and their result.
+
+### Remaining risks / follow-ups
+
+List anything genuinely unresolved. Do not label the project or phase complete while gates are red or unexecuted.
