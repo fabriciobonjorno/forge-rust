@@ -3,18 +3,50 @@
 //! health routes and graceful shutdown.
 %%if database%%
 //!
-//! `sqlx::migrate!()` embeds `migrations/` into the binary; run them with
-//! `<binary> migrate` (or `forge migrate`) and revert the latest with `rollback`.
+//! SQLx is confined to this outer composition/infrastructure boundary.
+//! Migrations are embedded in the binary and executed by the Forge process CLI.
 %%end%%
 
 use std::process::ExitCode;
+%%if database%%
+use std::error::Error;
 
-/// Runs the command selected on the command line (`serve` by default).
+use forge::config::SecretString;
+use sqlx::{PgPool, migrate::Migrator};
+
+static MIGRATOR: Migrator = sqlx::migrate!();
+
+async fn migrate_database(
+    url: SecretString,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let pool = PgPool::connect(url.expose()).await?;
+    MIGRATOR.run(&pool).await?;
+    pool.close().await;
+    Ok(())
+}
+
+async fn rollback_database(
+    url: SecretString,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let pool = PgPool::connect(url.expose()).await?;
+    let target = sqlx::query_scalar::<_, i64>(
+        "SELECT version FROM _sqlx_migrations ORDER BY version DESC OFFSET 1 LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await?
+    .unwrap_or(0);
+    MIGRATOR.undo(&pool, target).await?;
+    pool.close().await;
+    Ok(())
+}
+%%end%%
+
+/// Runs the command selected on the command line (serve by default).
 pub fn run() -> ExitCode {
     forge::App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
 %%if database%%
-        .%%DATABASE_DRIVER%%(sqlx::migrate!())
+        .migrations(migrate_database, rollback_database)
 %%end%%
         .routes(crate::adapters::http::routes)
         .run()
