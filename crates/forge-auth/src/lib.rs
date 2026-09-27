@@ -136,6 +136,7 @@ impl Session {
         now: UnixTimestamp,
         new_expires_at: UnixTimestamp,
     ) -> Result<Self, SessionError> {
+        self.authenticate(now)?;
         let replacement = Self::new(self.principal_id, now, new_expires_at)?;
         self.revoke(now);
         Ok(replacement)
@@ -243,6 +244,23 @@ mod tests {
         );
         assert_eq!(session.id(), original_id);
         assert!(session.authenticate(time(21)).is_ok());
+    }
+
+    #[test]
+    fn expired_or_revoked_session_cannot_rotate() {
+        let principal = PrincipalId::new();
+        let mut expired = Session::new(principal, time(10), time(20)).expect("valid session");
+        assert_eq!(
+            expired.rotate(time(20), time(30)),
+            Err(SessionError::Expired)
+        );
+
+        let mut revoked = Session::new(principal, time(10), time(30)).expect("valid session");
+        revoked.revoke(time(15));
+        assert_eq!(
+            revoked.rotate(time(16), time(40)),
+            Err(SessionError::Revoked)
+        );
     }
 
     #[test]
