@@ -1,10 +1,12 @@
 # Forge Architecture
 
 Status: Phase 0 design baseline complete; Phase 1 implemented, unreleased.
-Phase 2 is in progress: PostgreSQL generation, reversible migrations,
-framework-owned database errors/transaction contracts and optimistic-version
-primitives are implemented on the current development branch. Repository/pool
-integration and the Phase 2 quality gates remain open.
+Phase 2 behavior is implemented through PostgreSQL generation, reversible
+migrations, transaction/repository contracts and optimistic locking, but the
+GitHub Actions runner gate remains blocked before job steps execute. Phase 3 is
+in progress: server-side session lifecycle, deny-by-default RBAC, explicit
+membership and authorized TenantContext contracts are implemented; PostgreSQL
+RLS, concrete authentication adapters and audit persistence remain open.
 
 Forge is an opinionated Rust application framework for long-lived services. Its
 value is the integration of explicit application architecture, secure defaults,
@@ -183,6 +185,24 @@ route match -> request limits -> authentication -> tenant resolution
 Use cases accept typed input and an explicit request context. The context carries
 request/correlation identity, deadline/cancellation, authenticated principal, and
 tenant scope where required. It must not become an untyped service locator.
+
+### Authentication, authorization, and tenant context
+
+Authentication, membership resolution, and authorization are separate proofs.
+A server-side session establishes a principal identity with explicit issuance,
+expiry, revocation, and rotation semantics. Tenant roles are not embedded in the
+session; they are loaded from the tenant membership so suspension and role
+changes do not wait for credential expiry.
+
+RBAC is deny-by-default. Roles and permissions use validated application-defined
+names. A successful policy decision produces an AuthorizationGrant that
+application code cannot manufacture directly.
+
+TenantContext is derived only when an authenticated principal matches an active
+membership and the tenant-scoped RBAC policy explicitly grants the requested
+permission. Tenant-sensitive repository contracts accept TenantContext, never a
+bare tenant identifier. PostgreSQL RLS integration consumes that context in the
+next Phase 3 slice. See [ADR 0010](adr/0010-session-and-tenant-authorization-context.md).
 
 ### Database and transactions
 
