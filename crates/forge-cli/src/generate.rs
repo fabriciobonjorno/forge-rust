@@ -283,19 +283,58 @@ fn write_application(
     Ok(())
 }
 
-/// Substitutes `%%NAME%%` variables and keeps or drops
-/// `%%IF_DOCKER%%` ... `%%END_IF_DOCKER%%` line blocks.
+/// Substitutes `%%NAME%%` variables and evaluates template conditionals.
+///
+/// Phase 1 only enables the `docker` capability. The database condition names
+/// are intentionally understood already because Phase 2 templates landed ahead
+/// of their public CLI switch; until that vertical slice is complete they render
+/// as disabled rather than leaking `%%if ...%%` markers into generated apps.
 fn render(template: &str, variables: &[(&str, &str)], docker: bool) -> String {
+    let condition = |name: &str| match name {
+        "docker" => docker,
+        "database" | "postgresql" | "mysql" | "sqlite" => false,
+        _ => false,
+    };
+
     let mut output = String::with_capacity(template.len());
-    let mut include = true;
+    let mut stack = vec![true];
+
     for line in template.split_inclusive('\n') {
-        match line.trim_end() {
-            "%%IF_DOCKER%%" => include = docker,
-            "%%END_IF_DOCKER%%" => include = true,
-            _ if include => output.push_str(line),
-            _ => {}
+        let marker = line.trim();
+        let directive = match marker {
+            "%%IF_DOCKER%%" => Some(("docker", false)),
+            "%%END_IF_DOCKER%%" => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                continue;
+            }
+            _ if marker.starts_with("%%if ") && marker.ends_with("%%") => {
+                let name = &marker[5..marker.len() - 2];
+                Some((name.strip_prefix('!').unwrap_or(name), name.starts_with('!')))
+            }
+            "%%end%%" => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                continue;
+            }
+            _ => None,
+        };
+
+        if let Some((name, negated)) = directive {
+            let enabled = condition(name);
+            let enabled = if negated { !enabled } else { enabled };
+            let parent = *stack.last().unwrap_or(&true);
+            stack.push(parent && enabled);
+            continue;
+        }
+
+        if *stack.last().unwrap_or(&true) {
+            output.push_str(line);
         }
     }
+
     for (name, value) in variables {
         output = output.replace(name, value);
     }
