@@ -22,8 +22,9 @@ results.
 | --- | --- | --- |
 | 0 | Architecture, ADRs, threat model, dependency and test policy | Done |
 | 1 | Runtime, CLI, configuration, HTTP, graceful shutdown, health, Docker | Implemented, unreleased |
-| 2 | PostgreSQL, migrations, transaction contracts, repositories | In progress |
-| 3+ | Auth/tenancy, jobs/events, telemetry, OpenAPI, AI, hardening | Design only |
+| 2 | PostgreSQL, migrations, transaction contracts, repositories | Behavior implemented; CI runner gate still blocked |
+| 3 | Authentication, authorization, tenancy, RLS, audit | Foundation in progress |
+| 4+ | Jobs/events, telemetry, OpenAPI, AI, hardening | Design only |
 
 See the [delivery sequence](docs/architecture.md#delivery-sequence-and-exit-criteria).
 
@@ -111,11 +112,14 @@ Kubernetes and systemd deployment is covered in
 
 ```text
 crates/
-├── forge          # facade: forge::App, re-exports forge-core/config/http
+├── forge          # facade: forge::App and framework-owned re-exports
+├── forge-auth     # server-side session lifecycle and authenticated identity
 ├── forge-core     # lifecycle, errors, UUIDv7 identifiers
 ├── forge-config   # typed FORGE_* configuration and secret redaction
-├── forge-db       # database errors, optimistic versions, transaction contracts
+├── forge-db       # repository/transaction contracts, including tenant-scoped ports
 ├── forge-http     # HTTP server, limits, health routes, request IDs
+├── forge-security # deny-by-default RBAC roles, permissions and grants
+├── forge-tenancy  # membership and explicit authorized TenantContext
 └── forge-cli      # the `forge` executable and application generator
 examples/
 └── hello-forge    # committed `forge new` output; standalone package (not a
