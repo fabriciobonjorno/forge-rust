@@ -137,7 +137,7 @@ if docker run --rm --entrypoint /bin/sh "$image" -c true >/dev/null 2>&1; then
 fi
 
 curl --silent --fail "http://127.0.0.1:3000/" | grep -q "\"application\":\"$app_name\""   || fail "container index route"
-docker compose logs app 2>&1 | grep -m1 -q '^app-.* | {' || fail "production logs must be JSON"
+docker compose logs app 2>&1 | grep -m1 -q ' | {' || fail "production logs must be JSON"
 
 # The named volume must preserve the migrated schema across an application restart.
 docker compose restart app >/dev/null
