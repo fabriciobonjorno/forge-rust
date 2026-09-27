@@ -60,7 +60,8 @@ cargo fmt --all -- --check
 cargo clippy --quiet --all-targets --locked -- -D warnings
 cargo test --quiet --locked
 
-database_url=""
+runtime_database_url=""
+migration_database_url=""
 if [[ "${FORGE_E2E_SKIP_DOCKER:-0}" != 1 ]]; then
   log "Starting PostgreSQL and exercising reversible migrations"
   "$forge" generate migration create_e2e_probe >/dev/null
@@ -73,23 +74,32 @@ if [[ "${FORGE_E2E_SKIP_DOCKER:-0}" != 1 ]]; then
   # sqlx::migrate!() embeds migrations at compile time, so rebuild after creating it.
   cargo build --quiet --locked
   docker compose up --detach db >/dev/null
-  database_url="postgres://app:app@127.0.0.1:5432/forge_e2e_app"
+  runtime_database_url="postgres://app_runtime:app_runtime@127.0.0.1:5432/forge_e2e_app"
+  migration_database_url="postgres://app_migrator:app_migrator@127.0.0.1:5432/forge_e2e_app"
 
-  FORGE_DATABASE_URL="$database_url" "target/debug/$app_name" migrate
-  [[ "$(docker compose exec -T db psql -U app -d forge_e2e_app -Atc       "SELECT to_regclass('public.forge_e2e_probe')")" == "forge_e2e_probe" ]]     || fail "migrate did not create the probe table"
+  if FORGE_DATABASE_URL="$runtime_database_url" "target/debug/$app_name" migrate 2>/dev/null; then
+    fail "migrate must not accept the runtime database credential"
+  fi
 
-  FORGE_DATABASE_URL="$database_url" "target/debug/$app_name" rollback
-  [[ -z "$(docker compose exec -T db psql -U app -d forge_e2e_app -Atc       "SELECT to_regclass('public.forge_e2e_probe')")" ]]     || fail "rollback did not remove the probe table"
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" migrate
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" == "forge_e2e_probe" ]]     || fail "migrate did not create the probe table"
 
-  FORGE_DATABASE_URL="$database_url" "target/debug/$app_name" migrate
+  if docker compose exec -T db psql -U app_runtime -d forge_e2e_app       -v ON_ERROR_STOP=1 -c 'CREATE TABLE forge_runtime_must_not_create_schema (id bigint);'       >/dev/null 2>&1; then
+    fail "runtime database role must not be able to create schema objects"
+  fi
+
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" rollback
+  [[ -z "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" ]]     || fail "rollback did not remove the probe table"
+
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" migrate
 fi
 
 log "Host run: serve, probe and graceful shutdown"
 cargo build --quiet --locked
 port="$(free_port)"
 env_args=(FORGE_BIND="127.0.0.1:$port" FORGE_SHUTDOWN_GRACE_SECS=5)
-if [[ -n "$database_url" ]]; then
-  env_args+=(FORGE_DATABASE_URL="$database_url")
+if [[ -n "$runtime_database_url" ]]; then
+  env_args+=(FORGE_DATABASE_URL="$runtime_database_url")
 fi
 env "${env_args[@]}" "target/debug/$app_name" &
 server_pid=$!
@@ -141,7 +151,7 @@ docker compose logs app 2>&1 | grep -m1 -q ' | {' || fail "production logs must 
 
 # The named volume must preserve the migrated schema across an application restart.
 docker compose restart app >/dev/null
-[[ "$(docker compose exec -T db psql -U app -d forge_e2e_app -Atc     "SELECT to_regclass('public.forge_e2e_probe')")" == "forge_e2e_probe" ]]   || fail "database schema did not persist across app restart"
+[[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" == "forge_e2e_probe" ]]   || fail "database schema did not persist across app restart"
 
 docker compose stop --timeout 20 app >/dev/null
 app_container="$(docker compose ps --quiet --all app)"
