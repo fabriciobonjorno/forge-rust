@@ -138,8 +138,9 @@ shop/
     └── container.rs         # omitted with --skip-docker; Dockerfile RUST_VERSION == toolchain
 ```
 
-[`examples/hello-forge`](../examples/hello-forge) is the committed output of
-`forge new hello-forge --skip-ci --skip-lockfile --forge-path ../../crates/forge`
+[`examples/hello-forge`](../examples/hello-forge) is the committed
+database-free output of
+`forge new hello-forge --skip-ci --skip-database --skip-lockfile --forge-path ../../crates/forge`
 and is the authoritative reference for exact file contents. A golden test in
 `forge-cli` fails if generator output drifts from it. Like a real user
 application, it is a standalone package outside the framework workspace. Its
