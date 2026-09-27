@@ -66,8 +66,14 @@ impl DatabaseError {
 }
 
 /// Monotonic optimistic-lock value stored with mutable records.
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RecordVersion(i64);
+
+impl Default for RecordVersion {
+    fn default() -> Self {
+        Self::INITIAL
+    }
+}
 
 impl RecordVersion {
     /// Initial version for a newly persisted record.
@@ -139,6 +145,7 @@ mod tests {
     fn versions_are_positive_and_checked() {
         assert!(RecordVersion::new(0).is_err());
         assert_eq!(RecordVersion::INITIAL.get(), 1);
+        assert_eq!(RecordVersion::default(), RecordVersion::INITIAL);
         assert_eq!(
             RecordVersion::INITIAL
                 .next()
