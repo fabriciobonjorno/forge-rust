@@ -1,5 +1,7 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::CliError;
 
@@ -145,6 +147,88 @@ const RESERVED_MODULES: &[(&str, &str)] = &[
         "Secrets, keys and security mechanisms.",
     ),
 ];
+
+pub(crate) fn create_migration(
+    root: &Path,
+    name: &str,
+) -> Result<(PathBuf, PathBuf), CliError> {
+    let normalized = normalize_migration_name(name)?;
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(CliError::Clock)?;
+    let version = elapsed.as_nanos();
+    let migrations = root.join("migrations");
+    fs::create_dir_all(&migrations).map_err(|source| CliError::CreateDirectory {
+        path: migrations.clone(),
+        source,
+    })?;
+
+    let stem = format!("{version}_{normalized}");
+    let up = migrations.join(format!("{stem}.up.sql"));
+    let down = migrations.join(format!("{stem}.down.sql"));
+
+    write_new_file(
+        &up,
+        &format!("-- {normalized}: apply migration\n\n"),
+    )?;
+    if let Err(error) = write_new_file(
+        &down,
+        &format!("-- {normalized}: revert migration\n\n"),
+    ) {
+        let _ = fs::remove_file(&up);
+        return Err(error);
+    }
+
+    Ok((up, down))
+}
+
+fn normalize_migration_name(name: &str) -> Result<String, CliError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CliError::InvalidMigrationName {
+            name: name.to_owned(),
+            reason: "the name cannot be empty",
+        });
+    }
+    if name.len() > 80 || !name.is_ascii() {
+        return Err(CliError::InvalidMigrationName {
+            name: name.to_owned(),
+            reason: "use at most 80 ASCII characters",
+        });
+    }
+
+    let mut normalized = String::with_capacity(name.len());
+    for character in name.chars() {
+        match character {
+            'a'..='z' | '0'..='9' | '_' => normalized.push(character),
+            'A'..='Z' => normalized.push(character.to_ascii_lowercase()),
+            '-' | ' ' => normalized.push('_'),
+            _ => {
+                return Err(CliError::InvalidMigrationName {
+                    name: name.to_owned(),
+                    reason: "use letters, numbers, spaces, '-' or '_' only",
+                });
+            }
+        }
+    }
+
+    while normalized.contains("__") {
+        normalized = normalized.replace("__", "_");
+    }
+    let normalized = normalized.trim_matches('_').to_owned();
+    if normalized.is_empty()
+        || !normalized
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_lowercase)
+    {
+        return Err(CliError::InvalidMigrationName {
+            name: name.to_owned(),
+            reason: "the normalized name must start with a letter",
+        });
+    }
+    Ok(normalized)
+}
 
 pub(crate) fn create_application(
     parent: &Path,
@@ -362,6 +446,28 @@ fn render(
     output
 }
 
+fn write_new_file(path: &Path, content: &str) -> Result<(), CliError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                CliError::DestinationExists(path.to_path_buf())
+            } else {
+                CliError::WriteFile {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            }
+        })?;
+    file.write_all(content.as_bytes())
+        .map_err(|source| CliError::WriteFile {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 fn write_file(path: &Path, content: &str) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| CliError::CreateDirectory {
@@ -421,6 +527,34 @@ mod tests {
         let mut files = BTreeMap::new();
         visit(root, root, &mut files);
         files
+    }
+
+    #[test]
+    fn creates_reversible_migration_files() {
+        let root = tempfile::tempdir().expect("temporary directory should be available");
+        let (up, down) =
+            create_migration(root.path(), "Create Users").expect("migration should be created");
+
+        assert!(up.is_file());
+        assert!(down.is_file());
+        assert!(up.file_name().unwrap().to_string_lossy().ends_with("_create_users.up.sql"));
+        assert!(
+            down.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("_create_users.down.sql")
+        );
+        assert!(read(root.path(), up.strip_prefix(root.path()).unwrap().to_str().unwrap())
+            .contains("apply migration"));
+        assert!(read(root.path(), down.strip_prefix(root.path()).unwrap().to_str().unwrap())
+            .contains("revert migration"));
+    }
+
+    #[test]
+    fn rejects_unsafe_migration_names() {
+        for name in ["", "../users", "1users", "users/roles", "café"] {
+            assert!(normalize_migration_name(name).is_err(), "accepted {name}");
+        }
     }
 
     #[test]
