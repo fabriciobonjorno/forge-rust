@@ -727,8 +727,8 @@ mod tests {
         assert_eq!(read(&existing, "keep.txt"), "user data");
     }
 
-    /// `examples/hello-forge` is the committed output of
-    /// `forge new hello-forge --skip-ci --forge-path ../../crates/forge`.
+    /// `examples/hello-forge` is the committed database-free output of
+    /// `forge new hello-forge --skip-ci --skip-database --forge-path ../../crates/forge`.
     /// Regenerate it with `FORGE_BLESS=1 cargo test -p forge-cli`.
     #[test]
     fn hello_forge_example_matches_generator_output() {
