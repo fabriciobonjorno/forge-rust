@@ -25,6 +25,7 @@ pub(crate) struct NewApplication {
     pub(crate) name: String,
     pub(crate) docker: bool,
     pub(crate) ci: bool,
+    pub(crate) database: bool,
     pub(crate) forge: ForgeSource,
 }
 
@@ -33,6 +34,7 @@ enum Group {
     Always,
     Docker,
     Ci,
+    Database,
 }
 
 struct Template {
@@ -65,6 +67,8 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Always, "src/infrastructure/mod.rs" => "src/infrastructure/mod.rs.tmpl"),
     template!(Group::Always, "src/bootstrap/mod.rs" => "src/bootstrap/mod.rs.tmpl"),
     template!(Group::Always, "tests/architecture.rs" => "tests/architecture.rs.tmpl"),
+    template!(Group::Database, "build.rs" => "build.rs.tmpl"),
+    template!(Group::Database, "migrations/.gitkeep" => "migrations/gitkeep.tmpl"),
     template!(Group::Docker, "Dockerfile" => "Dockerfile.tmpl"),
     template!(Group::Docker, ".dockerignore" => "dockerignore.tmpl"),
     template!(Group::Docker, "compose.yaml" => "compose.yaml.tmpl"),
@@ -255,10 +259,20 @@ fn write_application(
     options: &NewApplication,
     forge_dependency: &str,
 ) -> Result<(), CliError> {
+    let database_name = options.name.replace('-', "_");
+    let database_url_local = format!(
+        "postgres://app:app@127.0.0.1:5432/{database_name}"
+    );
+    let database_url_container =
+        format!("postgres://app:app@db:5432/{database_name}");
     let variables = [
         ("%%APP_NAME%%", options.name.as_str()),
         ("%%RUST_VERSION%%", RUST_VERSION),
         ("%%FORGE_DEPENDENCY%%", forge_dependency),
+        ("%%DATABASE_NAME%%", database_name.as_str()),
+        ("%%DATABASE_DRIVER%%", "postgres"),
+        ("%%DATABASE_URL_LOCAL%%", database_url_local.as_str()),
+        ("%%DATABASE_URL_CONTAINER%%", database_url_container.as_str()),
     ];
 
     for template in TEMPLATES {
@@ -266,9 +280,10 @@ fn write_application(
             Group::Always => true,
             Group::Docker => options.docker,
             Group::Ci => options.ci,
+            Group::Database => options.database,
         };
         if enabled {
-            let content = render(template.content, &variables, options.docker);
+            let content = render(template.content, &variables, options.docker, options.database);
             write_file(&root.join(template.path), &content)?;
         }
     }
@@ -289,10 +304,16 @@ fn write_application(
 /// are intentionally understood already because Phase 2 templates landed ahead
 /// of their public CLI switch; until that vertical slice is complete they render
 /// as disabled rather than leaking `%%if ...%%` markers into generated apps.
-fn render(template: &str, variables: &[(&str, &str)], docker: bool) -> String {
+fn render(
+    template: &str,
+    variables: &[(&str, &str)],
+    docker: bool,
+    database: bool,
+) -> String {
     let condition = |name: &str| match name {
         "docker" => docker,
-        "database" | "postgresql" | "mysql" | "sqlite" => false,
+        "database" | "postgresql" => database,
+        "mysql" | "sqlite" => false,
         _ => false,
     };
 
@@ -365,6 +386,7 @@ mod tests {
             name: name.to_owned(),
             docker: true,
             ci: true,
+            database: true,
             forge: ForgeSource::GitTag,
         }
     }
@@ -444,6 +466,9 @@ mod tests {
 
         let manifest = read(&root, "Cargo.toml");
         assert!(manifest.contains("name = \"sample-app\""));
+        assert!(manifest.contains("sqlx"));
+        assert!(root.join("build.rs").is_file());
+        assert!(root.join("migrations/.gitkeep").is_file());
         assert!(manifest.contains(&format!(
             "forge = {{ git = \"https://github.com/fabriciobonjorno/forge-rust\", tag = \"v{FORGE_VERSION}\" }}"
         )));
@@ -474,6 +499,7 @@ mod tests {
         let options = NewApplication {
             docker: false,
             ci: false,
+            database: false,
             ..options("plain")
         };
 
@@ -489,6 +515,8 @@ mod tests {
             assert!(!root.join(path).exists(), "{path} should not be generated");
         }
         assert!(!read(&root, "README.md").contains("docker"));
+        assert!(!read(&root, "Cargo.toml").contains("sqlx"));
+        assert!(!root.join("migrations").exists());
     }
 
     #[test]
@@ -496,6 +524,7 @@ mod tests {
         let parent = tempfile::tempdir().expect("temporary directory should be available");
         let options = NewApplication {
             docker: false,
+            database: false,
             ..options("plain")
         };
 
@@ -574,6 +603,7 @@ mod tests {
         let parent = tempfile::tempdir().expect("temporary directory should be available");
         let options = NewApplication {
             ci: false,
+            database: false,
             forge: ForgeSource::Path("../../crates/forge".to_owned()),
             ..options("hello-forge")
         };
