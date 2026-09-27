@@ -232,6 +232,20 @@ mod tests {
     }
 
     #[test]
+    fn failed_rotation_does_not_revoke_current_session() {
+        let principal = PrincipalId::new();
+        let mut session = Session::new(principal, time(10), time(40)).expect("valid session");
+        let original_id = session.id();
+
+        assert_eq!(
+            session.rotate(time(20), time(20)),
+            Err(SessionError::InvalidLifetime)
+        );
+        assert_eq!(session.id(), original_id);
+        assert!(session.authenticate(time(21)).is_ok());
+    }
+
+    #[test]
     fn revocation_keeps_first_timestamp() {
         let principal = PrincipalId::new();
         let mut session = Session::new(principal, time(10), time(40)).expect("valid session");
