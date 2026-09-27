@@ -137,6 +137,108 @@ pub trait TransactionManager: Send + Sync {
     async fn begin(&self) -> Result<Self::Transaction<'_>, DatabaseError>;
 }
 
+
+/// Validated maximum number of records requested from a repository page.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PageLimit(u16);
+
+impl PageLimit {
+    /// Conservative default page size.
+    pub const DEFAULT: Self = Self(50);
+    /// Hard upper bound to keep accidental unbounded reads out of repository APIs.
+    pub const MAX: u16 = 500;
+
+    /// Creates a page limit in the inclusive range 1..=MAX.
+    pub fn new(value: u16) -> Result<Self, DatabaseError> {
+        if value == 0 || value > Self::MAX {
+            return Err(DatabaseError::new(
+                DatabaseErrorKind::Infrastructure,
+                "invalid repository page limit",
+                false,
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the validated raw limit.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl Default for PageLimit {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// One deterministic cursor-paginated repository page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CursorPage<T, C> {
+    /// Records in stable repository order.
+    pub items: Vec<T>,
+    /// Cursor to request the next page, or None when this is the final page.
+    pub next: Option<C>,
+}
+
+impl<T, C> CursorPage<T, C> {
+    /// Creates a page without exposing adapter-specific pagination types.
+    #[must_use]
+    pub fn new(items: Vec<T>, next: Option<C>) -> Self {
+        Self { items, next }
+    }
+}
+
+/// Conventional typed repository contract for aggregate persistence.
+///
+/// Applications remain free to define narrower domain-specific ports when CRUD
+/// semantics are not appropriate. This contract exists for ordinary aggregates
+/// and deliberately exposes only Forge-owned types. SQLx rows, pools,
+/// transactions and query builders stay in infrastructure adapters.
+#[async_trait]
+pub trait Repository: Send + Sync {
+    /// Nominal identifier type, typically forge_core::Id<Marker>.
+    type Id: Send + Sync;
+    /// Aggregate/entity returned by the repository.
+    type Entity: Send + Sync;
+    /// Opaque deterministic cursor owned by the application/adapter contract.
+    type Cursor: Send + Sync;
+
+    /// Loads an entity by typed identifier.
+    async fn find(&self, id: &Self::Id) -> Result<Option<Self::Entity>, DatabaseError>;
+
+    /// Inserts a new entity at RecordVersion::INITIAL.
+    async fn insert(&self, entity: &Self::Entity) -> Result<(), DatabaseError>;
+
+    /// Persists an optimistic update and returns the new record version.
+    ///
+    /// Adapters must classify a zero-row optimistic update as
+    /// DatabaseErrorKind::Conflict rather than silently overwriting newer data.
+    async fn update(
+        &self,
+        entity: &Self::Entity,
+        expected_version: RecordVersion,
+    ) -> Result<RecordVersion, DatabaseError>;
+
+    /// Deletes an entity only when its persisted version matches.
+    async fn delete(
+        &self,
+        id: &Self::Id,
+        expected_version: RecordVersion,
+    ) -> Result<(), DatabaseError>;
+
+    /// Reads a bounded deterministic page.
+    ///
+    /// Concrete adapters should use an indexed stable ordering tuple (normally
+    /// created_at plus id) and must not emulate cursors with unbounded OFFSET.
+    async fn page(
+        &self,
+        after: Option<&Self::Cursor>,
+        limit: PageLimit,
+    ) -> Result<CursorPage<Self::Entity, Self::Cursor>, DatabaseError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +259,27 @@ mod tests {
             .expect("max positive version is valid")
             .next()
             .is_err());
+    }
+
+    #[test]
+    fn page_limits_are_bounded() {
+        assert_eq!(PageLimit::default().get(), 50);
+        assert_eq!(PageLimit::new(1).expect("minimum is valid").get(), 1);
+        assert_eq!(
+            PageLimit::new(PageLimit::MAX)
+                .expect("maximum is valid")
+                .get(),
+            PageLimit::MAX
+        );
+        assert!(PageLimit::new(0).is_err());
+        assert!(PageLimit::new(PageLimit::MAX + 1).is_err());
+    }
+
+    #[test]
+    fn cursor_pages_keep_adapter_types_out_of_the_contract() {
+        let page = CursorPage::new(vec!["a", "b"], Some("next"));
+        assert_eq!(page.items, vec!["a", "b"]);
+        assert_eq!(page.next, Some("next"));
     }
 
     #[test]
