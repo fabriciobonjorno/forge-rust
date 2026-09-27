@@ -1,6 +1,6 @@
 # Forge CLI Reference
 
-Status: Phase 2 in progress. This page documents the `forge` executable
+Status: Phase 3 in progress. This page documents the `forge` executable
 (crate `forge-cli`) and the subcommands built into generated applications.
 
 ## Installation
@@ -91,18 +91,29 @@ Forge creates a versioned `.up.sql` / `.down.sql` pair using a positive,
 time-sortable numeric migration version. It creates files with create-new
 semantics and never overwrites an existing migration.
 
-Generated database applications use `FORGE_DATABASE_URL`. The value is treated
-as a secret by Forge configuration and is redacted from ordinary Debug and
-serialization output.
+Generated database applications separate runtime and migration credentials.
+Both values are treated as secrets by Forge configuration and are redacted from
+ordinary Debug and serialization output.
 
 ```sh
-export FORGE_DATABASE_URL='postgres://app:app@127.0.0.1:5432/shop'
+export FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/shop'
 cargo run -- migrate
 cargo run -- rollback
+
+export FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/shop'
+cargo run
 ```
 
-`migrate` runs all pending embedded SQLx migrations. `rollback` reverts only
-the latest applied reversible migration.
+`migrate` and `rollback` require `FORGE_MIGRATION_DATABASE_URL`; they do
+not fall back to the runtime credential. The serving process should receive only
+`FORGE_DATABASE_URL`.
+
+With generated Docker assets, `docker/postgres/init.sql` creates separate
+development-only `app_migrator` and `app_runtime` roles. The runtime role is
+not schema owner and has `NOBYPASSRLS`. Generated
+`src/infrastructure/database/mod.rs` provides `begin_tenant_transaction`,
+which installs the authorized tenant and principal as transaction-local
+PostgreSQL settings for RLS policies.
 
 ### Generated tree
 
@@ -123,6 +134,9 @@ shop/
 ├── Dockerfile               # omitted with --skip-docker
 ├── README.md
 ├── compose.yaml             # omitted with --skip-docker; 127.0.0.1:3000, stop_grace_period 20s
+├── docker/                   # omitted with --skip-docker
+│   └── postgres/
+│       └── init.sql          # omitted with --skip-database; local least-privilege roles
 ├── migrations/              # omitted with --skip-database; reversible SQL files
 ├── rust-toolchain.toml      # pinned to the framework toolchain
 ├── src/
@@ -176,9 +190,10 @@ Notes on the generated package:
   so the builder image uses its preinstalled toolchain instead of downloading
   components.
 - The Docker assets are described in [deployment](deployment.md#container-image).
-- With the default database capability, Compose includes PostgreSQL, waits for
-  `pg_isready`, runs a one-shot migration container, then starts the app.
-  `--skip-database` removes those database-specific pieces.
+- With the default database capability, Compose includes PostgreSQL, waits until
+  the database and least-privilege roles are initialized, runs a one-shot
+  migration container with the migration credential, then starts the app with
+  only the runtime credential. `--skip-database` removes those database pieces.
 
 ## `forge check`, `forge test`, `forge format`, `forge lint`
 
