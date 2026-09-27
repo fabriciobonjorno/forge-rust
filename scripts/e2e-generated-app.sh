@@ -68,8 +68,35 @@ if [[ "${FORGE_E2E_SKIP_DOCKER:-0}" != 1 ]]; then
   up_file="$(find migrations -maxdepth 1 -name '*_create_e2e_probe.up.sql' -print -quit)"
   down_file="$(find migrations -maxdepth 1 -name '*_create_e2e_probe.down.sql' -print -quit)"
   [[ -n "$up_file" && -n "$down_file" ]] || fail "migration pair was not generated"
-  printf '%s\n' 'CREATE TABLE forge_e2e_probe (id bigint PRIMARY KEY);' >"$up_file"
-  printf '%s\n' 'DROP TABLE forge_e2e_probe;' >"$down_file"
+  cat >"$up_file" <<'SQL'
+CREATE TABLE forge_e2e_probe (
+  id bigint PRIMARY KEY
+);
+
+CREATE TABLE forge_e2e_tenant_probe (
+  id bigint PRIMARY KEY,
+  tenant_id uuid NOT NULL,
+  value text NOT NULL
+);
+
+ALTER TABLE forge_e2e_tenant_probe ENABLE ROW LEVEL SECURITY;
+ALTER TABLE forge_e2e_tenant_probe FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY forge_e2e_tenant_isolation
+ON forge_e2e_tenant_probe
+FOR ALL
+TO app_runtime
+USING (
+  tenant_id = NULLIF(current_setting('forge.tenant_id', true), '')::uuid
+)
+WITH CHECK (
+  tenant_id = NULLIF(current_setting('forge.tenant_id', true), '')::uuid
+);
+SQL
+  cat >"$down_file" <<'SQL'
+DROP TABLE forge_e2e_tenant_probe;
+DROP TABLE forge_e2e_probe;
+SQL
 
   # sqlx::migrate!() embeds migrations at compile time, so rebuild after creating it.
   cargo build --quiet --locked
@@ -84,8 +111,63 @@ if [[ "${FORGE_E2E_SKIP_DOCKER:-0}" != 1 ]]; then
   FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" migrate
   [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" == "forge_e2e_probe" ]]     || fail "migrate did not create the probe table"
 
-  if docker compose exec -T db psql -U app_runtime -d forge_e2e_app       -v ON_ERROR_STOP=1 -c 'CREATE TABLE forge_runtime_must_not_create_schema (id bigint);'       >/dev/null 2>&1; then
+  if docker compose exec -T db psql -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 \
+      -c 'CREATE TABLE forge_runtime_must_not_create_schema (id bigint);' \
+      >/dev/null 2>&1; then
     fail "runtime database role must not be able to create schema objects"
+  fi
+
+  tenant_one="01941f29-7c00-7000-8000-000000000001"
+  tenant_two="01941f29-7c00-7000-8000-000000000002"
+  principal="01941f29-7c00-7000-8000-000000000003"
+
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+    BEGIN;
+    SELECT set_config('forge.tenant_id', '$tenant_one', true);
+    SELECT set_config('forge.principal_id', '$principal', true);
+    INSERT INTO forge_e2e_tenant_probe (id, tenant_id, value)
+    VALUES (1, '$tenant_one', 'tenant-one');
+    COMMIT;
+  " >/dev/null
+
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+    BEGIN;
+    SELECT set_config('forge.tenant_id', '$tenant_two', true);
+    SELECT set_config('forge.principal_id', '$principal', true);
+    INSERT INTO forge_e2e_tenant_probe (id, tenant_id, value)
+    VALUES (2, '$tenant_two', 'tenant-two');
+    COMMIT;
+  " >/dev/null
+
+  visible_without_context="$(docker compose exec -T db psql -Atq -U app_runtime \
+      -d forge_e2e_app -c "SELECT count(*) FROM forge_e2e_tenant_probe;")"
+  [[ "$visible_without_context" == 0 ]] \
+    || fail "RLS must fail closed without tenant context"
+
+  visible_tenant_one="$(docker compose exec -T db psql -Atq -U app_runtime \
+      -d forge_e2e_app -c "
+    BEGIN;
+    SELECT set_config('forge.tenant_id', '$tenant_one', true);
+    SELECT set_config('forge.principal_id', '$principal', true);
+    SELECT count(*) FROM forge_e2e_tenant_probe;
+    ROLLBACK;
+  " | tail -n 1)"
+  [[ "$visible_tenant_one" == 1 ]] \
+    || fail "tenant one must see exactly one tenant-scoped row"
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+      BEGIN;
+      SELECT set_config('forge.tenant_id', '$tenant_one', true);
+      SELECT set_config('forge.principal_id', '$principal', true);
+      INSERT INTO forge_e2e_tenant_probe (id, tenant_id, value)
+      VALUES (3, '$tenant_two', 'cross-tenant');
+      COMMIT;
+    " >/dev/null 2>&1; then
+    fail "RLS must reject a cross-tenant write"
   fi
 
   FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" rollback
