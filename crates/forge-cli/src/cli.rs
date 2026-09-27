@@ -32,6 +32,9 @@ pub(crate) enum Command {
         /// Do not generate the GitHub Actions workflow and Dependabot configuration.
         #[arg(long)]
         skip_ci: bool,
+        /// Generate an application without PostgreSQL, migrations or database Compose services.
+        #[arg(long)]
+        skip_database: bool,
         /// Do not run `cargo generate-lockfile` after generation.
         #[arg(long)]
         skip_lockfile: bool,
