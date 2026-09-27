@@ -15,6 +15,9 @@ path = "src/main.rs"
 [dependencies]
 forge = %%FORGE_DEPENDENCY%%
 serde = { version = "1", features = ["derive"] }
+%%if database%%
+sqlx = { version = "0.9", default-features = false, features = ["chrono", "json", "macros", "migrate", "%%DATABASE_DRIVER%%", "runtime-tokio", "uuid"] }
+%%end%%
 
 [lints.rust]
 unsafe_code = "forbid"

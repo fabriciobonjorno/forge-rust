@@ -1,6 +1,11 @@
 //! Composition root: selects concrete implementations and owns the process
 //! lifecycle. Forge provides the runtime, configuration, structured logging,
 //! health routes and graceful shutdown.
+%%if database%%
+//!
+//! `sqlx::migrate!()` embeds `migrations/` into the binary; run them with
+//! `<binary> migrate` (or `forge migrate`) and revert the latest with `rollback`.
+%%end%%
 
 use std::process::ExitCode;
 
@@ -8,6 +13,9 @@ use std::process::ExitCode;
 pub fn run() -> ExitCode {
     forge::App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
+%%if database%%
+        .%%DATABASE_DRIVER%%(sqlx::migrate!())
+%%end%%
         .routes(crate::adapters::http::routes)
         .run()
 }

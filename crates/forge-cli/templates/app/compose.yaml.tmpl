@@ -1,6 +1,69 @@
 # Runs the production image locally. This is a development convenience,
 # not a production orchestration contract.
 services:
+%%if postgresql%%
+  db:
+    image: postgres:18
+    environment:
+      # Development-only credentials. Never reuse them in a deployment.
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: %%DATABASE_NAME%%
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "--username=app", "--dbname=%%DATABASE_NAME%%"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+%%end%%
+%%if mysql%%
+  db:
+    image: mysql:8.4
+    environment:
+      # Development-only credentials. Never reuse them in a deployment.
+      MYSQL_DATABASE: %%DATABASE_NAME%%
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      # TCP ping: fails while the entrypoint's init server runs without networking.
+      test: ["CMD", "mysqladmin", "ping", "--host=127.0.0.1", "--user=app", "--password=app"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+%%end%%
+%%if database%%
+  migrate:
+    build: .
+    image: %%APP_NAME%%:dev
+    command: ["migrate"]
+    environment:
+      FORGE_DATABASE_URL: %%DATABASE_URL_CONTAINER%%
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+%%if sqlite%%
+    volumes:
+      - app-data:/data
+%%end%%
+%%if !sqlite%%
+    depends_on:
+      db:
+        condition: service_healthy
+%%end%%
+
+%%end%%
   app:
     build: .
     image: %%APP_NAME%%:dev
@@ -8,6 +71,9 @@ services:
       - "127.0.0.1:3000:3000"
     environment:
       FORGE_LOG: info
+%%if database%%
+      FORGE_DATABASE_URL: %%DATABASE_URL_CONTAINER%%
+%%end%%
     init: true
     read_only: true
     tmpfs:
@@ -18,3 +84,20 @@ services:
       - no-new-privileges:true
     # Must exceed FORGE_SHUTDOWN_GRACE_SECS (15s by default).
     stop_grace_period: 20s
+%%if sqlite%%
+    volumes:
+      - app-data:/data
+%%end%%
+%%if database%%
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+%%if sqlite%%
+  app-data:
+%%end%%
+%%if !sqlite%%
+  db-data:
+%%end%%
+%%end%%

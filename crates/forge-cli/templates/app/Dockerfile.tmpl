@@ -20,11 +20,22 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
     cargo build --release --locked --bin %%APP_NAME%% \
     && install -D -m 0755 target/release/%%APP_NAME%% /out/%%APP_NAME%%
+%%if sqlite%%
+RUN install -d -m 0750 /out/data
+%%end%%
 
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 COPY --from=build /out/%%APP_NAME%% /usr/local/bin/%%APP_NAME%%
+%%if sqlite%%
+# SQLite lives on a volume owned by the runtime user; mount one to persist it.
+COPY --from=build --chown=65532:65532 /out/data /data
+VOLUME ["/data"]
+%%end%%
 ENV FORGE_ENV=production \
     FORGE_BIND=0.0.0.0:3000
+%%if sqlite%%
+ENV FORGE_DATABASE_URL=%%DATABASE_URL_CONTAINER%%
+%%end%%
 USER 65532:65532
 EXPOSE 3000
 # The binary probes its own /health/live endpoint; no curl or shell is needed.

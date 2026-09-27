@@ -8,9 +8,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
-%%IF_DOCKER%%
+%%if docker%%
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
-%%END_IF_DOCKER%%
+%%end%%

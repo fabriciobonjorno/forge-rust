@@ -35,7 +35,7 @@ jobs:
         run: cargo --version
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets --locked
-%%IF_DOCKER%%
+%%if docker%%
 
   docker:
     runs-on: ubuntu-latest
@@ -49,13 +49,32 @@ jobs:
           context: .
           load: true
           push: false
-          tags: %%APP_NAME%%:ci
+          tags: %%APP_NAME%%:dev
           cache-from: type=gha
           cache-to: type=gha,mode=max
+%%if database%%
+      - name: Smoke test the Compose stack
+        run: |
+          docker compose up --detach --no-build
+          app="$(docker compose ps --quiet app)"
+          for _ in $(seq 1 60); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' "$app")"
+            [ "$status" = healthy ] && break
+            sleep 1
+          done
+          docker inspect --format '{{.State.Health.Status}}' "$app" | grep -qx healthy
+          curl --fail --silent --show-error http://127.0.0.1:3000/health/ready
+          docker compose stop --timeout 20 app
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$app")" = 0
+      - name: Tear down
+        if: always()
+        run: docker compose down --volumes
+%%end%%
+%%if !database%%
       - name: Smoke test the image
         run: |
           docker run -d --name app --read-only --cap-drop ALL \
-            --security-opt no-new-privileges -p 3000:3000 %%APP_NAME%%:ci
+            --security-opt no-new-privileges -p 3000:3000 %%APP_NAME%%:dev
           for _ in $(seq 1 30); do
             status="$(docker inspect --format '{{.State.Health.Status}}' app)"
             [ "$status" = healthy ] && break
@@ -65,4 +84,5 @@ jobs:
           curl --fail --silent --show-error http://127.0.0.1:3000/health/ready
           docker stop --timeout 20 app
           test "$(docker inspect --format '{{.State.ExitCode}}' app)" = 0
-%%END_IF_DOCKER%%
+%%end%%
+%%end%%
