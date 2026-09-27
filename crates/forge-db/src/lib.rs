@@ -138,7 +138,6 @@ pub trait TransactionManager: Send + Sync {
     async fn begin(&self) -> Result<Self::Transaction<'_>, DatabaseError>;
 }
 
-
 /// Validated maximum number of records requested from a repository page.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PageLimit(u16);
