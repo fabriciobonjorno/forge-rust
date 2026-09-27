@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-26
+- Refined by: [ADR 0011](0011-postgresql-runtime-migration-roles-and-rls-context.md)
 
 ## Context
 
