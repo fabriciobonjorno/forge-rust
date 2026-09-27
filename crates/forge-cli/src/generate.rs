@@ -221,7 +221,8 @@ fn normalize_migration_name(name: &str) -> Result<String, CliError> {
         || !normalized
             .as_bytes()
             .first()
-            .is_some_and(u8::is_ascii_lowercase)
+            .map(|byte| byte.is_ascii_lowercase())
+            .unwrap_or(false)
     {
         return Err(CliError::InvalidMigrationName {
             name: name.to_owned(),
@@ -345,11 +346,9 @@ fn write_application(
     forge_dependency: &str,
 ) -> Result<(), CliError> {
     let database_name = options.name.replace('-', "_");
-    let database_url_local = format!(
-        "postgres://app:app@127.0.0.1:5432/{database_name}"
-    );
-    let database_url_container =
-        format!("postgres://app:app@db:5432/{database_name}");
+    let database_url_local =
+        format!("postgres://app:app@127.0.0.1:5432/{database_name}");
+    let database_url_container = format!("postgres://app:app@db:5432/{database_name}");
     let variables = [
         ("%%APP_NAME%%", options.name.as_str()),
         ("%%RUST_VERSION%%", RUST_VERSION),
@@ -383,12 +382,11 @@ fn write_application(
     Ok(())
 }
 
-/// Substitutes `%%NAME%%` variables and evaluates template conditionals.
+/// Substitutes template variables and evaluates nested capability conditionals.
 ///
-/// Phase 1 only enables the `docker` capability. The database condition names
-/// are intentionally understood already because Phase 2 templates landed ahead
-/// of their public CLI switch; until that vertical slice is complete they render
-/// as disabled rather than leaking `%%if ...%%` markers into generated apps.
+/// PostgreSQL is the only database capability currently enabled. MySQL and
+/// SQLite markers are understood only so stale/unsupported template branches
+/// cannot leak into generated applications.
 fn render(
     template: &str,
     variables: &[(&str, &str)],
