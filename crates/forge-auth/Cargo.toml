@@ -1,0 +1,16 @@
+[package]
+name = "forge-auth"
+description = "Authentication and server-side session contracts for Forge applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+forge-core = { path = "../forge-core" }
+forge-security = { path = "../forge-security" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
