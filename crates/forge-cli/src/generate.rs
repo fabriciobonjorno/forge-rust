@@ -37,6 +37,7 @@ enum Group {
     Docker,
     Ci,
     Database,
+    DatabaseDocker,
 }
 
 struct Template {
@@ -77,7 +78,7 @@ const TEMPLATES: &[Template] = &[
         "src/infrastructure/database/mod.rs" => "src/infrastructure/database/mod.rs.tmpl"
     ),
     template!(
-        Group::Database,
+        Group::DatabaseDocker,
         "docker/postgres/init.sql" => "docker/postgres/init.sql.tmpl"
     ),
     template!(Group::Docker, "Dockerfile" => "Dockerfile.tmpl"),
@@ -389,6 +390,7 @@ fn write_application(
             Group::Docker => options.docker,
             Group::Ci => options.ci,
             Group::Database => options.database,
+            Group::DatabaseDocker => options.database && options.docker,
         };
         if enabled {
             let content = render(template.content, &variables, options.docker, options.database);
@@ -657,7 +659,13 @@ mod tests {
         assert!(dockerignore.contains("**/.env"));
         assert!(dockerignore.contains("**/target"));
 
-        assert!(read(&root, "compose.yaml").contains("no-new-privileges:true"));
+        let compose = read(&root, "compose.yaml");
+        assert!(compose.contains("no-new-privileges:true"));
+        assert!(compose.contains("app_migrator"));
+        assert!(compose.contains("app_runtime"));
+        assert!(compose.contains("FORGE_MIGRATION_DATABASE_URL"));
+        assert!(compose.contains("FORGE_DATABASE_URL"));
+        assert!(!compose.contains("postgres://app:app@"));
         assert!(read(&root, ".github/workflows/ci.yml").contains("docker/build-push-action"));
         assert!(read(&root, ".github/dependabot.yml").contains("package-ecosystem: docker"));
         assert!(root.join("tests/container.rs").is_file());
@@ -688,6 +696,24 @@ mod tests {
         assert!(!read(&root, "README.md").contains("docker"));
         assert!(!read(&root, "Cargo.toml").contains("sqlx"));
         assert!(!root.join("migrations").exists());
+        assert!(!root.join("docker/postgres/init.sql").exists());
+    }
+
+    #[test]
+    fn skipping_docker_keeps_database_code_without_compose_bootstrap() {
+        let parent = tempfile::tempdir().expect("temporary directory should be available");
+        let options = NewApplication {
+            docker: false,
+            database: true,
+            ..options("plain-db")
+        };
+
+        let root = create_application(parent.path(), &options).expect("generation should succeed");
+
+        assert!(read(&root, "Cargo.toml").contains("sqlx"));
+        assert!(root.join("src/infrastructure/database/mod.rs").is_file());
+        assert!(root.join("migrations/.gitkeep").is_file());
+        assert!(!root.join("compose.yaml").exists());
         assert!(!root.join("docker/postgres/init.sql").exists());
     }
 
