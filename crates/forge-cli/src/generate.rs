@@ -72,6 +72,14 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Database, "build.rs" => "build.rs.tmpl"),
     template!(Group::Database, ".gitattributes" => "gitattributes.tmpl"),
     template!(Group::Database, "migrations/.gitkeep" => "migrations/gitkeep.tmpl"),
+    template!(
+        Group::Database,
+        "src/infrastructure/database/mod.rs" => "src/infrastructure/database/mod.rs.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "docker/postgres/init.sql" => "docker/postgres/init.sql.tmpl"
+    ),
     template!(Group::Docker, "Dockerfile" => "Dockerfile.tmpl"),
     template!(Group::Docker, ".dockerignore" => "dockerignore.tmpl"),
     template!(Group::Docker, "compose.yaml" => "compose.yaml.tmpl"),
@@ -346,17 +354,33 @@ fn write_application(
     forge_dependency: &str,
 ) -> Result<(), CliError> {
     let database_name = options.name.replace('-', "_");
-    let database_url_local =
-        format!("postgres://app:app@127.0.0.1:5432/{database_name}");
-    let database_url_container = format!("postgres://app:app@db:5432/{database_name}");
+    let runtime_url_local =
+        format!("postgres://app_runtime:app_runtime@127.0.0.1:5432/{database_name}");
+    let migration_url_local =
+        format!("postgres://app_migrator:app_migrator@127.0.0.1:5432/{database_name}");
+    let runtime_url_container =
+        format!("postgres://app_runtime:app_runtime@db:5432/{database_name}");
+    let migration_url_container =
+        format!("postgres://app_migrator:app_migrator@db:5432/{database_name}");
     let variables = [
         ("%%APP_NAME%%", options.name.as_str()),
         ("%%RUST_VERSION%%", RUST_VERSION),
         ("%%FORGE_DEPENDENCY%%", forge_dependency),
         ("%%DATABASE_NAME%%", database_name.as_str()),
         ("%%DATABASE_DRIVER%%", "postgres"),
-        ("%%DATABASE_URL_LOCAL%%", database_url_local.as_str()),
-        ("%%DATABASE_URL_CONTAINER%%", database_url_container.as_str()),
+        ("%%DATABASE_RUNTIME_URL_LOCAL%%", runtime_url_local.as_str()),
+        (
+            "%%DATABASE_MIGRATION_URL_LOCAL%%",
+            migration_url_local.as_str(),
+        ),
+        (
+            "%%DATABASE_RUNTIME_URL_CONTAINER%%",
+            runtime_url_container.as_str(),
+        ),
+        (
+            "%%DATABASE_MIGRATION_URL_CONTAINER%%",
+            migration_url_container.as_str(),
+        ),
     ];
 
     for template in TEMPLATES {
@@ -373,6 +397,9 @@ fn write_application(
     }
 
     for (directory, description) in RESERVED_MODULES {
+        if options.database && *directory == "src/infrastructure/database" {
+            continue;
+        }
         write_file(
             &root.join(directory).join("mod.rs"),
             &format!("//! {description}\n"),
@@ -602,6 +629,17 @@ mod tests {
         assert!(manifest.contains("sqlx"));
         assert!(root.join("build.rs").is_file());
         assert!(root.join("migrations/.gitkeep").is_file());
+        assert!(root.join("docker/postgres/init.sql").is_file());
+
+        let database_module = read(&root, "src/infrastructure/database/mod.rs");
+        assert!(database_module.contains("begin_tenant_transaction"));
+        assert!(database_module.contains("forge.tenant_id"));
+        assert!(database_module.contains("forge.principal_id"));
+
+        let postgres_init = read(&root, "docker/postgres/init.sql");
+        assert!(postgres_init.contains("CREATE ROLE app_migrator"));
+        assert!(postgres_init.contains("CREATE ROLE app_runtime"));
+        assert!(postgres_init.contains("NOBYPASSRLS"));
         assert!(manifest.contains(&format!(
             "forge = {{ git = \"https://github.com/fabriciobonjorno/forge-rust\", tag = \"v{FORGE_VERSION}\" }}"
         )));
@@ -650,6 +688,7 @@ mod tests {
         assert!(!read(&root, "README.md").contains("docker"));
         assert!(!read(&root, "Cargo.toml").contains("sqlx"));
         assert!(!root.join("migrations").exists());
+        assert!(!root.join("docker/postgres/init.sql").exists());
     }
 
     #[test]
