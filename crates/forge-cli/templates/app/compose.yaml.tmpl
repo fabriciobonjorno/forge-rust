@@ -1,9 +1,8 @@
-# Runs the production image locally. This is a development convenience,
-# not a production orchestration contract.
+# Development convenience only; not a production orchestration contract.
 services:
-%%if postgresql%%
+%%if database%%
   db:
-    image: postgres:18
+    image: postgres:18.6-trixie@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
     environment:
       # Development-only credentials. Never reuse them in a deployment.
       POSTGRES_USER: app
@@ -19,29 +18,6 @@ services:
       timeout: 3s
       retries: 30
 
-%%end%%
-%%if mysql%%
-  db:
-    image: mysql:8.4
-    environment:
-      # Development-only credentials. Never reuse them in a deployment.
-      MYSQL_DATABASE: %%DATABASE_NAME%%
-      MYSQL_USER: app
-      MYSQL_PASSWORD: app
-      MYSQL_ROOT_PASSWORD: root
-    ports:
-      - "127.0.0.1:3306:3306"
-    volumes:
-      - db-data:/var/lib/mysql
-    healthcheck:
-      # TCP ping: fails while the entrypoint's init server runs without networking.
-      test: ["CMD", "mysqladmin", "ping", "--host=127.0.0.1", "--user=app", "--password=app"]
-      interval: 2s
-      timeout: 3s
-      retries: 60
-
-%%end%%
-%%if database%%
   migrate:
     build: .
     image: %%APP_NAME%%:dev
@@ -53,15 +29,9 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-%%if sqlite%%
-    volumes:
-      - app-data:/data
-%%end%%
-%%if !sqlite%%
     depends_on:
       db:
         condition: service_healthy
-%%end%%
 
 %%end%%
   app:
@@ -84,20 +54,11 @@ services:
       - no-new-privileges:true
     # Must exceed FORGE_SHUTDOWN_GRACE_SECS (15s by default).
     stop_grace_period: 20s
-%%if sqlite%%
-    volumes:
-      - app-data:/data
-%%end%%
 %%if database%%
     depends_on:
       migrate:
         condition: service_completed_successfully
 
 volumes:
-%%if sqlite%%
-  app-data:
-%%end%%
-%%if !sqlite%%
   db-data:
-%%end%%
 %%end%%
