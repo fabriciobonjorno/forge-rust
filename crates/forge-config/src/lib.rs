@@ -32,6 +32,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_LOG",
     "FORGE_LOG_FORMAT",
     "FORGE_DATABASE_URL",
+    "FORGE_MIGRATION_DATABASE_URL",
 ];
 
 /// Runtime environment controls safety-sensitive defaults.
@@ -192,8 +193,10 @@ impl Serialize for SecretString {
 /// Database settings after validation.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DatabaseConfig {
-    /// PostgreSQL connection URL. Optional for applications without a database.
+    /// Least-privilege PostgreSQL runtime URL. Optional for database-free apps.
     pub url: Option<SecretString>,
+    /// Privileged PostgreSQL URL used only by migrate/rollback commands.
+    pub migration_url: Option<SecretString>,
 }
 
 /// Complete process configuration.
@@ -290,15 +293,11 @@ impl AppConfig {
             config.log.filter = filter.to_owned();
         }
         if let Some(value) = lookup("FORGE_DATABASE_URL") {
-            let url = value.trim();
-            if url.is_empty() {
-                return Err(ConfigError::InvalidValue {
-                    key: "FORGE_DATABASE_URL",
-                    value,
-                    expected: "a non-empty PostgreSQL connection URL",
-                });
-            }
-            config.database.url = Some(SecretString::new(url));
+            config.database.url = Some(parse_secret_url("FORGE_DATABASE_URL", value)?);
+        }
+        if let Some(value) = lookup("FORGE_MIGRATION_DATABASE_URL") {
+            config.database.migration_url =
+                Some(parse_secret_url("FORGE_MIGRATION_DATABASE_URL", value)?);
         }
         // The format default depends on the environment, so derive it only
         // after FORGE_ENV has been applied.
@@ -335,6 +334,21 @@ where
         });
     }
     Ok(parsed)
+}
+
+fn parse_secret_url(
+    key: &'static str,
+    value: String,
+) -> Result<SecretString, ConfigError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            key,
+            value,
+            expected: "a non-empty PostgreSQL connection URL",
+        });
+    }
+    Ok(SecretString::new(trimmed))
 }
 
 /// Configuration loading or validation failure.
@@ -574,41 +588,60 @@ mod tests {
     }
 
     #[test]
-    fn database_url_is_available_but_redacted() {
-        let config = AppConfig::from_vars(vars(&[(
-            "FORGE_DATABASE_URL",
-            "postgres://app:super-secret@localhost/app",
-        )]))
-        .expect("database URL should be accepted");
+    fn database_urls_are_available_but_redacted() {
+        let config = AppConfig::from_vars(vars(&[
+            (
+                "FORGE_DATABASE_URL",
+                "postgres://runtime:runtime-secret@localhost/app",
+            ),
+            (
+                "FORGE_MIGRATION_DATABASE_URL",
+                "postgres://migrator:migration-secret@localhost/app",
+            ),
+        ]))
+        .expect("database URLs should be accepted");
 
-        let url = config
-            .database
-            .url
-            .as_ref()
-            .expect("database URL should be present");
-        assert_eq!(url.expose(), "postgres://app:super-secret@localhost/app");
+        assert_eq!(
+            config
+                .database
+                .url
+                .as_ref()
+                .expect("runtime database URL should be present")
+                .expose(),
+            "postgres://runtime:runtime-secret@localhost/app"
+        );
+        assert_eq!(
+            config
+                .database
+                .migration_url
+                .as_ref()
+                .expect("migration database URL should be present")
+                .expose(),
+            "postgres://migrator:migration-secret@localhost/app"
+        );
 
         let debug = format!("{config:?}");
-        assert!(!debug.contains("super-secret"));
+        assert!(!debug.contains("runtime-secret"));
+        assert!(!debug.contains("migration-secret"));
         assert!(debug.contains("[REDACTED]"));
 
         let json = serde_json::to_string(&config).expect("config should serialize");
-        assert!(!json.contains("super-secret"));
+        assert!(!json.contains("runtime-secret"));
+        assert!(!json.contains("migration-secret"));
         assert!(json.contains("[REDACTED]"));
     }
 
     #[test]
-    fn blank_database_url_is_rejected() {
-        let error = AppConfig::from_vars(vars(&[("FORGE_DATABASE_URL", "   ")]))
-            .expect_err("blank database URL must be rejected");
+    fn blank_database_urls_are_rejected() {
+        for key in ["FORGE_DATABASE_URL", "FORGE_MIGRATION_DATABASE_URL"] {
+            let error = AppConfig::from_vars(vars(&[(key, "   ")]))
+                .expect_err("blank database URL must be rejected");
 
-        assert!(matches!(
-            error,
-            ConfigError::InvalidValue {
-                key: "FORGE_DATABASE_URL",
-                ..
-            }
-        ));
+            assert!(matches!(
+                error,
+                ConfigError::InvalidValue { key: actual, .. } if actual == key
+            ));
+        }
     }
 
     #[test]
@@ -622,7 +655,8 @@ mod tests {
             "10",
             "debug",
             "json",
-            "postgres://app:secret@localhost/app",
+            "postgres://runtime:secret@localhost/app",
+            "postgres://migrator:secret@localhost/app",
         ];
         let pairs: Vec<(&str, &str)> = KNOWN_KEYS.iter().copied().zip(values).collect();
         assert_eq!(pairs.len(), KNOWN_KEYS.len());
