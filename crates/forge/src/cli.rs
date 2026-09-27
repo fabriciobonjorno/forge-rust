@@ -44,7 +44,8 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
             Some("rollback") => Command::Rollback,
             Some("version" | "--version" | "-V") => Command::Version,
             Some("help" | "--help" | "-h") => Command::Help,
-            _ => {
+            Some(command) => Command::Custom(command.to_owned()),
+            None => {
                 return Err(UsageError::UnknownCommand(
                     arg.to_string_lossy().into_owned(),
                 ));
@@ -148,7 +149,7 @@ mod tests {
 
     #[test]
     fn usage_documents_every_configuration_key() {
-        let text = usage("demo");
+        let text = usage("demo", &[("migrate", "Apply database migrations")]);
 
         assert!(text.starts_with("Usage: demo [COMMAND]"));
         for command in ["serve", "healthcheck", "migrate", "rollback", "version", "help"] {
