@@ -1,8 +1,10 @@
 # Forge Architecture
 
-Status: Phase 0 design baseline complete; Phase 1 (runtime, CLI, configuration,
-HTTP, graceful shutdown, health, Docker) implemented, unreleased. Later phases
-remain design only.
+Status: Phase 0 design baseline complete; Phase 1 implemented, unreleased.
+Phase 2 is in progress: PostgreSQL generation, reversible migrations,
+framework-owned database errors/transaction contracts and optimistic-version
+primitives are implemented on the current development branch. Repository/pool
+integration and the Phase 2 quality gates remain open.
 
 Forge is an opinionated Rust application framework for long-lived services. Its
 value is the integration of explicit application architecture, secure defaults,
@@ -277,10 +279,12 @@ modules structurally rather than producing duplicate `*_new` files.
 `forge new` emits the application Docker assets in Phase 1 and `forge build` can
 produce the same release binary locally or in the container build. A development
 container workflow may be offered, but Docker is not required to run the ordinary
-Cargo commands. PostgreSQL does not exist in Phase 1, so no placeholder database
-service is generated then. Phase 2 adds a version-pinned Compose development profile
-for PostgreSQL, health-based service ordering, a named data volume, and explicit
-configuration; Compose remains a local/development convenience, not the production
+Cargo commands. Phase 2 adds PostgreSQL by default to newly generated applications. The Compose
+development profile pins PostgreSQL, uses health-based service ordering, a named
+data volume and a one-shot migration service. SQLx remains in the generated
+outer infrastructure/bootstrap boundary; framework-owned application-facing
+contracts live in `forge-db`. `--skip-database` creates a database-free
+application. Compose remains a local/development convenience, not the production
 orchestration contract.
 
 Following Rails 8's `rails new`, Phase 1 also generates `.github/workflows/ci.yml`
