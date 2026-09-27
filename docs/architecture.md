@@ -192,6 +192,13 @@ provides repositories; application code cannot retain transaction references pas
 their lifetime. Optimistic locking uses an explicit version column. Cursor
 pagination uses a deterministic indexed tuple, normally `(created_at, id)`.
 
+Forge also provides a conventional typed `Repository` contract for ordinary
+aggregates. It uses associated `Id`, `Entity`, and cursor types, bounded
+`PageLimit`, `CursorPage`, and explicit optimistic `RecordVersion` checks.
+Applications may define narrower domain-specific repository ports when CRUD
+semantics are not appropriate. SQLx row/pool/query types never cross this
+application-facing contract.
+
 Tenant-sensitive repository methods require `TenantContext`. The PostgreSQL
 adapter begins a transaction, sets transaction-local tenant settings, and relies
 on RLS as defense in depth. No global/default tenant exists. See
