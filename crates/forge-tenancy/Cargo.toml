@@ -1,0 +1,17 @@
+[package]
+name = "forge-tenancy"
+description = "Explicit tenant membership and authorization context for Forge applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+forge-auth = { path = "../forge-auth" }
+forge-core = { path = "../forge-core" }
+forge-security = { path = "../forge-security" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
