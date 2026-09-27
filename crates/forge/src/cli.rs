@@ -11,6 +11,10 @@ pub(crate) enum Command {
     Serve,
     /// Probe the local liveness endpoint for container health checks.
     Healthcheck,
+    /// Apply all pending embedded database migrations.
+    Migrate,
+    /// Revert the latest reversible database migration.
+    Rollback,
     /// Print name and version.
     Version,
     /// Print usage.
@@ -36,6 +40,8 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         Some(arg) => match arg.to_str() {
             Some("serve") => Command::Serve,
             Some("healthcheck") => Command::Healthcheck,
+            Some("migrate") => Command::Migrate,
+            Some("rollback") => Command::Rollback,
             Some("version" | "--version" | "-V") => Command::Version,
             Some("help" | "--help" | "-h") => Command::Help,
             _ => {
@@ -62,6 +68,8 @@ Usage: {name} [COMMAND]
 Commands:
   serve        Run the HTTP server (default)
   healthcheck  Probe GET /health/live on the configured address; exit 0 when healthy
+  migrate      Apply all pending embedded database migrations
+  rollback     Revert the latest reversible database migration
   version      Print the application name and version (also --version, -V)
   help         Print this help (also --help, -h)
 
@@ -74,6 +82,7 @@ Environment:
   FORGE_MAX_CONNECTIONS       maximum concurrent connections (default: 10000)
   FORGE_LOG                   log filter directives (default: info)
   FORGE_LOG_FORMAT            json | text (default: json in production, text otherwise)
+  FORGE_DATABASE_URL           PostgreSQL connection URL (required for database commands)
 
 Unknown FORGE_* variables are rejected at startup.
 "
@@ -97,6 +106,8 @@ mod tests {
     #[test]
     fn known_commands_and_aliases_are_recognized() {
         assert_eq!(parse(args(&["healthcheck"])), Ok(Command::Healthcheck));
+        assert_eq!(parse(args(&["migrate"])), Ok(Command::Migrate));
+        assert_eq!(parse(args(&["rollback"])), Ok(Command::Rollback));
         for alias in ["version", "--version", "-V"] {
             assert_eq!(parse(args(&[alias])), Ok(Command::Version), "{alias}");
         }
@@ -108,8 +119,8 @@ mod tests {
     #[test]
     fn unknown_commands_are_rejected() {
         assert_eq!(
-            parse(args(&["migrate"])),
-            Err(UsageError::UnknownCommand("migrate".to_owned()))
+            parse(args(&["frobnicate"])),
+            Err(UsageError::UnknownCommand("frobnicate".to_owned()))
         );
         assert_eq!(
             parse(args(&["-v"])),
@@ -140,7 +151,7 @@ mod tests {
         let text = usage("demo");
 
         assert!(text.starts_with("Usage: demo [COMMAND]"));
-        for command in ["serve", "healthcheck", "version", "help"] {
+        for command in ["serve", "healthcheck", "migrate", "rollback", "version", "help"] {
             assert!(text.contains(command), "{command}");
         }
         for key in forge_config::KNOWN_KEYS {
