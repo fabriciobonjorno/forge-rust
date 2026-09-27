@@ -4,13 +4,15 @@ use std::{
     error::Error,
     ffi::OsString,
     fmt,
+    future::Future,
     io::{self, Write},
     net::SocketAddr,
+    pin::Pin,
     process::ExitCode,
     time::Duration,
 };
 
-use forge_config::{AppConfig, Environment};
+use forge_config::{AppConfig, Environment, SecretString};
 use forge_http::{RouteError, Router, Server, ServerError};
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -30,6 +32,10 @@ const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const UNKNOWN_VERSION: &str = "unknown";
 
 type RouteRegistration = Box<dyn FnOnce(&mut Router) -> Result<(), RouteError> + Send + 'static>;
+type DatabaseCommandFuture =
+    Pin<Box<dyn Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send + 'static>>;
+type DatabaseCommandHandler =
+    Box<dyn Fn(SecretString) -> DatabaseCommandFuture + Send + Sync + 'static>;
 
 /// A Forge application process.
 ///
@@ -41,6 +47,8 @@ pub struct App {
     name: &'static str,
     version: &'static str,
     registrations: Vec<RouteRegistration>,
+    migrate: Option<DatabaseCommandHandler>,
+    rollback: Option<DatabaseCommandHandler>,
 }
 
 impl fmt::Debug for App {
@@ -50,6 +58,7 @@ impl fmt::Debug for App {
             .field("name", &self.name)
             .field("version", &self.version)
             .field("route_registrations", &self.registrations.len())
+            .field("database_migrations", &self.migrate.is_some())
             .finish()
     }
 }
@@ -64,6 +73,8 @@ impl App {
             name,
             version: UNKNOWN_VERSION,
             registrations: Vec::new(),
+            migrate: None,
+            rollback: None,
         }
     }
 
@@ -90,11 +101,45 @@ impl App {
         self
     }
 
+    /// Registers database migration handlers.
+    ///
+    /// Generated PostgreSQL applications use this hook to keep SQLx confined to
+    /// their infrastructure/bootstrap boundary while the Forge process owns
+    /// command dispatch and runtime lifecycle.
+    #[must_use]
+    pub fn migrations<M, MFut, ME, R, RFut, RE>(mut self, migrate: M, rollback: R) -> Self
+    where
+        M: Fn(SecretString) -> MFut + Send + Sync + 'static,
+        MFut: Future<Output = Result<(), ME>> + Send + 'static,
+        ME: Error + Send + Sync + 'static,
+        R: Fn(SecretString) -> RFut + Send + Sync + 'static,
+        RFut: Future<Output = Result<(), RE>> + Send + 'static,
+        RE: Error + Send + Sync + 'static,
+    {
+        self.migrate = Some(Box::new(move |url| {
+            let future = migrate(url);
+            Box::pin(async move {
+                future
+                    .await
+                    .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+            })
+        }));
+        self.rollback = Some(Box::new(move |url| {
+            let future = rollback(url);
+            Box::pin(async move {
+                future
+                    .await
+                    .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+            })
+        }));
+        self
+    }
+
     /// Parses process arguments, runs the selected command and returns the
     /// process exit code.
     ///
-    /// Commands: `serve` (default), `healthcheck`, `version` (`--version`,
-    /// `-V`) and `help` (`--help`, `-h`). Exit codes: `0` success, `1` runtime
+    /// Commands: serve (default), healthcheck, migrate, rollback, version
+    /// (--version, -V) and help (--help, -h). Exit codes: 0 success, 1 runtime
     /// failure or unhealthy probe, `2` invalid command line, `78` invalid
     /// configuration.
     #[must_use]
@@ -106,6 +151,8 @@ impl App {
         match cli::parse(args) {
             Ok(Command::Serve) => self.serve(),
             Ok(Command::Healthcheck) => healthcheck(),
+            Ok(Command::Migrate) => self.run_database_command(DatabaseCommand::Migrate),
+            Ok(Command::Rollback) => self.run_database_command(DatabaseCommand::Rollback),
             Ok(Command::Version) => write_stdout(&format!("{} {}\n", self.name, self.version)),
             Ok(Command::Help) => write_stdout(&cli::usage(self.name)),
             Err(error) => {
@@ -120,6 +167,8 @@ impl App {
             name,
             version,
             registrations,
+            migrate: _,
+            rollback: _,
         } = self;
 
         let config = match AppConfig::from_env() {
@@ -163,7 +212,72 @@ impl App {
             }
         }
     }
+    fn run_database_command(self, command: DatabaseCommand) -> ExitCode {
+        let config = match AppConfig::from_env() {
+            Ok(config) => config,
+            Err(error) => return config_error(&error),
+        };
+        if let Err(error) = logging::init(&config.log) {
+            return config_error(&error);
+        }
+
+        let Some(url) = config.database.url else {
+            write_stderr("error: FORGE_DATABASE_URL is required for database commands\n");
+            return ExitCode::from(EXIT_CONFIG);
+        };
+
+        let handler = match command {
+            DatabaseCommand::Migrate => self.migrate,
+            DatabaseCommand::Rollback => self.rollback,
+        };
+        let Some(handler) = handler else {
+            write_stderr("error: database migrations are not configured for this application\n");
+            return ExitCode::FAILURE;
+        };
+
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                error!(app = self.name, error = %ErrorChain(&error), "failed to start async runtime");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let result = runtime.block_on(handler(url));
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                error!(
+                    app = self.name,
+                    command = command.as_str(),
+                    error = %ErrorChain(error.as_ref()),
+                    "database command failed"
+                );
+                ExitCode::FAILURE
+            }
+        }
+    }
 }
+
+#[derive(Clone, Copy)]
+enum DatabaseCommand {
+    Migrate,
+    Rollback,
+}
+
+impl DatabaseCommand {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Migrate => "migrate",
+            Self::Rollback => "rollback",
+        }
+    }
+}
+
 
 /// Builds the route table: framework health routes first, then the
 /// application's registrations in order.
@@ -317,6 +431,17 @@ mod tests {
             let code = App::new("demo").run_with_args(args(&[command]));
             assert_eq!(code, ExitCode::SUCCESS, "{command}");
         }
+    }
+
+    #[test]
+    fn migration_handlers_can_be_registered() {
+        let app = App::new("demo").migrations(
+            |_url| async { Ok::<(), std::io::Error>(()) },
+            |_url| async { Ok::<(), std::io::Error>(()) },
+        );
+
+        assert!(app.migrate.is_some());
+        assert!(app.rollback.is_some());
     }
 
     #[test]

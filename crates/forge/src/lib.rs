@@ -28,6 +28,7 @@ mod signal;
 
 pub use forge_config as config;
 pub use forge_core as core;
+pub use forge_db as db;
 pub use forge_http as http;
 
 pub use app::App;

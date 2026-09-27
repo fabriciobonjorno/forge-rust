@@ -32,6 +32,9 @@ pub(crate) enum Command {
         /// Do not generate the GitHub Actions workflow and Dependabot configuration.
         #[arg(long)]
         skip_ci: bool,
+        /// Generate an application without PostgreSQL, migrations or database Compose services.
+        #[arg(long)]
+        skip_database: bool,
         /// Do not run `cargo generate-lockfile` after generation.
         #[arg(long)]
         skip_lockfile: bool,
@@ -39,6 +42,11 @@ pub(crate) enum Command {
         /// paths are resolved by Cargo from the new application's directory.
         #[arg(long, value_name = "PATH")]
         forge_path: Option<String>,
+    },
+    /// Generate application artifacts.
+    Generate {
+        #[command(subcommand)]
+        generator: GenerateCommand,
     },
     /// Type-check the current application.
     Check,
@@ -50,4 +58,14 @@ pub(crate) enum Command {
     Lint,
     /// Build the optimized release binary from the locked dependency graph.
     Build,
+}
+
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum GenerateCommand {
+    /// Create a reversible SQL migration in migrations/.
+    Migration {
+        /// Human-readable migration name.
+        name: String,
+    },
 }

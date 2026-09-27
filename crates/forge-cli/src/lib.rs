@@ -13,7 +13,7 @@ use uuid::Uuid;
 pub use error::CliError;
 
 use crate::cargo::CargoCommand;
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, GenerateCommand};
 use crate::generate::{ForgeSource, NewApplication};
 
 /// Parses process arguments and executes the selected Forge command.
@@ -34,6 +34,7 @@ fn execute(
             name,
             skip_docker,
             skip_ci,
+            skip_database,
             skip_lockfile,
             forge_path,
         } => {
@@ -41,6 +42,7 @@ fn execute(
                 name,
                 docker: !skip_docker,
                 ci: !skip_ci,
+                database: !skip_database,
                 forge: forge_path.map_or(ForgeSource::GitTag, ForgeSource::Path),
             };
             let destination = generate::create_application(current_dir, &options)?;
@@ -65,6 +67,18 @@ fn execute(
             }
             Ok(())
         }
+        Command::Generate { generator } => match generator {
+            GenerateCommand::Migration { name } => {
+                let (up, down) = generate::create_migration(current_dir, &name)?;
+                writeln!(
+                    output,
+                    "Created migration files:\n  {}\n  {}",
+                    up.display(),
+                    down.display()
+                )
+                .map_err(CliError::Output)
+            }
+        },
         Command::Check => CargoCommand::Check.run(current_dir),
         Command::Test => CargoCommand::Test.run(current_dir),
         Command::Format => CargoCommand::Format.run(current_dir),

@@ -1,8 +1,8 @@
 # Deploying Forge Applications
 
-Status: Phase 1. This guide covers what a generated application provides today:
-a container image, a standalone binary, environment configuration, health
-endpoints and graceful shutdown. The examples use an application named `shop`.
+Status: Phase 2 in progress. This guide covers the generated container image,
+standalone binary, PostgreSQL development profile, environment configuration,
+health endpoints and graceful shutdown. The examples use an application named `shop`.
 Kubernetes and systemd snippets are starting points to review, not certified
 configurations. Forge does not generate a deployment tool yet
 ([ADR 0009](adr/0009-rails-style-generated-delivery-assets.md)).
@@ -54,15 +54,27 @@ shares the process namespace.
 ### Compose (local convenience)
 
 The generated `compose.yaml` builds the image and publishes it on
-`127.0.0.1:3000` only (not on all host interfaces). It sets
-`stop_grace_period: 20s` (longer than the default 15-second drain) and applies `read_only: true`, a `tmpfs` at `/tmp`, `cap_drop: [ALL]`,
-`security_opt: [no-new-privileges:true]` and `init: true`. It is for local runs
-and has no database service yet (PostgreSQL arrives in Phase 2). Compose is not
-Forge's production orchestration contract.
+`127.0.0.1:3000` only. By default it also provides PostgreSQL 18, pinned by
+image digest, with development-only credentials, a named `db-data` volume and
+a `pg_isready` health check. A one-shot `migrate` service must complete
+successfully before the application starts.
+
+The app and migration containers use `read_only: true`, drop all capabilities
+and set `no-new-privileges`; the app also uses a `tmpfs` at `/tmp` and
+`stop_grace_period: 20s`. Compose is a development convenience, not Forge's
+production orchestration contract.
 
 ```sh
+docker compose up -d db
+export FORGE_DATABASE_URL='postgres://app:app@127.0.0.1:5432/<database>'
+cargo run -- migrate
+
+# Or start the complete development stack:
 docker compose up --build
 ```
+
+Applications generated with `--skip-database` omit PostgreSQL and the migration
+service while retaining the ordinary app container workflow.
 
 ### Pinning base images for release builds
 
@@ -103,6 +115,7 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. Extra connections wait for a slot (backpressure) instead of being served without bound. |
 | `FORGE_LOG` | `info` | `tracing` filter directive, for example `info,shop=debug`. |
 | `FORGE_LOG_FORMAT` | `json` in production, `text` otherwise | `json` or `text`. |
+| `FORGE_DATABASE_URL` | none | PostgreSQL connection URL for database-enabled applications and migration commands. Treated as a secret and redacted from ordinary diagnostics. |
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
 collects them. The HTTP layer also enforces a header-read timeout and adds
@@ -110,8 +123,11 @@ collects them. The HTTP layer also enforces a header-read timeout and adds
 `x-request-id` to responses. Transient `accept` errors, such as running out of
 file descriptors, do not stop the server.
 
-Do not put secrets in the image or in build arguments. Phase 1 has no secret
-settings. Secret references arrive with the features that need them.
+Do not put secrets in the image or in build arguments. `FORGE_DATABASE_URL`
+often contains credentials; inject it at runtime through the deployment
+platform's secret mechanism. Forge's typed configuration redacts the value from
+normal Debug/serialization output, but adapters must still avoid logging the
+exposed URL.
 
 ## Health endpoints
 

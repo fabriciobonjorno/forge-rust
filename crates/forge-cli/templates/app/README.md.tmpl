@@ -15,26 +15,34 @@ src/bootstrap       composition root and process lifecycle
 
 ## Development
 
-%%if postgresql%%
-The application uses PostgreSQL.
-%%end%%
-%%if mysql%%
-The application uses MySQL (MariaDB is also supported).
-%%end%%
-%%if sqlite%%
-The application uses SQLite; the development database is a file in `storage/`.
-%%end%%
 %%if database%%
-%%if !sqlite%%
+This application uses PostgreSQL. SQLx stays in the outer
+infrastructure/bootstrap boundary; domain and application code do not depend on it.
+
 %%if docker%%
-Start the development database with `docker compose up -d db`, then:
+Start PostgreSQL with:
+
+```bash
+docker compose up -d db
+```
 %%end%%
-%%end%%
+
+Set the database URL and run embedded migrations:
 
 ```bash
 export FORGE_DATABASE_URL='%%DATABASE_URL_LOCAL%%'
 forge migrate                 # or: cargo run -- migrate
 ```
+
+Create a reversible migration with:
+
+```bash
+forge generate migration create_customers
+```
+
+This creates matching `.up.sql` and `.down.sql` files in `migrations/`.
+Migration SQL is checked out with LF line endings so SQLx hashes remain stable
+across operating systems.
 
 %%end%%
 ```bash
@@ -45,39 +53,35 @@ forge check && forge lint && forge test
 
 Binary commands: `serve` (default), `healthcheck`, `version`, `help`.
 %%if database%%
-`migrate` applies pending migrations from `migrations/` (embedded in the
-binary) and `rollback` reverts the latest one. Create migrations with
-`forge generate migration <name>`.
+Database-enabled binaries also support `migrate` and `rollback`.
+`migrate` applies pending embedded migrations; `rollback` reverts the latest
+reversible migration.
 %%end%%
+
 Configuration uses `FORGE_*` environment variables; unknown `FORGE_*` keys are
 rejected at startup. Run `cargo run -- help` for the full list.
-%%if docker%%
 
+%%if docker%%
 ## Container
 
 ```bash
 docker build -t %%APP_NAME%% .
 %%if database%%
-docker compose up --build     # database, migrations, then the application
+docker compose up --build     # PostgreSQL, one-shot migrations, then app
 %%end%%
 %%if !database%%
 docker run --rm -p 3000:3000 %%APP_NAME%%
-docker compose up --build     # read-only, non-root, all capabilities dropped
+docker compose up --build
 %%end%%
 ```
 
 The image is built with `cargo build --release --locked`, so commit
 `Cargo.lock`. The runtime stage is distroless and runs as uid 65532; the Docker
 health check runs `%%APP_NAME%% healthcheck`.
+
 %%if database%%
-`compose.yaml` runs a one-shot `migrate` service before starting the
-application.
-%%if !sqlite%%
-Its database credentials are for local development only.
-%%end%%
-%%if sqlite%%
-The SQLite file lives in the `app-data` volume mounted at `/data`; without a
-mount the image keeps it in an anonymous volume.
-%%end%%
+The Compose PostgreSQL credentials are development-only. The database is stored
+in the named `db-data` volume, and the app starts only after the database is
+healthy and migrations complete successfully.
 %%end%%
 %%end%%

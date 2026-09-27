@@ -31,6 +31,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_MAX_CONNECTIONS",
     "FORGE_LOG",
     "FORGE_LOG_FORMAT",
+    "FORGE_DATABASE_URL",
 ];
 
 /// Runtime environment controls safety-sensitive defaults.
@@ -150,6 +151,51 @@ impl Default for LogConfig {
     }
 }
 
+/// A secret configuration value.
+///
+/// Debug and serialization are deliberately redacted so credentials cannot be
+/// exposed by ordinary diagnostics. Call expose only at the adapter boundary
+/// that needs the underlying value.
+#[derive(Clone, Eq, PartialEq, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    /// Wraps a secret value.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Exposes the secret to a concrete adapter.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl Serialize for SecretString {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str("[REDACTED]")
+    }
+}
+
+/// Database settings after validation.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    /// PostgreSQL connection URL. Optional for applications without a database.
+    pub url: Option<SecretString>,
+}
+
 /// Complete process configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -159,6 +205,8 @@ pub struct AppConfig {
     pub server: ServerConfig,
     /// Logging settings.
     pub log: LogConfig,
+    /// Database settings.
+    pub database: DatabaseConfig,
 }
 
 impl AppConfig {
@@ -240,6 +288,17 @@ impl AppConfig {
                 });
             }
             config.log.filter = filter.to_owned();
+        }
+        if let Some(value) = lookup("FORGE_DATABASE_URL") {
+            let url = value.trim();
+            if url.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    key: "FORGE_DATABASE_URL",
+                    value,
+                    expected: "a non-empty PostgreSQL connection URL",
+                });
+            }
+            config.database.url = Some(SecretString::new(url));
         }
         // The format default depends on the environment, so derive it only
         // after FORGE_ENV has been applied.
@@ -515,6 +574,44 @@ mod tests {
     }
 
     #[test]
+    fn database_url_is_available_but_redacted() {
+        let config = AppConfig::from_vars(vars(&[(
+            "FORGE_DATABASE_URL",
+            "postgres://app:super-secret@localhost/app",
+        )]))
+        .expect("database URL should be accepted");
+
+        let url = config
+            .database
+            .url
+            .as_ref()
+            .expect("database URL should be present");
+        assert_eq!(url.expose(), "postgres://app:super-secret@localhost/app");
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("super-secret"));
+        assert!(debug.contains("[REDACTED]"));
+
+        let json = serde_json::to_string(&config).expect("config should serialize");
+        assert!(!json.contains("super-secret"));
+        assert!(json.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn blank_database_url_is_rejected() {
+        let error = AppConfig::from_vars(vars(&[("FORGE_DATABASE_URL", "   ")]))
+            .expect_err("blank database URL must be rejected");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidValue {
+                key: "FORGE_DATABASE_URL",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn every_known_key_is_accepted() {
         let values = [
             "production",
@@ -525,6 +622,7 @@ mod tests {
             "10",
             "debug",
             "json",
+            "postgres://app:secret@localhost/app",
         ];
         let pairs: Vec<(&str, &str)> = KNOWN_KEYS.iter().copied().zip(values).collect();
         assert_eq!(pairs.len(), KNOWN_KEYS.len());

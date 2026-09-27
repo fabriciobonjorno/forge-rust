@@ -51,6 +51,27 @@ The architectural choices currently permit, but do not yet install:
 An allowed role is not blanket approval of any crate or feature set. Version and
 feature choices still undergo admission review.
 
+## Phase 2 PostgreSQL dependency decision
+
+Phase 2 generated applications use SQLx 0.9 as the concrete PostgreSQL adapter.
+The generated dependency disables SQLx default features and enables only the
+capabilities Forge currently consumes: PostgreSQL, Tokio runtime integration,
+migrations/macros, UUID, JSON, chrono, and Rustls with the ring/WebPKI root
+backend.
+
+SQLx remains an outer-layer implementation detail: Forge-owned database errors,
+optimistic-version values and transaction contracts live in `forge-db`; domain
+and application rings must not import SQLx. Generated bootstrap/infrastructure
+code may use SQLx directly because those layers are adapters.
+
+Rustls is enabled explicitly rather than relying on a runtime feature to imply
+TLS. This keeps production PostgreSQL URLs that require TLS within the supported
+generated configuration while avoiding a native OpenSSL dependency.
+
+The dependency is not added to the framework workspace merely for convenience:
+only generated applications that enable the database capability consume it.
+`--skip-database` removes SQLx entirely from a generated application's graph.
+
 ## Features and public API containment
 
 - Set `default-features = false` when defaults add unused protocols, native
