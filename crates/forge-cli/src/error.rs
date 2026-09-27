@@ -13,6 +13,11 @@ pub enum CliError {
         path: String,
         reason: &'static str,
     },
+    InvalidMigrationName {
+        name: String,
+        reason: &'static str,
+    },
+    Clock(std::time::SystemTimeError),
     DestinationExists(PathBuf),
     CreateDirectory {
         path: PathBuf,
@@ -48,6 +53,10 @@ impl fmt::Display for CliError {
             Self::InvalidForgePath { path, reason } => {
                 write!(formatter, "invalid --forge-path {path:?}: {reason}")
             }
+            Self::InvalidMigrationName { name, reason } => {
+                write!(formatter, "invalid migration name {name:?}: {reason}")
+            }
+            Self::Clock(error) => write!(formatter, "system clock is before the Unix epoch: {error}"),
             Self::DestinationExists(path) => write!(
                 formatter,
                 "destination `{}` already exists; refusing to overwrite it",
@@ -79,8 +88,10 @@ impl std::error::Error for CliError {
             | Self::CreateDirectory { source: error, .. }
             | Self::WriteFile { source: error, .. }
             | Self::SpawnCargo { source: error, .. } => Some(error),
+            Self::Clock(error) => Some(error),
             Self::InvalidApplicationName { .. }
             | Self::InvalidForgePath { .. }
+            | Self::InvalidMigrationName { .. }
             | Self::DestinationExists(_)
             | Self::CargoFailed { .. } => None,
         }
