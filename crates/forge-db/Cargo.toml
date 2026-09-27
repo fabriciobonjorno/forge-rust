@@ -1,0 +1,15 @@
+[package]
+name = "forge-db"
+description = "Database contracts and transaction primitives for Forge applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
