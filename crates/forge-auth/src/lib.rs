@@ -6,6 +6,8 @@
 //! review. A session proves identity only. Tenant roles are resolved separately
 //! so authorization changes do not remain stale inside credentials.
 
+use std::num::NonZeroU64;
+
 use async_trait::async_trait;
 use forge_core::Id;
 use forge_security::PrincipalId;
@@ -282,10 +284,7 @@ impl Session {
     /// Authenticates this session at a trusted current time.
     ///
     /// Expiry is exclusive: authentication exactly at expires_at is denied.
-    pub fn authenticate(
-        &self,
-        now: UnixTimestamp,
-    ) -> Result<AuthenticatedPrincipal, SessionError> {
+    pub fn authenticate(&self, now: UnixTimestamp) -> Result<AuthenticatedPrincipal, SessionError> {
         if self.revoked_at.is_some() {
             return Err(SessionError::Revoked);
         }
@@ -374,6 +373,15 @@ pub trait PasswordHasher: Send + Sync {
         password: &[u8],
         expected: &PasswordHash,
     ) -> Result<bool, PasswordHashError>;
+
+    /// Returns whether a successfully verified hash should be upgraded to the
+    /// implementation's current password policy.
+    ///
+    /// Implementations that do not support policy upgrades may keep the
+    /// conservative default.
+    fn needs_rehash(&self, _expected: &PasswordHash) -> Result<bool, PasswordHashError> {
+        Ok(false)
+    }
 }
 
 /// Safe password hashing failure.
@@ -390,12 +398,34 @@ pub enum PasswordHashError {
     InvalidPassword,
 }
 
+/// Optimistic version of a persisted password credential.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PasswordCredentialVersion(NonZeroU64);
+
+impl PasswordCredentialVersion {
+    /// Creates a positive credential version.
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Returns the positive version number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 /// Persisted password credential resolved by a login identifier.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PasswordCredential {
     principal_id: PrincipalId,
     password_hash: PasswordHash,
     disabled: bool,
+    version: PasswordCredentialVersion,
 }
 
 impl PasswordCredential {
@@ -405,11 +435,13 @@ impl PasswordCredential {
         principal_id: PrincipalId,
         password_hash: PasswordHash,
         disabled: bool,
+        version: PasswordCredentialVersion,
     ) -> Self {
         Self {
             principal_id,
             password_hash,
             disabled,
+            version,
         }
     }
 
@@ -430,6 +462,12 @@ impl PasswordCredential {
     pub const fn disabled(&self) -> bool {
         self.disabled
     }
+
+    /// Optimistic version observed with this credential.
+    #[must_use]
+    pub const fn version(&self) -> PasswordCredentialVersion {
+        self.version
+    }
 }
 
 /// Persistence boundary used by password authentication.
@@ -440,6 +478,17 @@ pub trait PasswordCredentialStore: Send + Sync {
         &self,
         login: &str,
     ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError>;
+
+    /// Replaces the password hash only when the observed credential version is
+    /// still current. Implementations increment the persisted version on
+    /// success and return Conflict on a stale version or concurrently disabled
+    /// principal.
+    async fn replace_password_hash(
+        &self,
+        principal_id: PrincipalId,
+        expected_version: PasswordCredentialVersion,
+        password_hash: &PasswordHash,
+    ) -> Result<(), PasswordCredentialStoreError>;
 }
 
 /// Safe password credential persistence error.
@@ -448,6 +497,9 @@ pub enum PasswordCredentialStoreError {
     /// Durable credential storage is unavailable.
     #[error("credential store unavailable")]
     Unavailable,
+    /// Optimistic credential update lost a race or the principal was disabled.
+    #[error("credential store conflict")]
+    Conflict,
     /// Stored credential data is malformed or violates framework invariants.
     #[error("invalid persisted credential")]
     CorruptRecord,
@@ -541,6 +593,17 @@ mod tests {
     }
 
     #[test]
+    fn password_credential_version_must_be_positive() {
+        assert!(PasswordCredentialVersion::new(0).is_none());
+        assert_eq!(
+            PasswordCredentialVersion::new(7)
+                .expect("positive version")
+                .get(),
+            7
+        );
+    }
+
+    #[test]
     fn lifetime_is_fail_closed() {
         let principal = PrincipalId::new();
         assert_eq!(
@@ -611,7 +674,9 @@ mod tests {
         let mut session = Session::new(principal, time(10), time(40)).expect("valid session");
 
         session.revoke(time(20)).expect("revocation should succeed");
-        session.revoke(time(30)).expect("repeated revocation should succeed");
+        session
+            .revoke(time(30))
+            .expect("repeated revocation should succeed");
 
         assert_eq!(session.revoked_at(), Some(time(20)));
     }

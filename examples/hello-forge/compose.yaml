@@ -1,5 +1,4 @@
-# Runs the production image locally. This is a development convenience,
-# not a production orchestration contract.
+# Development convenience only; not a production orchestration contract.
 services:
   app:
     build: .

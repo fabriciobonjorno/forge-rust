@@ -122,11 +122,7 @@ impl TenantContext {
         }
 
         let authorization = policy
-            .authorize(
-                authenticated.principal_id(),
-                membership.roles(),
-                permission,
-            )
+            .authorize(authenticated.principal_id(), membership.roles(), permission)
             .map_err(TenantContextError::Authorization)?;
 
         Ok(Self {
@@ -269,13 +265,9 @@ mod tests {
         let mut policy = RbacPolicy::new();
         policy.allow(admin, permission.clone());
 
-        let context = TenantContext::authorize(
-            authenticated(principal),
-            &membership,
-            &policy,
-            &permission,
-        )
-        .expect("authorized membership should create context");
+        let context =
+            TenantContext::authorize(authenticated(principal), &membership, &policy, &permission)
+                .expect("authorized membership should create context");
 
         assert_eq!(context.tenant_id(), tenant);
         assert_eq!(context.principal_id(), principal);
@@ -296,12 +288,7 @@ mod tests {
         policy.allow(Role::new("admin").expect("valid role"), permission.clone());
 
         assert_eq!(
-            TenantContext::authorize(
-                authenticated(attacker),
-                &membership,
-                &policy,
-                &permission,
-            ),
+            TenantContext::authorize(authenticated(attacker), &membership, &policy, &permission,),
             Err(TenantContextError::PrincipalMismatch)
         );
     }
@@ -337,23 +324,15 @@ mod tests {
         let policy = RbacPolicy::new();
 
         assert_eq!(
-            TenantContext::authorize(
-                authenticated(principal),
-                &membership,
-                &policy,
-                &permission,
-            ),
-            Err(TenantContextError::Authorization(AuthorizationError::Denied))
+            TenantContext::authorize(authenticated(principal), &membership, &policy, &permission,),
+            Err(TenantContextError::Authorization(
+                AuthorizationError::Denied
+            ))
         );
 
         membership.suspend();
         assert_eq!(
-            TenantContext::authorize(
-                authenticated(principal),
-                &membership,
-                &policy,
-                &permission,
-            ),
+            TenantContext::authorize(authenticated(principal), &membership, &policy, &permission,),
             Err(TenantContextError::InactiveMembership)
         );
     }

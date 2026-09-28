@@ -60,7 +60,6 @@ pub(crate) enum Command {
     Build,
 }
 
-
 #[derive(Debug, Subcommand)]
 pub(crate) enum GenerateCommand {
     /// Create a reversible SQL migration in migrations/.

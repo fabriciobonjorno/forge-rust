@@ -9,10 +9,10 @@ use sqlx::{PgPool, Postgres, Transaction};
 /// RLS policies should read these values with current_setting(..., true). The
 /// third set_config argument is true, so pooled connections do not retain tenant
 /// identity after commit/rollback.
-pub(crate) async fn begin_tenant_transaction(
-    pool: &PgPool,
+pub async fn begin_tenant_transaction<'a>(
+    pool: &'a PgPool,
     context: &TenantContext,
-) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+) -> Result<Transaction<'a, Postgres>, sqlx::Error> {
     let mut transaction = pool.begin().await?;
 
     sqlx::query(

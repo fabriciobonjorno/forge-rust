@@ -8,9 +8,9 @@ in progress: server-side session lifecycle, deny-by-default RBAC, explicit
 membership and authorized TenantContext contracts, least-privilege PostgreSQL/RLS,
 digest-only persistent sessions, Argon2id password verification, opaque
 session/CSRF secrets, secure cookie helpers, and append-only audit persistence
-are implemented. Login throttling, turnkey HTTP auth route composition, password
-rehash-on-policy-upgrade, and stronger audit integrity/retention controls remain
-open.
+are implemented, including optimistic Argon2id rehash-on-policy-upgrade after a
+successful login. Login throttling, turnkey HTTP auth route composition, and
+stronger audit integrity/retention controls remain open.
 
 Forge is an opinionated Rust application framework for long-lived services. Its
 value is the integration of explicit application architecture, secure defaults,
@@ -225,7 +225,10 @@ use Argon2id on Tokio blocking workers; bearer and CSRF tokens are independent
 serialized in a Secure/HttpOnly/SameSite=Lax `__Host-forge_session` cookie; and
 unsafe cookie-authenticated HTTP methods require the independent
 `x-csrf-token` value. Public login denial does not reveal whether an account is
-missing, disabled, or has the wrong password. See
+missing, disabled, or has the wrong password. Successfully verified passwords
+whose PHC parameters no longer match policy are rehashed and updated with an
+optimistic credential version; a concurrent password change/disable wins and the
+login fails closed rather than overwriting it. See
 [ADR 0014](adr/0014-argon2-session-cookie-and-csrf.md).
 
 ### Database and transactions

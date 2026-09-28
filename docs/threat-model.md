@@ -160,8 +160,10 @@ database boundary. It verifies migration/runtime privilege separation, tenant
 RLS isolation, append-only audit restrictions, identity/session schema
 invariants, digest-only session persistence, and membership lifecycle storage.
 Unit tests in the generated security module cover Argon2id authentication,
-generic login denial, opaque token generation, cookie attributes, session lookup,
-and CSRF enforcement.
+policy-upgrade detection, generic login denial, opaque token generation, cookie
+attributes, session lookup, and CSRF enforcement. The generated database E2E also
+checks that runtime password-hash updates are column-restricted and use an
+optimistic credential version so stale upgrades do not overwrite newer state.
 
 Append-only audit persistence remains a separate structured security-evidence
 channel. The generated runtime role can INSERT audit events but cannot SELECT,
@@ -171,9 +173,9 @@ storage.
 
 Remaining Phase 3 threat-model controls are not claimed complete: per-account and
 per-origin credential throttling, turnkey HTTP login/logout/tenant-selection
-composition, password rehash-on-policy-upgrade, audit integrity
-chaining/retention and privileged reader workflows, and administrative
-cross-tenant role separation still require implementation and abuse tests.
+composition, audit integrity chaining/retention and privileged reader workflows,
+and administrative cross-tenant role separation still require implementation and
+abuse tests.
 
 ## Review cadence
 

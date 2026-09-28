@@ -336,10 +336,7 @@ where
     Ok(parsed)
 }
 
-fn parse_secret_url(
-    key: &'static str,
-    value: String,
-) -> Result<SecretString, ConfigError> {
+fn parse_secret_url(key: &'static str, value: String) -> Result<SecretString, ConfigError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(ConfigError::InvalidValue {

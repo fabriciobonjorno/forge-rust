@@ -109,8 +109,11 @@ can read them with `current_setting('forge.tenant_id', true)` and
 Argon2id password hashing (m=19456 KiB, t=2, p=1) on Tokio blocking workers,
 independent 256-bit session/CSRF tokens from the OS CSPRNG, SHA-256 persistence
 digests, a Secure/HttpOnly/SameSite=Lax `__Host-forge_session` cookie, generic
-login denials, request session lookup and CSRF enforcement for unsafe methods.
-The bearer cookie and CSRF token are separate secrets; never place the CSRF token
+login denials, automatic Argon2id policy upgrades after successful verification,
+request session lookup and CSRF enforcement for unsafe methods. Password rehashes
+use optimistic credential versions so a concurrent password change or disable
+cannot be overwritten. The bearer cookie and CSRF token are separate secrets;
+never place the CSRF token
 inside the HttpOnly session cookie.
 %%end%%
 %%end%%

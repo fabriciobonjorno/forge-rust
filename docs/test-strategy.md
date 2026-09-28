@@ -79,7 +79,8 @@ tenant/principal settings are installed, and cannot write another tenant's row.
 ### Authentication and security
 
 Test password/session lifecycle, Argon2id parameter selection and malformed PHC
-handling, generic credential denial, bounded password input, bearer/CSRF entropy
+handling, policy-upgrade detection and optimistic rehash conflicts, generic
+credential denial, bounded password input, bearer/CSRF entropy
 and independence, digest-only persistence, cookie flags, session revocation and
 rotation, CSRF safe/unsafe method behavior, RBAC deny-by-default, role changes,
 brute-force/rate limits, CORS, SSRF redirect and address cases, path
@@ -141,8 +142,9 @@ the runtime role has no DDL authority, missing tenant settings deny visibility,
 and two-tenant reads/writes remain isolated. The same generated-app path verifies
 that Forge identity migrations create principal/session/membership storage, bearer
 and CSRF digests are persisted without raw secrets, session mutation is limited to
-monotonic revocation, and membership state persists independently from session
-credentials.
+monotonic revocation, membership state persists independently from session
+credentials, and runtime password rehash updates are restricted to hash metadata
+with stale versions rejected.
 
 ## Concurrency correctness
 

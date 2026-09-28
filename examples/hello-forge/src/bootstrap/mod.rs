@@ -4,7 +4,7 @@
 
 use std::process::ExitCode;
 
-/// Runs the command selected on the command line (`serve` by default).
+/// Runs the command selected on the command line (serve by default).
 pub fn run() -> ExitCode {
     forge::App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
