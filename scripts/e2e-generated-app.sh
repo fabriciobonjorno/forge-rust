@@ -113,6 +113,101 @@ SQL
   [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_audit_events')")" == "forge_audit_events" ]] \
     || fail "framework audit migration did not create the audit table"
 
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_login_throttles')")" == "forge_login_throttles" ]] \
+    || fail "framework throttle migration did not create the throttle table"
+
+  cat >tests/forge_login_throttle_e2e.rs <<'RS'
+use std::error::Error;
+
+use app::infrastructure::auth::PostgresLoginThrottleStore;
+use forge::auth::{
+    LoginThrottleDecision, LoginThrottleKey, LoginThrottlePolicy, LoginThrottleStore,
+    UnixTimestamp,
+};
+use sqlx::PgPool;
+use tokio::task::JoinSet;
+
+#[test]
+fn postgres_login_throttle_serializes_parallel_attempts() -> Result<(), Box<dyn Error>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async {
+        let url = std::env::var("FORGE_DATABASE_URL")?;
+        let pool = PgPool::connect(&url).await?;
+        let store = PostgresLoginThrottleStore::new(pool.clone());
+        let policy = match LoginThrottlePolicy::new(3, 60, 120) {
+            Some(policy) => policy,
+            None => return Err("test throttle policy is invalid".into()),
+        };
+        let key = LoginThrottleKey::from_bytes([0x42; 32]);
+
+        store.clear(&key).await?;
+
+        let mut attempts = JoinSet::new();
+        for _ in 0..10 {
+            let store = store.clone();
+            attempts.spawn(async move {
+                store
+                    .reserve(&key, UnixTimestamp::from_secs(100), policy)
+                    .await
+            });
+        }
+
+        let mut allowed = 0_u32;
+        let mut denied = 0_u32;
+        while let Some(result) = attempts.join_next().await {
+            match result?? {
+                LoginThrottleDecision::Allowed => allowed += 1,
+                LoginThrottleDecision::Denied {
+                    retry_after_seconds,
+                } => {
+                    assert_eq!(retry_after_seconds, 120);
+                    denied += 1;
+                }
+            }
+        }
+
+        assert_eq!(allowed, 3);
+        assert_eq!(denied, 7);
+
+        assert_eq!(
+            store
+                .reserve(&key, UnixTimestamp::from_secs(150), policy)
+                .await?,
+            LoginThrottleDecision::Denied {
+                retry_after_seconds: 70,
+            }
+        );
+
+        assert_eq!(
+            store
+                .reserve(&key, UnixTimestamp::from_secs(221), policy)
+                .await?,
+            LoginThrottleDecision::Allowed
+        );
+
+        store.clear(&key).await?;
+        assert_eq!(
+            store
+                .reserve(&key, UnixTimestamp::from_secs(222), policy)
+                .await?,
+            LoginThrottleDecision::Allowed
+        );
+
+        store.clear(&key).await?;
+        pool.close().await;
+        Ok::<(), Box<dyn Error>>(())
+    })?;
+
+    Ok(())
+}
+RS
+
+  FORGE_DATABASE_URL="$runtime_database_url" \
+    cargo test --quiet --locked --test forge_login_throttle_e2e
+
   audit_id="01941f29-7c00-7000-8000-000000000010"
   docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app -v ON_ERROR_STOP=1 -c "
     INSERT INTO forge_audit_events (
