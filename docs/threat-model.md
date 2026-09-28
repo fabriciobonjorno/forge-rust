@@ -146,29 +146,34 @@ and generated diagnostic bundles. Secret access is capability-scoped and audited
 
 Review date: 2026-09-27.
 
-The first Phase 3 slices implement typed authenticated principals, deny-by-default
-RBAC, explicit tenant membership/TenantContext, separate PostgreSQL migration and
-runtime roles, and transaction-local tenant/principal settings for RLS. The
+The implemented Phase 3 slices provide typed authenticated principals,
+deny-by-default RBAC, explicit tenant membership/TenantContext, separate
+PostgreSQL migration/runtime roles, transaction-local tenant/principal settings
+for tenant-owned data, persistent credential-digest sessions, membership
+persistence, Argon2id password verification, independent opaque bearer/CSRF
+secrets, secure host-only cookie helpers, and append-only audit persistence. The
 long-running runtime role is generated without schema ownership or BYPASSRLS, and
-migration commands require a credential that is distinct from the runtime URL.
+migration commands require a credential distinct from the runtime URL.
 
 `scripts/e2e-generated-app.sh` is the linked negative integration test for the
-database boundary. It verifies that the runtime credential cannot be used for
-migration dispatch, the runtime database role cannot create schema objects,
-missing tenant context sees no RLS-protected rows, one tenant cannot see another
-tenant's row, and a cross-tenant write is rejected.
+database boundary. It verifies migration/runtime privilege separation, tenant
+RLS isolation, append-only audit restrictions, identity/session schema
+invariants, digest-only session persistence, and membership lifecycle storage.
+Unit tests in the generated security module cover Argon2id authentication,
+generic login denial, opaque token generation, cookie attributes, session lookup,
+and CSRF enforcement.
 
-Append-only audit persistence is now implemented as a separate structured
-security-evidence channel. The generated runtime role can INSERT audit events but
-cannot SELECT, UPDATE, or DELETE them, and a database trigger rejects audit-row
-mutation. This satisfies the restricted append-only writer portion of the audit
-control, not tamper-evident cryptographic integrity or immutable external storage.
+Append-only audit persistence remains a separate structured security-evidence
+channel. The generated runtime role can INSERT audit events but cannot SELECT,
+UPDATE, or DELETE them, and a database trigger rejects audit-row mutation. This
+does not claim tamper-evident cryptographic integrity or immutable external
+storage.
 
-Remaining Phase 3 threat-model controls are not claimed complete: password
-hashing/credential throttling, secure cookie and CSRF behavior, persistent session
-revocation, membership persistence, audit integrity chaining/retention and
-privileged reader workflows, administrative cross-tenant role separation, and
-HTTP policy integration still require their own implementation and abuse tests.
+Remaining Phase 3 threat-model controls are not claimed complete: per-account and
+per-origin credential throttling, turnkey HTTP login/logout/tenant-selection
+composition, password rehash-on-policy-upgrade, audit integrity
+chaining/retention and privileged reader workflows, and administrative
+cross-tenant role separation still require implementation and abuse tests.
 
 ## Review cadence
 

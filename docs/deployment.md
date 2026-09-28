@@ -147,6 +147,26 @@ runtime database role should be `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`,
 `NOBYPASSRLS`, and should not own application schemas. See
 [ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md).
 
+## Authentication cookies and TLS
+
+Generated authentication infrastructure serializes the server-side bearer as
+`__Host-forge_session` with `Secure`, `HttpOnly`, `Path=/`, no `Domain`
+attribute and `SameSite=Lax`. Client-facing authentication therefore requires
+an HTTPS origin. A reverse proxy/load balancer may terminate TLS before forwarding
+plain HTTP on a trusted private hop; the application still emits the Secure
+cookie because the browser-facing origin is HTTPS.
+
+Do not weaken production behavior by removing `Secure` or the `__Host-` prefix
+to make browser login work over arbitrary development HTTP. Use an HTTPS local
+proxy/origin when testing the full browser flow.
+
+Cookie-authenticated POST/PUT/PATCH/DELETE requests must also send exactly one
+`x-csrf-token` header containing the independent CSRF token issued with the
+session. The HttpOnly bearer cookie and CSRF token are intentionally different
+256-bit secrets. CORS credential support is not enabled implicitly; applications
+that add cross-origin credentialed requests need an exact reviewed origin
+allowlist.
+
 ## Health endpoints
 
 These routes are always registered:

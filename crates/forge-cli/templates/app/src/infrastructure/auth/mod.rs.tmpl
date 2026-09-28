@@ -1,20 +1,29 @@
 //! PostgreSQL server-side session persistence.
+//!
+//! Only credential digests are persisted. Raw bearer credentials are never
+//! accepted by this adapter.
 
 use async_trait::async_trait;
 use forge::auth::{
-    Session, SessionId, SessionStore, SessionStoreError, SessionStoreErrorKind, UnixTimestamp,
+    CsrfTokenDigest, PasswordCredential, PasswordCredentialStore,
+    PasswordCredentialStoreError, PasswordHash, Session, SessionCredentialDigest, SessionId,
+    SessionStore, SessionStoreError, UnixTimestamp,
 };
 use forge::security::PrincipalId;
-use sqlx::{PgPool, Row, types::Uuid};
+use sqlx::{PgPool, types::Uuid};
 
-/// PostgreSQL-backed server-side session lifecycle store.
-#[derive(Clone, Debug)]
-pub struct PgSessionStore {
+/// SQLx-backed password credential lookup.
+///
+/// This adapter never returns whether a login was absent to the HTTP boundary;
+/// the authentication mechanism maps absence/disabled/wrong-password to the same
+/// public login failure.
+#[derive(Clone)]
+pub struct PostgresPasswordCredentialStore {
     pool: PgPool,
 }
 
-impl PgSessionStore {
-    /// Creates a session store using the application runtime pool.
+impl PostgresPasswordCredentialStore {
+    /// Creates a credential store using the least-privilege runtime pool.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -22,164 +31,279 @@ impl PgSessionStore {
 }
 
 #[async_trait]
-impl SessionStore for PgSessionStore {
-    async fn insert(&self, session: &Session) -> Result<(), SessionStoreError> {
+impl PasswordCredentialStore for PostgresPasswordCredentialStore {
+    async fn find_by_login(
+        &self,
+        login: &str,
+    ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError> {
+        let row = sqlx::query_as::<_, (Uuid, String, bool)>(
+            "SELECT id, password_hash, disabled_at IS NOT NULL
+             FROM forge_principals
+             WHERE lower(login) = lower($1)
+               AND password_hash IS NOT NULL
+             LIMIT 1",
+        )
+        .bind(login)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PasswordCredentialStoreError::Unavailable)?;
+
+        row.map(|(principal_id, password_hash, disabled)| {
+            let principal_id = PrincipalId::from_uuid(principal_id)
+                .map_err(|_| PasswordCredentialStoreError::CorruptRecord)?;
+            let password_hash = PasswordHash::new(password_hash)
+                .map_err(|_| PasswordCredentialStoreError::CorruptRecord)?;
+            Ok(PasswordCredential::new(
+                principal_id,
+                password_hash,
+                disabled,
+            ))
+        })
+        .transpose()
+    }
+}
+
+/// SQLx-backed server-side session store.
+#[derive(Clone)]
+pub struct PostgresSessionStore {
+    pool: PgPool,
+}
+
+impl PostgresSessionStore {
+    /// Creates a store using the least-privilege runtime pool.
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl SessionStore for PostgresSessionStore {
+    async fn insert(
+        &self,
+        session: &Session,
+        credential: &SessionCredentialDigest,
+        csrf: &CsrfTokenDigest,
+    ) -> Result<(), SessionStoreError> {
+        let issued_at = timestamp_to_i64(session.issued_at())?;
+        let expires_at = timestamp_to_i64(session.expires_at())?;
+        let revoked_at = session
+            .revoked_at()
+            .map(timestamp_to_i64)
+            .transpose()?;
+
         sqlx::query(
             "INSERT INTO forge_sessions (
-                id, principal_id, issued_at_unix, expires_at_unix, revoked_at_unix
-             ) VALUES ($1, $2, $3, $4, $5)",
+                id, principal_id, credential_digest, csrf_digest,
+                issued_at, expires_at, revoked_at
+             )
+             VALUES (
+                $1, $2, $3, $4,
+                to_timestamp($5::double precision),
+                to_timestamp($6::double precision),
+                CASE
+                    WHEN $7::bigint IS NULL THEN NULL
+                    ELSE to_timestamp($7::double precision)
+                END
+             )",
         )
         .bind(session.id().into_uuid())
         .bind(session.principal_id().into_uuid())
-        .bind(to_i64(session.issued_at())?)
-        .bind(to_i64(session.expires_at())?)
-        .bind(session.revoked_at().map(to_i64).transpose()?)
+        .bind(credential.as_bytes().as_slice())
+        .bind(csrf.as_bytes().as_slice())
+        .bind(issued_at)
+        .bind(expires_at)
+        .bind(revoked_at)
         .execute(&self.pool)
         .await
-        .map_err(classify_sqlx_error)?;
+        .map_err(map_sqlx_error)?;
 
         Ok(())
     }
 
-    async fn find(&self, id: SessionId) -> Result<Option<Session>, SessionStoreError> {
-        let row = sqlx::query(
-            "SELECT id, principal_id, issued_at_unix, expires_at_unix, revoked_at_unix
+    async fn find_by_credential(
+        &self,
+        credential: &SessionCredentialDigest,
+    ) -> Result<Option<Session>, SessionStoreError> {
+        let row = sqlx::query_as::<_, (Uuid, Uuid, i64, i64, Option<i64>)>(
+            "SELECT
+                id,
+                principal_id,
+                EXTRACT(EPOCH FROM issued_at)::bigint,
+                EXTRACT(EPOCH FROM expires_at)::bigint,
+                EXTRACT(EPOCH FROM revoked_at)::bigint
              FROM forge_sessions
-             WHERE id = $1",
+             WHERE credential_digest = $1
+             LIMIT 1",
         )
-        .bind(id.into_uuid())
+        .bind(credential.as_bytes().as_slice())
         .fetch_optional(&self.pool)
         .await
-        .map_err(classify_sqlx_error)?;
+        .map_err(map_sqlx_error)?;
 
         row.map(restore_session).transpose()
     }
 
+    async fn verify_csrf(
+        &self,
+        session_id: SessionId,
+        csrf: &CsrfTokenDigest,
+    ) -> Result<bool, SessionStoreError> {
+        let matched = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM forge_sessions
+                WHERE id = $1
+                  AND csrf_digest = $2
+                  AND revoked_at IS NULL
+                  AND expires_at > now()
+             )",
+        )
+        .bind(session_id.into_uuid())
+        .bind(csrf.as_bytes().as_slice())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(matched)
+    }
+
     async fn revoke(
         &self,
-        id: SessionId,
+        session_id: SessionId,
         revoked_at: UnixTimestamp,
     ) -> Result<(), SessionStoreError> {
-        sqlx::query(
+        let revoked_at = timestamp_to_i64(revoked_at)?;
+        let result = sqlx::query(
             "UPDATE forge_sessions
-             SET revoked_at_unix = COALESCE(revoked_at_unix, $2)
-             WHERE id = $1",
+             SET revoked_at = LEAST(
+                 COALESCE(revoked_at, to_timestamp($2::double precision)),
+                 to_timestamp($2::double precision)
+             )
+             WHERE id = $1
+               AND issued_at <= to_timestamp($2::double precision)",
         )
-        .bind(id.into_uuid())
-        .bind(to_i64(revoked_at)?)
+        .bind(session_id.into_uuid())
+        .bind(revoked_at)
         .execute(&self.pool)
         .await
-        .map_err(classify_sqlx_error)?;
+        .map_err(map_sqlx_error)?;
 
-        Ok(())
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(SessionStoreError::Conflict)
+        }
     }
 
     async fn rotate(
         &self,
-        current_id: SessionId,
-        rotated_at: UnixTimestamp,
+        previous_session_id: SessionId,
+        revoked_at: UnixTimestamp,
         replacement: &Session,
+        replacement_credential: &SessionCredentialDigest,
+        replacement_csrf: &CsrfTokenDigest,
     ) -> Result<(), SessionStoreError> {
-        let rotated_at_unix = to_i64(rotated_at)?;
-        let mut transaction = self.pool.begin().await.map_err(classify_sqlx_error)?;
+        let revoked_at = timestamp_to_i64(revoked_at)?;
+        let issued_at = timestamp_to_i64(replacement.issued_at())?;
+        let expires_at = timestamp_to_i64(replacement.expires_at())?;
+        let replacement_revoked_at = replacement
+            .revoked_at()
+            .map(timestamp_to_i64)
+            .transpose()?;
 
-        let principal_id = sqlx::query_scalar::<_, Uuid>(
+        let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
+
+        let updated = sqlx::query(
             "UPDATE forge_sessions
-             SET revoked_at_unix = $2
+             SET revoked_at = LEAST(
+                 COALESCE(revoked_at, to_timestamp($2::double precision)),
+                 to_timestamp($2::double precision)
+             )
              WHERE id = $1
-               AND revoked_at_unix IS NULL
-               AND issued_at_unix <= $2
-               AND expires_at_unix > $2
-             RETURNING principal_id",
+               AND revoked_at IS NULL
+               AND expires_at > to_timestamp($2::double precision)
+               AND issued_at <= to_timestamp($2::double precision)",
         )
-        .bind(current_id.into_uuid())
-        .bind(rotated_at_unix)
-        .fetch_optional(&mut *transaction)
+        .bind(previous_session_id.into_uuid())
+        .bind(revoked_at)
+        .execute(&mut *transaction)
         .await
-        .map_err(classify_sqlx_error)?
-        .ok_or_else(|| {
-            SessionStoreError::new(
-                SessionStoreErrorKind::Conflict,
-                "session rotation conflict",
-                false,
-            )
-        })?;
+        .map_err(map_sqlx_error)?;
 
-        if principal_id != replacement.principal_id().into_uuid()
-            || replacement.issued_at() != rotated_at
-            || replacement.revoked_at().is_some()
-        {
-            return Err(SessionStoreError::new(
-                SessionStoreErrorKind::Conflict,
-                "session replacement does not match rotation",
-                false,
-            ));
+        if updated.rows_affected() != 1 {
+            return Err(SessionStoreError::Conflict);
         }
 
         sqlx::query(
             "INSERT INTO forge_sessions (
-                id, principal_id, issued_at_unix, expires_at_unix, revoked_at_unix
-             ) VALUES ($1, $2, $3, $4, NULL)",
+                id, principal_id, credential_digest, csrf_digest,
+                issued_at, expires_at, revoked_at
+             )
+             VALUES (
+                $1, $2, $3, $4,
+                to_timestamp($5::double precision),
+                to_timestamp($6::double precision),
+                CASE
+                    WHEN $7::bigint IS NULL THEN NULL
+                    ELSE to_timestamp($7::double precision)
+                END
+             )",
         )
         .bind(replacement.id().into_uuid())
         .bind(replacement.principal_id().into_uuid())
-        .bind(to_i64(replacement.issued_at())?)
-        .bind(to_i64(replacement.expires_at())?)
+        .bind(replacement_credential.as_bytes().as_slice())
+        .bind(replacement_csrf.as_bytes().as_slice())
+        .bind(issued_at)
+        .bind(expires_at)
+        .bind(replacement_revoked_at)
         .execute(&mut *transaction)
         .await
-        .map_err(classify_sqlx_error)?;
+        .map_err(map_sqlx_error)?;
 
-        transaction.commit().await.map_err(classify_sqlx_error)?;
-        Ok(())
+        transaction.commit().await.map_err(map_sqlx_error)
     }
 }
 
-fn restore_session(row: sqlx::postgres::PgRow) -> Result<Session, SessionStoreError> {
-    let id = SessionId::from_uuid(row.get::<Uuid, _>("id")).map_err(|_| corrupt())?;
+fn restore_session(
+    (id, principal_id, issued_at, expires_at, revoked_at): (
+        Uuid,
+        Uuid,
+        i64,
+        i64,
+        Option<i64>,
+    ),
+) -> Result<Session, SessionStoreError> {
+    let id = SessionId::from_uuid(id).map_err(|_| SessionStoreError::CorruptRecord)?;
     let principal_id =
-        PrincipalId::from_uuid(row.get::<Uuid, _>("principal_id")).map_err(|_| corrupt())?;
-    let issued_at = from_i64(row.get::<i64, _>("issued_at_unix"))?;
-    let expires_at = from_i64(row.get::<i64, _>("expires_at_unix"))?;
-    let revoked_at = row
-        .get::<Option<i64>, _>("revoked_at_unix")
-        .map(from_i64)
-        .transpose()?;
+        PrincipalId::from_uuid(principal_id).map_err(|_| SessionStoreError::CorruptRecord)?;
+    let issued_at = timestamp_from_i64(issued_at)?;
+    let expires_at = timestamp_from_i64(expires_at)?;
+    let revoked_at = revoked_at.map(timestamp_from_i64).transpose()?;
 
-    Session::restore(id, principal_id, issued_at, expires_at, revoked_at).map_err(|_| corrupt())
+    Session::restore(id, principal_id, issued_at, expires_at, revoked_at)
+        .map_err(|_| SessionStoreError::CorruptRecord)
 }
 
-fn to_i64(timestamp: UnixTimestamp) -> Result<i64, SessionStoreError> {
-    i64::try_from(timestamp.as_secs()).map_err(|_| corrupt())
+fn timestamp_to_i64(timestamp: UnixTimestamp) -> Result<i64, SessionStoreError> {
+    i64::try_from(timestamp.as_secs()).map_err(|_| SessionStoreError::CorruptRecord)
 }
 
-fn from_i64(value: i64) -> Result<UnixTimestamp, SessionStoreError> {
-    u64::try_from(value)
+fn timestamp_from_i64(timestamp: i64) -> Result<UnixTimestamp, SessionStoreError> {
+    u64::try_from(timestamp)
         .map(UnixTimestamp::from_secs)
-        .map_err(|_| corrupt())
+        .map_err(|_| SessionStoreError::CorruptRecord)
 }
 
-fn corrupt() -> SessionStoreError {
-    SessionStoreError::new(
-        SessionStoreErrorKind::Corrupt,
-        "persisted session data is invalid",
-        false,
-    )
-}
-
-fn classify_sqlx_error(error: sqlx::Error) -> SessionStoreError {
-    if let sqlx::Error::Database(database) = &error {
-        if database.is_unique_violation() {
-            return SessionStoreError::new(
-                SessionStoreErrorKind::Conflict,
-                "session persistence conflict",
-                false,
-            );
-        }
+fn map_sqlx_error(error: sqlx::Error) -> SessionStoreError {
+    if error.as_database_error().is_some_and(|database| {
+        database
+            .code()
+            .as_deref()
+            .is_some_and(|code| code == "23505" || code == "23503" || code == "23514")
+    }) {
+        SessionStoreError::Conflict
+    } else {
+        SessionStoreError::Unavailable
     }
-
-    SessionStoreError::new(
-        SessionStoreErrorKind::Unavailable,
-        "session store unavailable",
-        true,
-    )
 }

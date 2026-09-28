@@ -5,10 +5,12 @@ Phase 2 behavior is implemented through PostgreSQL generation, reversible
 migrations, transaction/repository contracts and optimistic locking, but the
 GitHub Actions runner gate remains blocked before job steps execute. Phase 3 is
 in progress: server-side session lifecycle, deny-by-default RBAC, explicit
-membership and authorized TenantContext contracts are implemented; generated
-PostgreSQL RLS/least-privilege roles and append-only audit persistence are now
-implemented. Concrete password/cookie authentication adapters and stronger audit
-integrity/retention controls remain open.
+membership and authorized TenantContext contracts, least-privilege PostgreSQL/RLS,
+digest-only persistent sessions, Argon2id password verification, opaque
+session/CSRF secrets, secure cookie helpers, and append-only audit persistence
+are implemented. Login throttling, turnkey HTTP auth route composition, password
+rehash-on-policy-upgrade, and stronger audit integrity/retention controls remain
+open.
 
 Forge is an opinionated Rust application framework for long-lived services. Its
 value is the integration of explicit application architecture, secure defaults,
@@ -207,6 +209,24 @@ bare tenant identifier. Generated PostgreSQL infrastructure consumes that contex
 by installing tenant/principal values as transaction-local settings for RLS.
 See [ADR 0010](adr/0010-session-and-tenant-authorization-context.md) and
 [ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md).
+
+Generated database applications persist principal credentials and sessions through
+Forge-owned contracts. Raw bearer and CSRF secrets never enter persistence:
+`forge_sessions` stores fixed 256-bit digests, while
+`PostgresSessionStore` performs lookup, revocation, CSRF binding, and atomic
+rotation. Membership roles remain outside the session and are loaded from
+`forge_tenant_memberships` so changes can take effect independently of session
+expiry. See
+[ADR 0013](adr/0013-persistent-principals-sessions-and-memberships.md).
+
+Concrete authentication mechanisms remain in generated infrastructure. Passwords
+use Argon2id on Tokio blocking workers; bearer and CSRF tokens are independent
+256-bit OS-random values; persistence lookup uses SHA-256 digests; the bearer is
+serialized in a Secure/HttpOnly/SameSite=Lax `__Host-forge_session` cookie; and
+unsafe cookie-authenticated HTTP methods require the independent
+`x-csrf-token` value. Public login denial does not reveal whether an account is
+missing, disabled, or has the wrong password. See
+[ADR 0014](adr/0014-argon2-session-cookie-and-csrf.md).
 
 ### Database and transactions
 

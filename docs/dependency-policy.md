@@ -72,6 +72,55 @@ The dependency is not added to the framework workspace merely for convenience:
 only generated applications that enable the database capability consume it.
 `--skip-database` removes SQLx entirely from a generated application's graph.
 
+## Phase 3 persistence dependency decision
+
+The persistent-session/audit slice introduces no new third-party package to the
+workspace. It reuses the already-admitted `async-trait 0.1.92` contract helper
+and the existing generated SQLx 0.9 PostgreSQL adapter. Database-enabled generated
+applications now declare `async-trait` directly because their SQLx
+`SessionStore` and `AuditSink` implementations implement framework traits
+that use that macro; database-free generated applications do not add it.
+
+## Phase 3 authentication mechanism dependency decision
+
+The concrete authentication mechanism is confined to generated database-enabled
+application infrastructure; the Forge workspace public contracts remain free of
+third-party cryptographic types.
+
+Admitted direct dependencies:
+
+| Crate | Version | Purpose | Feature policy |
+| --- | --- | --- | --- |
+| `argon2` | `0.6.0` | Argon2id password hashing/verification | defaults disabled; `alloc,getrandom,password-hash,zeroize`; no Rayon parallel feature |
+| `getrandom` | `0.4.3` | 256-bit bearer and CSRF secrets from the OS CSPRNG | default platform backend only |
+| `sha2` | `0.11.0` | SHA-256 digests for high-entropy bearer/CSRF lookup | defaults disabled |
+| `cookie` | `0.18.2` | RFC cookie parsing/building and security attributes | defaults disabled; signed/private cookie crypto is not enabled |
+| `tokio` | `1.53.1` | `spawn_blocking` isolation for memory-hard hashing | `rt` only in the generated app |
+| `thiserror` | `2.0.21` | bounded infrastructure errors | existing project dependency family |
+
+Argon2 and SHA-2 are RustCrypto implementations; token entropy comes directly
+from the operating-system source through getrandom. Forge does not implement
+password hashing, randomness, SHA-256, or cookie grammar itself. The local helper
+only hex-encodes random bytes and selects parameters/attributes.
+
+The initial Argon2id policy is version 19, m=19456 KiB, t=2, p=1, 32-byte output.
+This matches the current OWASP minimum profile and is a floor, not a permanent
+performance target. Production sizing must benchmark authentication latency and
+memory concurrency before raising parameters.
+
+The RustSec review recorded during admission found historical advisories in old
+`cookie` and `sha2` releases (RUSTSEC-2017-0005 and RUSTSEC-2021-0100);
+the selected versions are above the published patched ranges. This manual review
+does not replace the repository's `cargo deny`/RustSec gate. CI runners were
+not executing at admission time, so automated advisory/license/source validation
+remains an unresolved merge/release gate.
+
+The cookie crate's optional signed/private jar feature is intentionally disabled:
+the cookie carries a 256-bit opaque server-side bearer value, not trusted claims.
+Only its parser/builder and `Secure`, `HttpOnly`, `SameSite`, `Path`
+attributes are required.
+
+
 ## Features and public API containment
 
 - Set `default-features = false` when defaults add unused protocols, native

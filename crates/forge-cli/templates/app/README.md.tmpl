@@ -18,6 +18,9 @@ src/bootstrap       composition root and process lifecycle
 %%if database%%
 This application uses PostgreSQL. SQLx stays in the outer
 infrastructure/bootstrap boundary; domain and application code do not depend on it.
+The built-in Forge migrations create append-only audit storage first, then
+principal/session/membership tables. Session bearer and CSRF values are persisted
+only as 256-bit digests.
 
 %%if docker%%
 Start PostgreSQL with:
@@ -38,10 +41,11 @@ export FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'
 cargo run
 ```
 
-Database-enabled applications also include the framework
-`forge_audit_events` migration and
-`infrastructure::audit::PgAuditSink`. The runtime role can append structured
-security-audit events but cannot read, update, or delete the audit history.
+Database-enabled applications include `infrastructure::audit::PgAuditSink`,
+`infrastructure::auth::PostgresSessionStore`, and
+`infrastructure::tenancy::PgMembershipStore`. The runtime role can append
+structured security-audit events but cannot read, update, or delete audit
+history.
 
 Create a reversible application migration with:
 
@@ -100,5 +104,13 @@ Tenant-sensitive persistence should open transactions through
 authorized tenant/principal as transaction-local PostgreSQL settings; RLS policies
 can read them with `current_setting('forge.tenant_id', true)` and
 `current_setting('forge.principal_id', true)`.
+
+`infrastructure::security` provides the concrete authentication mechanisms:
+Argon2id password hashing (m=19456 KiB, t=2, p=1) on Tokio blocking workers,
+independent 256-bit session/CSRF tokens from the OS CSPRNG, SHA-256 persistence
+digests, a Secure/HttpOnly/SameSite=Lax `__Host-forge_session` cookie, generic
+login denials, request session lookup and CSRF enforcement for unsafe methods.
+The bearer cookie and CSRF token are separate secrets; never place the CSRF token
+inside the HttpOnly session cookie.
 %%end%%
 %%end%%
