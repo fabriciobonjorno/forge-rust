@@ -86,6 +86,14 @@ const TEMPLATES: &[Template] = &[
         "src/infrastructure/database/mod.rs" => "src/infrastructure/database/mod.rs.tmpl"
     ),
     template!(
+        Group::Database,
+        "src/infrastructure/auth/mod.rs" => "src/infrastructure/auth/mod.rs.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "src/infrastructure/audit/mod.rs" => "src/infrastructure/audit/mod.rs.tmpl"
+    ),
+    template!(
         Group::DatabaseDocker,
         "docker/postgres/init.sql" => "docker/postgres/init.sql.tmpl"
     ),
@@ -665,6 +673,16 @@ mod tests {
         assert!(database_module.contains("forge.tenant_id"));
         assert!(database_module.contains("forge.principal_id"));
 
+        let auth_adapter = read(&root, "src/infrastructure/auth/mod.rs");
+        assert!(auth_adapter.contains("PostgresSessionStore"));
+        assert!(auth_adapter.contains("credential_digest"));
+        assert!(!auth_adapter.contains("bearer_token"));
+
+        let audit_adapter = read(&root, "src/infrastructure/audit/mod.rs");
+        assert!(audit_adapter.contains("PostgresAuditSink"));
+        assert!(audit_adapter.contains("forge_audit_log"));
+        assert!(audit_adapter.contains("set_config('forge.principal_id'"));
+
         let postgres_init = read(&root, "docker/postgres/init.sql");
         assert!(postgres_init.contains("CREATE ROLE app_migrator"));
         assert!(postgres_init.contains("CREATE ROLE app_runtime"));
@@ -722,7 +740,10 @@ mod tests {
         }
         assert!(!read(&root, "README.md").contains("docker"));
         assert!(!read(&root, "Cargo.toml").contains("sqlx"));
+        assert!(!read(&root, "Cargo.toml").contains("async-trait"));
         assert!(!root.join("migrations").exists());
+        assert!(!root.join("src/infrastructure/auth").exists());
+        assert!(!root.join("src/infrastructure/audit").exists());
         assert!(!root.join("docker/postgres/init.sql").exists());
     }
 
