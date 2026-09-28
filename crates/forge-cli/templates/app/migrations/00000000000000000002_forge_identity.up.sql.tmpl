@@ -1,16 +1,39 @@
-CREATE TABLE forge_sessions (
+-- Forge Phase 3 identity/session/tenancy persistence.
+-- Security audit storage is created separately by migration 00000000000000000001.
+
+CREATE TABLE forge_principals (
     id uuid PRIMARY KEY,
-    principal_id uuid NOT NULL,
-    issued_at_unix bigint NOT NULL CHECK (issued_at_unix >= 0),
-    expires_at_unix bigint NOT NULL CHECK (expires_at_unix > issued_at_unix),
-    revoked_at_unix bigint CHECK (
-        revoked_at_unix IS NULL OR revoked_at_unix >= issued_at_unix
-    ),
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+    login text NOT NULL,
+    password_hash text,
+    disabled_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    version bigint NOT NULL DEFAULT 1 CHECK (version > 0),
+    CHECK (char_length(login) BETWEEN 1 AND 320),
+    CHECK (password_hash IS NULL OR char_length(password_hash) <= 1024)
 );
 
-CREATE INDEX forge_sessions_principal_idx
-ON forge_sessions (principal_id, expires_at_unix DESC);
+CREATE UNIQUE INDEX forge_principals_login_unique
+ON forge_principals (lower(login));
+
+CREATE TABLE forge_sessions (
+    id uuid PRIMARY KEY,
+    principal_id uuid NOT NULL REFERENCES forge_principals(id) ON DELETE CASCADE,
+    credential_digest bytea NOT NULL UNIQUE,
+    csrf_digest bytea NOT NULL,
+    issued_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
+    revoked_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CHECK (octet_length(credential_digest) = 32),
+    CHECK (octet_length(csrf_digest) = 32),
+    CHECK (expires_at > issued_at),
+    CHECK (revoked_at IS NULL OR revoked_at >= issued_at)
+);
+
+CREATE INDEX forge_sessions_principal_active
+ON forge_sessions (principal_id, expires_at DESC)
+WHERE revoked_at IS NULL;
 
 CREATE FUNCTION forge_guard_session_update()
 RETURNS trigger
@@ -19,15 +42,17 @@ AS $$
 BEGIN
     IF NEW.id IS DISTINCT FROM OLD.id
         OR NEW.principal_id IS DISTINCT FROM OLD.principal_id
-        OR NEW.issued_at_unix IS DISTINCT FROM OLD.issued_at_unix
-        OR NEW.expires_at_unix IS DISTINCT FROM OLD.expires_at_unix
+        OR NEW.credential_digest IS DISTINCT FROM OLD.credential_digest
+        OR NEW.csrf_digest IS DISTINCT FROM OLD.csrf_digest
+        OR NEW.issued_at IS DISTINCT FROM OLD.issued_at
+        OR NEW.expires_at IS DISTINCT FROM OLD.expires_at
         OR NEW.created_at IS DISTINCT FROM OLD.created_at
     THEN
-        RAISE EXCEPTION 'forge session identity and lifetime are immutable';
+        RAISE EXCEPTION 'forge session identity, secrets and lifetime are immutable';
     END IF;
 
-    IF OLD.revoked_at_unix IS NOT NULL
-        AND NEW.revoked_at_unix IS DISTINCT FROM OLD.revoked_at_unix
+    IF OLD.revoked_at IS NOT NULL
+        AND NEW.revoked_at IS DISTINCT FROM OLD.revoked_at
     THEN
         RAISE EXCEPTION 'forge session revocation is monotonic';
     END IF;
@@ -43,9 +68,12 @@ EXECUTE FUNCTION forge_guard_session_update();
 
 CREATE TABLE forge_tenant_memberships (
     tenant_id uuid NOT NULL,
-    principal_id uuid NOT NULL,
+    principal_id uuid NOT NULL REFERENCES forge_principals(id) ON DELETE CASCADE,
     roles text[] NOT NULL DEFAULT '{}',
-    state text NOT NULL CHECK (state IN ('active', 'suspended')),
+    state text NOT NULL DEFAULT 'active'
+        CHECK (state IN ('active', 'suspended')),
+    version bigint NOT NULL DEFAULT 1 CHECK (version > 0),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (tenant_id, principal_id),
     CHECK (cardinality(roles) <= 64)
@@ -54,17 +82,24 @@ CREATE TABLE forge_tenant_memberships (
 CREATE INDEX forge_tenant_memberships_principal_idx
 ON forge_tenant_memberships (principal_id, tenant_id);
 
+REVOKE ALL ON TABLE forge_principals FROM PUBLIC;
 REVOKE ALL ON TABLE forge_sessions FROM PUBLIC;
 REVOKE ALL ON TABLE forge_tenant_memberships FROM PUBLIC;
 
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+        REVOKE ALL ON TABLE forge_principals FROM app_runtime;
         REVOKE ALL ON TABLE forge_sessions FROM app_runtime;
         REVOKE ALL ON TABLE forge_tenant_memberships FROM app_runtime;
 
+        GRANT SELECT ON TABLE forge_principals TO app_runtime;
         GRANT SELECT, INSERT, UPDATE ON TABLE forge_sessions TO app_runtime;
         GRANT SELECT, INSERT, UPDATE ON TABLE forge_tenant_memberships TO app_runtime;
+
+        IF to_regclass('public._sqlx_migrations') IS NOT NULL THEN
+            REVOKE ALL ON TABLE _sqlx_migrations FROM app_runtime;
+        END IF;
     END IF;
 END
 $$;
