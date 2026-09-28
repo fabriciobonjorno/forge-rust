@@ -700,9 +700,17 @@ mod tests {
         assert!(identity_migration.contains("credential_digest bytea"));
         assert!(identity_migration.contains("csrf_digest bytea"));
         assert!(identity_migration.contains("CREATE TABLE forge_tenant_memberships"));
+        assert!(identity_migration.contains("GRANT UPDATE (password_hash, updated_at, version)"));
+
+        let auth_module = read(&root, "src/infrastructure/auth/mod.rs");
+        assert!(auth_module.contains("PasswordCredentialVersion"));
+        assert!(auth_module.contains("replace_password_hash"));
+        assert!(auth_module.contains("version = version + 1"));
 
         let security_module = read(&root, "src/infrastructure/security/mod.rs");
         assert!(security_module.contains("Argon2idPasswordHasher"));
+        assert!(security_module.contains("needs_rehash"));
+        assert!(security_module.contains("replace_password_hash"));
         assert!(security_module.contains("__Host-forge_session"));
         assert!(security_module.contains("x-csrf-token"));
 
