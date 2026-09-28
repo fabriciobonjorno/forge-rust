@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 forge-auth = { path = "../forge-auth" }
 forge-core = { path = "../forge-core" }
 forge-security = { path = "../forge-security" }

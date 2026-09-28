@@ -1,7 +1,7 @@
 # Deploying Forge Applications
 
-Status: Phase 2 in progress. This guide covers the generated container image,
-standalone binary, PostgreSQL development profile, environment configuration,
+Status: Phase 3 in progress. This guide covers the generated container image,
+standalone binary, PostgreSQL development profile, least-privilege database roles, environment configuration,
 health endpoints and graceful shutdown. The examples use an application named `shop`.
 Kubernetes and systemd snippets are starting points to review, not certified
 configurations. Forge does not generate a deployment tool yet
@@ -55,9 +55,16 @@ shares the process namespace.
 
 The generated `compose.yaml` builds the image and publishes it on
 `127.0.0.1:3000` only. By default it also provides PostgreSQL 18, pinned by
-image digest, with development-only credentials, a named `db-data` volume and
-a `pg_isready` health check. A one-shot `migrate` service must complete
-successfully before the application starts.
+image digest, a named `db-data` volume, and an initialization script that creates
+two development-only application roles:
+
+- `app_migrator`: owns schema changes and is used only by migrate/rollback;
+- `app_runtime`: has data privileges, no schema ownership and `NOBYPASSRLS`.
+
+The PostgreSQL health check does not become healthy until the application database
+exists and the runtime role has its expected schema usage privilege. A one-shot
+`migrate` service then runs with only the migration credential. The long-running
+app receives only the runtime credential.
 
 The app and migration containers use `read_only: true`, drop all capabilities
 and set `no-new-privileges`; the app also uses a `tmpfs` at `/tmp` and
@@ -66,8 +73,12 @@ production orchestration contract.
 
 ```sh
 docker compose up -d db
-export FORGE_DATABASE_URL='postgres://app:app@127.0.0.1:5432/<database>'
+
+export FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/<database>'
 cargo run -- migrate
+
+export FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/<database>'
+cargo run
 
 # Or start the complete development stack:
 docker compose up --build
@@ -115,7 +126,8 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. Extra connections wait for a slot (backpressure) instead of being served without bound. |
 | `FORGE_LOG` | `info` | `tracing` filter directive, for example `info,shop=debug`. |
 | `FORGE_LOG_FORMAT` | `json` in production, `text` otherwise | `json` or `text`. |
-| `FORGE_DATABASE_URL` | none | PostgreSQL connection URL for database-enabled applications and migration commands. Treated as a secret and redacted from ordinary diagnostics. |
+| `FORGE_DATABASE_URL` | none | Least-privilege PostgreSQL runtime connection URL. Treated as a secret and redacted from ordinary diagnostics. |
+| `FORGE_MIGRATION_DATABASE_URL` | none | PostgreSQL schema-owner/migration URL used only by `migrate` and `rollback`. Treated as a secret and redacted. |
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
 collects them. The HTTP layer also enforces a header-read timeout and adds
@@ -123,11 +135,17 @@ collects them. The HTTP layer also enforces a header-read timeout and adds
 `x-request-id` to responses. Transient `accept` errors, such as running out of
 file descriptors, do not stop the server.
 
-Do not put secrets in the image or in build arguments. `FORGE_DATABASE_URL`
-often contains credentials; inject it at runtime through the deployment
-platform's secret mechanism. Forge's typed configuration redacts the value from
-normal Debug/serialization output, but adapters must still avoid logging the
-exposed URL.
+Do not put secrets in the image or in build arguments. Both database URLs contain
+credentials and must come from the deployment platform's secret mechanism.
+Forge's typed configuration redacts them from normal Debug/serialization output,
+but adapters must still avoid logging exposed URLs.
+
+Do **not** inject `FORGE_MIGRATION_DATABASE_URL` into the long-running serving
+process. Run migrations as a separate deployment job/task with the migration
+credential, then start the application with only `FORGE_DATABASE_URL`. The
+runtime database role should be `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`,
+`NOBYPASSRLS`, and should not own application schemas. See
+[ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md).
 
 ## Health endpoints
 

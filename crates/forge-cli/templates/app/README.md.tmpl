@@ -27,14 +27,23 @@ docker compose up -d db
 ```
 %%end%%
 
-Set the database URL and run embedded migrations:
+Use the migration role only for schema changes, then the least-privilege runtime
+role for the application:
 
 ```bash
-export FORGE_DATABASE_URL='%%DATABASE_URL_LOCAL%%'
+export FORGE_MIGRATION_DATABASE_URL='%%DATABASE_MIGRATION_URL_LOCAL%%'
 forge migrate                 # or: cargo run -- migrate
+
+export FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'
+cargo run
 ```
 
-Create a reversible migration with:
+Database-enabled applications also include the framework
+`forge_audit_events` migration and
+`infrastructure::audit::PgAuditSink`. The runtime role can append structured
+security-audit events but cannot read, update, or delete the audit history.
+
+Create a reversible application migration with:
 
 ```bash
 forge generate migration create_customers
@@ -80,8 +89,16 @@ The image is built with `cargo build --release --locked`, so commit
 health check runs `%%APP_NAME%% healthcheck`.
 
 %%if database%%
-The Compose PostgreSQL credentials are development-only. The database is stored
-in the named `db-data` volume, and the app starts only after the database is
-healthy and migrations complete successfully.
+The Compose PostgreSQL credentials are development-only. It creates a dedicated
+`app_migrator` role that owns schema changes and a separate `app_runtime` role
+without schema ownership or `BYPASSRLS`. The database is stored in the named
+`db-data` volume, and the app starts only after the database is healthy and
+migrations complete successfully.
+
+Tenant-sensitive persistence should open transactions through
+`infrastructure::database::begin_tenant_transaction`. It installs the
+authorized tenant/principal as transaction-local PostgreSQL settings; RLS policies
+can read them with `current_setting('forge.tenant_id', true)` and
+`current_setting('forge.principal_id', true)`.
 %%end%%
 %%end%%

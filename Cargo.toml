@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/forge",
+    "crates/forge-audit",
     "crates/forge-auth",
     "crates/forge-cli",
     "crates/forge-config",

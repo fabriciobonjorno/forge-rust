@@ -1,0 +1,148 @@
+//! PostgreSQL tenant-membership persistence.
+
+use async_trait::async_trait;
+use forge::security::{PrincipalId, Role};
+use forge::tenancy::{
+    Membership, MembershipState, MembershipStore, MembershipStoreError, MembershipStoreErrorKind,
+    TenantId,
+};
+use sqlx::{PgPool, Row, types::Uuid};
+
+/// PostgreSQL-backed tenant-membership store.
+#[derive(Clone, Debug)]
+pub struct PgMembershipStore {
+    pool: PgPool,
+}
+
+impl PgMembershipStore {
+    /// Creates a membership store using the application runtime pool.
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl MembershipStore for PgMembershipStore {
+    async fn find(
+        &self,
+        tenant_id: TenantId,
+        principal_id: PrincipalId,
+    ) -> Result<Option<Membership>, MembershipStoreError> {
+        let row = sqlx::query(
+            "SELECT roles, state
+             FROM forge_tenant_memberships
+             WHERE tenant_id = $1 AND principal_id = $2",
+        )
+        .bind(tenant_id.into_uuid())
+        .bind(principal_id.into_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(classify_sqlx_error)?;
+
+        row.map(|row| restore_membership(tenant_id, principal_id, row))
+            .transpose()
+    }
+
+    async fn upsert(&self, membership: &Membership) -> Result<(), MembershipStoreError> {
+        let roles: Vec<String> = membership
+            .roles()
+            .iter()
+            .map(|role| role.as_str().to_owned())
+            .collect();
+        let state = state_name(membership.state());
+
+        sqlx::query(
+            "INSERT INTO forge_tenant_memberships (
+                tenant_id, principal_id, roles, state
+             ) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (tenant_id, principal_id)
+             DO UPDATE SET
+                roles = EXCLUDED.roles,
+                state = EXCLUDED.state,
+                updated_at = clock_timestamp()",
+        )
+        .bind(membership.tenant_id().into_uuid())
+        .bind(membership.principal_id().into_uuid())
+        .bind(roles)
+        .bind(state)
+        .execute(&self.pool)
+        .await
+        .map_err(classify_sqlx_error)?;
+
+        Ok(())
+    }
+
+    async fn suspend(
+        &self,
+        tenant_id: TenantId,
+        principal_id: PrincipalId,
+    ) -> Result<(), MembershipStoreError> {
+        sqlx::query(
+            "UPDATE forge_tenant_memberships
+             SET state = 'suspended', updated_at = clock_timestamp()
+             WHERE tenant_id = $1 AND principal_id = $2",
+        )
+        .bind(tenant_id.into_uuid())
+        .bind(principal_id.into_uuid())
+        .execute(&self.pool)
+        .await
+        .map_err(classify_sqlx_error)?;
+
+        Ok(())
+    }
+}
+
+fn restore_membership(
+    tenant_id: TenantId,
+    principal_id: PrincipalId,
+    row: sqlx::postgres::PgRow,
+) -> Result<Membership, MembershipStoreError> {
+    let roles = row
+        .get::<Vec<String>, _>("roles")
+        .into_iter()
+        .map(Role::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| corrupt())?;
+
+    let state = match row.get::<String, _>("state").as_str() {
+        "active" => MembershipState::Active,
+        "suspended" => MembershipState::Suspended,
+        _ => return Err(corrupt()),
+    };
+
+    Ok(Membership::restore(tenant_id, principal_id, roles, state))
+}
+
+fn state_name(state: MembershipState) -> &'static str {
+    match state {
+        MembershipState::Active => "active",
+        MembershipState::Suspended => "suspended",
+    }
+}
+
+fn corrupt() -> MembershipStoreError {
+    MembershipStoreError::new(
+        MembershipStoreErrorKind::Corrupt,
+        "persisted membership data is invalid",
+        false,
+    )
+}
+
+fn classify_sqlx_error(error: sqlx::Error) -> MembershipStoreError {
+    if let sqlx::Error::Database(database) = &error {
+        if database.is_unique_violation() {
+            return MembershipStoreError::new(
+                MembershipStoreErrorKind::Conflict,
+                "membership persistence conflict",
+                false,
+            );
+        }
+    }
+
+    MembershipStoreError::new(
+        MembershipStoreErrorKind::Unavailable,
+        "membership store unavailable",
+        true,
+    )
+}

@@ -60,36 +60,160 @@ cargo fmt --all -- --check
 cargo clippy --quiet --all-targets --locked -- -D warnings
 cargo test --quiet --locked
 
-database_url=""
+runtime_database_url=""
+migration_database_url=""
 if [[ "${FORGE_E2E_SKIP_DOCKER:-0}" != 1 ]]; then
   log "Starting PostgreSQL and exercising reversible migrations"
   "$forge" generate migration create_e2e_probe >/dev/null
   up_file="$(find migrations -maxdepth 1 -name '*_create_e2e_probe.up.sql' -print -quit)"
   down_file="$(find migrations -maxdepth 1 -name '*_create_e2e_probe.down.sql' -print -quit)"
   [[ -n "$up_file" && -n "$down_file" ]] || fail "migration pair was not generated"
-  printf '%s\n' 'CREATE TABLE forge_e2e_probe (id bigint PRIMARY KEY);' >"$up_file"
-  printf '%s\n' 'DROP TABLE forge_e2e_probe;' >"$down_file"
+  cat >"$up_file" <<'SQL'
+CREATE TABLE forge_e2e_probe (
+  id bigint PRIMARY KEY
+);
+
+CREATE TABLE forge_e2e_tenant_probe (
+  id bigint PRIMARY KEY,
+  tenant_id uuid NOT NULL,
+  value text NOT NULL
+);
+
+ALTER TABLE forge_e2e_tenant_probe ENABLE ROW LEVEL SECURITY;
+ALTER TABLE forge_e2e_tenant_probe FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY forge_e2e_tenant_isolation
+ON forge_e2e_tenant_probe
+FOR ALL
+TO app_runtime
+USING (
+  tenant_id = NULLIF(current_setting('forge.tenant_id', true), '')::uuid
+)
+WITH CHECK (
+  tenant_id = NULLIF(current_setting('forge.tenant_id', true), '')::uuid
+);
+SQL
+  cat >"$down_file" <<'SQL'
+DROP TABLE forge_e2e_tenant_probe;
+DROP TABLE forge_e2e_probe;
+SQL
 
   # sqlx::migrate!() embeds migrations at compile time, so rebuild after creating it.
   cargo build --quiet --locked
   docker compose up --detach db >/dev/null
-  database_url="postgres://app:app@127.0.0.1:5432/forge_e2e_app"
+  runtime_database_url="postgres://app_runtime:app_runtime@127.0.0.1:5432/forge_e2e_app"
+  migration_database_url="postgres://app_migrator:app_migrator@127.0.0.1:5432/forge_e2e_app"
 
-  FORGE_DATABASE_URL="$database_url" "target/debug/$app_name" migrate
-  [[ "$(docker compose exec -T db psql -U app -d forge_e2e_app -Atc       "SELECT to_regclass('public.forge_e2e_probe')")" == "forge_e2e_probe" ]]     || fail "migrate did not create the probe table"
+  if FORGE_DATABASE_URL="$runtime_database_url" "target/debug/$app_name" migrate 2>/dev/null; then
+    fail "migrate must not accept the runtime database credential"
+  fi
 
-  FORGE_DATABASE_URL="$database_url" "target/debug/$app_name" rollback
-  [[ -z "$(docker compose exec -T db psql -U app -d forge_e2e_app -Atc       "SELECT to_regclass('public.forge_e2e_probe')")" ]]     || fail "rollback did not remove the probe table"
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" migrate
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" == "forge_e2e_probe" ]]     || fail "migrate did not create the probe table"
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_audit_events')")" == "forge_audit_events" ]] \
+    || fail "framework audit migration did not create the audit table"
 
-  FORGE_DATABASE_URL="$database_url" "target/debug/$app_name" migrate
+  audit_id="01941f29-7c00-7000-8000-000000000010"
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app -v ON_ERROR_STOP=1 -c "
+    INSERT INTO forge_audit_events (
+      id, occurred_at_unix, actor_kind, action, outcome, request_link
+    ) VALUES (
+      '$audit_id', 42, 'system', 'e2e.audit', 'succeeded', 'e2e-request'
+    );
+  " >/dev/null
+
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc \
+      "SELECT count(*) FROM forge_audit_events WHERE id = '$audit_id'")" == 1 ]] \
+    || fail "runtime audit append was not persisted"
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c 'SELECT * FROM forge_audit_events;' >/dev/null 2>&1; then
+    fail "runtime audit writer must not be able to read audit events"
+  fi
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "UPDATE forge_audit_events SET outcome = 'failed' WHERE id = '$audit_id';" \
+      >/dev/null 2>&1; then
+    fail "runtime audit writer must not be able to update audit events"
+  fi
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "DELETE FROM forge_audit_events WHERE id = '$audit_id';" \
+      >/dev/null 2>&1; then
+    fail "runtime audit writer must not be able to delete audit events"
+  fi
+
+  if docker compose exec -T db psql -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 \
+      -c 'CREATE TABLE forge_runtime_must_not_create_schema (id bigint);' \
+      >/dev/null 2>&1; then
+    fail "runtime database role must not be able to create schema objects"
+  fi
+
+  tenant_one="01941f29-7c00-7000-8000-000000000001"
+  tenant_two="01941f29-7c00-7000-8000-000000000002"
+  principal="01941f29-7c00-7000-8000-000000000003"
+
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+    BEGIN;
+    SELECT set_config('forge.tenant_id', '$tenant_one', true);
+    SELECT set_config('forge.principal_id', '$principal', true);
+    INSERT INTO forge_e2e_tenant_probe (id, tenant_id, value)
+    VALUES (1, '$tenant_one', 'tenant-one');
+    COMMIT;
+  " >/dev/null
+
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+    BEGIN;
+    SELECT set_config('forge.tenant_id', '$tenant_two', true);
+    SELECT set_config('forge.principal_id', '$principal', true);
+    INSERT INTO forge_e2e_tenant_probe (id, tenant_id, value)
+    VALUES (2, '$tenant_two', 'tenant-two');
+    COMMIT;
+  " >/dev/null
+
+  visible_without_context="$(docker compose exec -T db psql -Atq -U app_runtime \
+      -d forge_e2e_app -c "SELECT count(*) FROM forge_e2e_tenant_probe;")"
+  [[ "$visible_without_context" == 0 ]] \
+    || fail "RLS must fail closed without tenant context"
+
+  visible_tenant_one="$(docker compose exec -T db psql -Atq -U app_runtime \
+      -d forge_e2e_app -c "
+    BEGIN;
+    SELECT set_config('forge.tenant_id', '$tenant_one', true);
+    SELECT set_config('forge.principal_id', '$principal', true);
+    SELECT count(*) FROM forge_e2e_tenant_probe;
+    ROLLBACK;
+  " | tail -n 1)"
+  [[ "$visible_tenant_one" == 1 ]] \
+    || fail "tenant one must see exactly one tenant-scoped row"
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+      BEGIN;
+      SELECT set_config('forge.tenant_id', '$tenant_one', true);
+      SELECT set_config('forge.principal_id', '$principal', true);
+      INSERT INTO forge_e2e_tenant_probe (id, tenant_id, value)
+      VALUES (3, '$tenant_two', 'cross-tenant');
+      COMMIT;
+    " >/dev/null 2>&1; then
+    fail "RLS must reject a cross-tenant write"
+  fi
+
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" rollback
+  [[ -z "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" ]]     || fail "rollback did not remove the probe table"
+
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" migrate
 fi
 
 log "Host run: serve, probe and graceful shutdown"
 cargo build --quiet --locked
 port="$(free_port)"
 env_args=(FORGE_BIND="127.0.0.1:$port" FORGE_SHUTDOWN_GRACE_SECS=5)
-if [[ -n "$database_url" ]]; then
-  env_args+=(FORGE_DATABASE_URL="$database_url")
+if [[ -n "$runtime_database_url" ]]; then
+  env_args+=(FORGE_DATABASE_URL="$runtime_database_url")
 fi
 env "${env_args[@]}" "target/debug/$app_name" &
 server_pid=$!
@@ -141,7 +265,7 @@ docker compose logs app 2>&1 | grep -m1 -q ' | {' || fail "production logs must 
 
 # The named volume must preserve the migrated schema across an application restart.
 docker compose restart app >/dev/null
-[[ "$(docker compose exec -T db psql -U app -d forge_e2e_app -Atc     "SELECT to_regclass('public.forge_e2e_probe')")" == "forge_e2e_probe" ]]   || fail "database schema did not persist across app restart"
+[[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" == "forge_e2e_probe" ]]   || fail "database schema did not persist across app restart"
 
 docker compose stop --timeout 20 app >/dev/null
 app_container="$(docker compose ps --quiet --all app)"

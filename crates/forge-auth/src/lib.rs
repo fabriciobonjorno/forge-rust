@@ -6,6 +6,7 @@
 //! review. A session proves identity only. Tenant roles are resolved separately
 //! so authorization changes do not remain stale inside credentials.
 
+use async_trait::async_trait;
 use forge_core::Id;
 use forge_security::PrincipalId;
 use thiserror::Error;
@@ -68,6 +69,30 @@ impl Session {
         })
     }
 
+    /// Restores a persisted session after validating lifecycle invariants.
+    pub fn restore(
+        id: SessionId,
+        principal_id: PrincipalId,
+        issued_at: UnixTimestamp,
+        expires_at: UnixTimestamp,
+        revoked_at: Option<UnixTimestamp>,
+    ) -> Result<Self, SessionError> {
+        if expires_at <= issued_at {
+            return Err(SessionError::InvalidLifetime);
+        }
+        if revoked_at.is_some_and(|revoked_at| revoked_at < issued_at) {
+            return Err(SessionError::InvalidRevocationTime);
+        }
+
+        Ok(Self {
+            id,
+            principal_id,
+            issued_at,
+            expires_at,
+            revoked_at,
+        })
+    }
+
     /// Session identifier.
     #[must_use]
     pub const fn id(&self) -> SessionId {
@@ -124,10 +149,14 @@ impl Session {
 
     /// Revokes this session. Revocation is idempotent and keeps the earliest
     /// revocation timestamp.
-    pub fn revoke(&mut self, now: UnixTimestamp) {
+    pub fn revoke(&mut self, now: UnixTimestamp) -> Result<(), SessionError> {
+        if now < self.issued_at {
+            return Err(SessionError::InvalidRevocationTime);
+        }
         if self.revoked_at.is_none() {
             self.revoked_at = Some(now);
         }
+        Ok(())
     }
 
     /// Rotates to a new session and revokes this one.
@@ -138,7 +167,7 @@ impl Session {
     ) -> Result<Self, SessionError> {
         self.authenticate(now)?;
         let replacement = Self::new(self.principal_id, now, new_expires_at)?;
-        self.revoke(now);
+        self.revoke(now)?;
         Ok(replacement)
     }
 }
@@ -179,6 +208,9 @@ pub enum SessionError {
     /// Expiry was not strictly later than issuance.
     #[error("invalid session lifetime")]
     InvalidLifetime,
+    /// Revocation time predates session issuance.
+    #[error("invalid session revocation time")]
+    InvalidRevocationTime,
     /// Current time predates issuance.
     #[error("session is not yet valid")]
     NotYetValid,
@@ -188,6 +220,85 @@ pub enum SessionError {
     /// Session was revoked.
     #[error("session revoked")]
     Revoked,
+}
+
+/// Safe persistence error categories for server-side sessions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionStoreErrorKind {
+    /// Session storage is unavailable.
+    Unavailable,
+    /// A concurrent lifecycle transition prevented the requested write.
+    Conflict,
+    /// Persisted data violated Forge session invariants.
+    Corrupt,
+}
+
+/// Session persistence failure with a bounded safe message.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct SessionStoreError {
+    kind: SessionStoreErrorKind,
+    message: &'static str,
+    retryable: bool,
+}
+
+impl SessionStoreError {
+    /// Creates a classified session storage error.
+    #[must_use]
+    pub const fn new(
+        kind: SessionStoreErrorKind,
+        message: &'static str,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            kind,
+            message,
+            retryable,
+        }
+    }
+
+    /// Stable storage error category.
+    #[must_use]
+    pub const fn kind(&self) -> SessionStoreErrorKind {
+        self.kind
+    }
+
+    /// Whether a bounded retry may be reasonable.
+    #[must_use]
+    pub const fn retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+/// Persistent server-side session lifecycle.
+///
+/// This port stores lifecycle state only. It deliberately has no bearer-token or
+/// password API; credential verification is a later adapter boundary.
+#[async_trait]
+pub trait SessionStore: Send + Sync {
+    /// Inserts a newly created session.
+    async fn insert(&self, session: &Session) -> Result<(), SessionStoreError>;
+
+    /// Loads a persisted session by internal UUIDv7 identifier.
+    async fn find(&self, id: SessionId) -> Result<Option<Session>, SessionStoreError>;
+
+    /// Idempotently records revocation at the earliest persisted revocation time.
+    async fn revoke(
+        &self,
+        id: SessionId,
+        revoked_at: UnixTimestamp,
+    ) -> Result<(), SessionStoreError>;
+
+    /// Atomically revokes the active current session and inserts its replacement.
+    ///
+    /// Implementations must return Conflict when the current session is missing,
+    /// already revoked, not yet valid, or expired at rotated_at.
+    async fn rotate(
+        &self,
+        current_id: SessionId,
+        rotated_at: UnixTimestamp,
+        replacement: &Session,
+    ) -> Result<(), SessionStoreError>;
 }
 
 #[cfg(test)]
@@ -256,7 +367,7 @@ mod tests {
         );
 
         let mut revoked = Session::new(principal, time(10), time(30)).expect("valid session");
-        revoked.revoke(time(15));
+        revoked.revoke(time(15)).expect("revocation should succeed");
         assert_eq!(
             revoked.rotate(time(16), time(40)),
             Err(SessionError::Revoked)
@@ -264,12 +375,40 @@ mod tests {
     }
 
     #[test]
+    fn restored_sessions_validate_persisted_lifecycle() {
+        let principal = PrincipalId::new();
+        let id = SessionId::new();
+
+        assert!(Session::restore(id, principal, time(10), time(20), None).is_ok());
+        assert_eq!(
+            Session::restore(id, principal, time(10), time(10), None),
+            Err(SessionError::InvalidLifetime)
+        );
+        assert_eq!(
+            Session::restore(id, principal, time(10), time(20), Some(time(9))),
+            Err(SessionError::InvalidRevocationTime)
+        );
+    }
+
+    #[test]
+    fn revocation_before_issuance_is_rejected() {
+        let principal = PrincipalId::new();
+        let mut session = Session::new(principal, time(10), time(20)).expect("valid session");
+
+        assert_eq!(
+            session.revoke(time(9)),
+            Err(SessionError::InvalidRevocationTime)
+        );
+        assert_eq!(session.revoked_at(), None);
+    }
+
+    #[test]
     fn revocation_keeps_first_timestamp() {
         let principal = PrincipalId::new();
         let mut session = Session::new(principal, time(10), time(40)).expect("valid session");
 
-        session.revoke(time(20));
-        session.revoke(time(30));
+        session.revoke(time(20)).expect("revocation should succeed");
+        session.revoke(time(30)).expect("repeat revocation should succeed");
 
         assert_eq!(session.revoked_at(), Some(time(20)));
     }

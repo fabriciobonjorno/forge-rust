@@ -1,0 +1,5 @@
+DROP TABLE IF EXISTS forge_tenant_memberships;
+
+DROP TRIGGER IF EXISTS forge_sessions_guard_update ON forge_sessions;
+DROP FUNCTION IF EXISTS forge_guard_session_update();
+DROP TABLE IF EXISTS forge_sessions;

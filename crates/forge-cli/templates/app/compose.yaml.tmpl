@@ -5,15 +5,20 @@ services:
     image: postgres:18.6-trixie@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
     environment:
       # Development-only credentials. Never reuse them in a deployment.
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: app
-      POSTGRES_DB: %%DATABASE_NAME%%
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
       - db-data:/var/lib/postgresql
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/001-forge.sql:ro
     healthcheck:
-      test: ["CMD", "pg_isready", "--username=app", "--dbname=%%DATABASE_NAME%%"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready --username=postgres --dbname=%%DATABASE_NAME%% && test \"$(psql --username=postgres --dbname=%%DATABASE_NAME%% --tuples-only --no-align --command=\"SELECT has_schema_privilege('app_runtime', 'public', 'USAGE')\")\" = t",
+        ]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -23,7 +28,7 @@ services:
     image: %%APP_NAME%%:dev
     command: ["migrate"]
     environment:
-      FORGE_DATABASE_URL: %%DATABASE_URL_CONTAINER%%
+      FORGE_MIGRATION_DATABASE_URL: %%DATABASE_MIGRATION_URL_CONTAINER%%
     read_only: true
     cap_drop:
       - ALL
@@ -42,7 +47,7 @@ services:
     environment:
       FORGE_LOG: info
 %%if database%%
-      FORGE_DATABASE_URL: %%DATABASE_URL_CONTAINER%%
+      FORGE_DATABASE_URL: %%DATABASE_RUNTIME_URL_CONTAINER%%
 %%end%%
     init: true
     read_only: true
