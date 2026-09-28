@@ -6,6 +6,7 @@
 //! review. A session proves identity only. Tenant roles are resolved separately
 //! so authorization changes do not remain stale inside credentials.
 
+use async_trait::async_trait;
 use forge_core::Id;
 use forge_security::PrincipalId;
 use thiserror::Error;
@@ -16,6 +17,34 @@ pub enum SessionMarker {}
 
 /// UUIDv7 identifier for a server-side session record.
 pub type SessionId = Id<SessionMarker>;
+
+/// Fixed-size digest of an opaque session bearer credential.
+///
+/// The raw bearer token is intentionally not part of Forge's persistence
+/// contract. Infrastructure adapters derive this digest with a reviewed
+/// cryptographic hash before calling a SessionStore.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct SessionCredentialDigest([u8; 32]);
+
+impl SessionCredentialDigest {
+    /// Wraps a 256-bit credential digest produced by a cryptographic adapter.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the digest bytes for persistence/query binding.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SessionCredentialDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionCredentialDigest([REDACTED])")
+    }
+}
 
 /// UTC Unix timestamp in whole seconds.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -65,6 +94,30 @@ impl Session {
             issued_at,
             expires_at,
             revoked_at: None,
+        })
+    }
+
+    /// Restores a persisted server-side session while re-validating invariants.
+    pub fn restore(
+        id: SessionId,
+        principal_id: PrincipalId,
+        issued_at: UnixTimestamp,
+        expires_at: UnixTimestamp,
+        revoked_at: Option<UnixTimestamp>,
+    ) -> Result<Self, SessionError> {
+        if expires_at <= issued_at {
+            return Err(SessionError::InvalidLifetime);
+        }
+        if revoked_at.is_some_and(|timestamp| timestamp < issued_at) {
+            return Err(SessionError::InvalidRevocationTime);
+        }
+
+        Ok(Self {
+            id,
+            principal_id,
+            issued_at,
+            expires_at,
+            revoked_at,
         })
     }
 
@@ -124,10 +177,14 @@ impl Session {
 
     /// Revokes this session. Revocation is idempotent and keeps the earliest
     /// revocation timestamp.
-    pub fn revoke(&mut self, now: UnixTimestamp) {
+    pub fn revoke(&mut self, now: UnixTimestamp) -> Result<(), SessionError> {
+        if now < self.issued_at {
+            return Err(SessionError::InvalidRevocationTime);
+        }
         if self.revoked_at.is_none() {
             self.revoked_at = Some(now);
         }
+        Ok(())
     }
 
     /// Rotates to a new session and revokes this one.
@@ -138,7 +195,7 @@ impl Session {
     ) -> Result<Self, SessionError> {
         self.authenticate(now)?;
         let replacement = Self::new(self.principal_id, now, new_expires_at)?;
-        self.revoke(now);
+        self.revoke(now)?;
         Ok(replacement)
     }
 }
@@ -173,6 +230,56 @@ impl AuthenticatedPrincipal {
     }
 }
 
+/// Persistence boundary for opaque server-side sessions.
+///
+/// Implementations store only SessionCredentialDigest, never the bearer token.
+/// rotate must revoke the previous record and insert the replacement atomically.
+#[async_trait]
+pub trait SessionStore: Send + Sync {
+    /// Inserts a newly issued session and its credential digest.
+    async fn insert(
+        &self,
+        session: &Session,
+        credential: &SessionCredentialDigest,
+    ) -> Result<(), SessionStoreError>;
+
+    /// Resolves a persisted session by credential digest.
+    async fn find_by_credential(
+        &self,
+        credential: &SessionCredentialDigest,
+    ) -> Result<Option<Session>, SessionStoreError>;
+
+    /// Persists session revocation.
+    async fn revoke(
+        &self,
+        session_id: SessionId,
+        revoked_at: UnixTimestamp,
+    ) -> Result<(), SessionStoreError>;
+
+    /// Atomically revokes one session and inserts its replacement.
+    async fn rotate(
+        &self,
+        previous_session_id: SessionId,
+        revoked_at: UnixTimestamp,
+        replacement: &Session,
+        replacement_credential: &SessionCredentialDigest,
+    ) -> Result<(), SessionStoreError>;
+}
+
+/// Safe session persistence error.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum SessionStoreError {
+    /// Persistence is temporarily unavailable.
+    #[error("session store unavailable")]
+    Unavailable,
+    /// Uniqueness or optimistic persistence rule was violated.
+    #[error("session store conflict")]
+    Conflict,
+    /// Persisted data violates Session invariants.
+    #[error("invalid persisted session")]
+    CorruptRecord,
+}
+
 /// Session validation failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum SessionError {
@@ -188,6 +295,9 @@ pub enum SessionError {
     /// Session was revoked.
     #[error("session revoked")]
     Revoked,
+    /// Revocation timestamp predates session issuance.
+    #[error("invalid session revocation time")]
+    InvalidRevocationTime,
 }
 
 #[cfg(test)]
@@ -256,7 +366,7 @@ mod tests {
         );
 
         let mut revoked = Session::new(principal, time(10), time(30)).expect("valid session");
-        revoked.revoke(time(15));
+        revoked.revoke(time(15)).expect("revocation should succeed");
         assert_eq!(
             revoked.rotate(time(16), time(40)),
             Err(SessionError::Revoked)
@@ -268,9 +378,37 @@ mod tests {
         let principal = PrincipalId::new();
         let mut session = Session::new(principal, time(10), time(40)).expect("valid session");
 
-        session.revoke(time(20));
-        session.revoke(time(30));
+        session.revoke(time(20)).expect("revocation should succeed");
+        session.revoke(time(30)).expect("repeated revocation should succeed");
 
         assert_eq!(session.revoked_at(), Some(time(20)));
+    }
+
+    #[test]
+    fn persisted_session_is_revalidated() {
+        let principal = PrincipalId::new();
+        let id = SessionId::new();
+
+        assert_eq!(
+            Session::restore(id, principal, time(20), time(20), None),
+            Err(SessionError::InvalidLifetime)
+        );
+        assert_eq!(
+            Session::restore(id, principal, time(20), time(30), Some(time(19))),
+            Err(SessionError::InvalidRevocationTime)
+        );
+
+        let restored = Session::restore(id, principal, time(20), time(30), Some(time(25)))
+            .expect("valid persisted session");
+        assert_eq!(restored.id(), id);
+        assert_eq!(restored.revoked_at(), Some(time(25)));
+    }
+
+    #[test]
+    fn credential_digest_debug_is_redacted() {
+        let digest = SessionCredentialDigest::from_bytes([0xAB; 32]);
+        let debug = format!("{digest:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("AB"));
     }
 }
