@@ -45,7 +45,11 @@ impl MembershipStore for PgMembershipStore {
     }
 
     async fn upsert(&self, membership: &Membership) -> Result<(), MembershipStoreError> {
-        let roles: Vec<&str> = membership.roles().iter().map(Role::as_str).collect();
+        let roles: Vec<String> = membership
+            .roles()
+            .iter()
+            .map(|role| role.as_str().to_owned())
+            .collect();
         let state = state_name(membership.state());
 
         sqlx::query(
