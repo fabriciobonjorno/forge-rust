@@ -5,13 +5,13 @@
 
 use async_trait::async_trait;
 use forge::auth::{
-    CsrfTokenDigest, PasswordCredential, PasswordCredentialStore,
+    CsrfTokenDigest, LoginThrottleDecision, LoginThrottleKey, LoginThrottlePolicy,
+    LoginThrottleStore, LoginThrottleStoreError, PasswordCredential, PasswordCredentialStore,
     PasswordCredentialStoreError, PasswordCredentialVersion, PasswordHash, Session,
-    SessionCredentialDigest, SessionId,
-    SessionStore, SessionStoreError, UnixTimestamp,
+    SessionCredentialDigest, SessionId, SessionStore, SessionStoreError, UnixTimestamp,
 };
 use forge::security::PrincipalId;
-use sqlx::{PgPool, types::Uuid};
+use sqlx::{PgPool, Postgres, Transaction, types::Uuid};
 
 /// SQLx-backed password credential lookup.
 ///
@@ -98,6 +98,185 @@ impl PasswordCredentialStore for PostgresPasswordCredentialStore {
             _ => Err(PasswordCredentialStoreError::Conflict),
         }
     }
+}
+
+/// SQLx-backed atomic credential-attempt throttle store.
+#[derive(Clone)]
+pub struct PostgresLoginThrottleStore {
+    pool: PgPool,
+}
+
+impl PostgresLoginThrottleStore {
+    /// Creates a throttle store using the least-privilege runtime pool.
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LoginThrottleStore for PostgresLoginThrottleStore {
+    async fn reserve(
+        &self,
+        key: &LoginThrottleKey,
+        now: UnixTimestamp,
+        policy: LoginThrottlePolicy,
+    ) -> Result<LoginThrottleDecision, LoginThrottleStoreError> {
+        let now = throttle_timestamp_to_i64(now)?;
+        let window_seconds = i64::try_from(policy.window_seconds())
+            .map_err(|_| LoginThrottleStoreError::CorruptRecord)?;
+        let block_seconds = i64::try_from(policy.block_seconds())
+            .map_err(|_| LoginThrottleStoreError::CorruptRecord)?;
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(map_throttle_sqlx_error)?;
+        throttle_advisory_lock(&mut transaction, key).await?;
+
+        sqlx::query(
+            "INSERT INTO forge_login_throttles (
+                throttle_key, window_started_at, attempts, blocked_until
+             ) VALUES (
+                $1, to_timestamp($2::double precision), 0, NULL
+             )
+             ON CONFLICT (throttle_key) DO NOTHING",
+        )
+        .bind(key.as_bytes().as_slice())
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_throttle_sqlx_error)?;
+
+        let row = sqlx::query_as::<_, (i64, i32, Option<i64>)>(
+            "SELECT
+                EXTRACT(EPOCH FROM window_started_at)::bigint,
+                attempts,
+                EXTRACT(EPOCH FROM blocked_until)::bigint
+             FROM forge_login_throttles
+             WHERE throttle_key = $1
+             FOR UPDATE",
+        )
+        .bind(key.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(map_throttle_sqlx_error)?
+        .ok_or(LoginThrottleStoreError::CorruptRecord)?;
+
+        let (mut window_started_at, attempts, blocked_until) = row;
+        let mut attempts =
+            u32::try_from(attempts).map_err(|_| LoginThrottleStoreError::CorruptRecord)?;
+
+        if let Some(blocked_until) = blocked_until {
+            if blocked_until > now {
+                transaction.commit().await.map_err(map_throttle_sqlx_error)?;
+                return Ok(LoginThrottleDecision::Denied {
+                    retry_after_seconds: u64::try_from(blocked_until - now)
+                        .map_err(|_| LoginThrottleStoreError::CorruptRecord)?
+                        .max(1),
+                });
+            }
+
+            window_started_at = now;
+            attempts = 0;
+        } else if now.saturating_sub(window_started_at) >= window_seconds {
+            window_started_at = now;
+            attempts = 0;
+        }
+
+        if attempts < policy.max_attempts() {
+            let attempts = attempts
+                .checked_add(1)
+                .ok_or(LoginThrottleStoreError::CorruptRecord)?;
+
+            sqlx::query(
+                "UPDATE forge_login_throttles
+                 SET window_started_at = to_timestamp($2::double precision),
+                     attempts = $3,
+                     blocked_until = NULL,
+                     updated_at = clock_timestamp()
+                 WHERE throttle_key = $1",
+            )
+            .bind(key.as_bytes().as_slice())
+            .bind(window_started_at)
+            .bind(i64::from(attempts))
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_throttle_sqlx_error)?;
+
+            transaction.commit().await.map_err(map_throttle_sqlx_error)?;
+            return Ok(LoginThrottleDecision::Allowed);
+        }
+
+        let blocked_until = now
+            .checked_add(block_seconds)
+            .ok_or(LoginThrottleStoreError::CorruptRecord)?;
+
+        sqlx::query(
+            "UPDATE forge_login_throttles
+             SET blocked_until = to_timestamp($2::double precision),
+                 updated_at = clock_timestamp()
+             WHERE throttle_key = $1",
+        )
+        .bind(key.as_bytes().as_slice())
+        .bind(blocked_until)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_throttle_sqlx_error)?;
+
+        transaction.commit().await.map_err(map_throttle_sqlx_error)?;
+        Ok(LoginThrottleDecision::Denied {
+            retry_after_seconds: policy.block_seconds(),
+        })
+    }
+
+    async fn clear(&self, key: &LoginThrottleKey) -> Result<(), LoginThrottleStoreError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(map_throttle_sqlx_error)?;
+        throttle_advisory_lock(&mut transaction, key).await?;
+
+        sqlx::query(
+            "DELETE FROM forge_login_throttles
+             WHERE throttle_key = $1",
+        )
+        .bind(key.as_bytes().as_slice())
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_throttle_sqlx_error)?;
+
+        transaction.commit().await.map_err(map_throttle_sqlx_error)
+    }
+}
+
+async fn throttle_advisory_lock(
+    transaction: &mut Transaction<'_, Postgres>,
+    key: &LoginThrottleKey,
+) -> Result<(), LoginThrottleStoreError> {
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&key.as_bytes()[..8]);
+    let lock_id = i64::from_be_bytes(prefix);
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_throttle_sqlx_error)?;
+
+    Ok(())
+}
+
+fn throttle_timestamp_to_i64(
+    timestamp: UnixTimestamp,
+) -> Result<i64, LoginThrottleStoreError> {
+    i64::try_from(timestamp.as_secs()).map_err(|_| LoginThrottleStoreError::CorruptRecord)
+}
+
+fn map_throttle_sqlx_error(_error: sqlx::Error) -> LoginThrottleStoreError {
+    LoginThrottleStoreError::Unavailable
 }
 
 /// SQLx-backed server-side session store.
