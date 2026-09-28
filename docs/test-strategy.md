@@ -78,11 +78,13 @@ tenant/principal settings are installed, and cannot write another tenant's row.
 
 ### Authentication and security
 
-Test password/session lifecycle, cookie flags, revocation, RBAC deny-by-default,
-role changes, brute-force/rate limits, CSRF/CORS, SSRF redirect and address cases,
-path traversal/symlinks, upload limits, security headers, key rotation, webhook
-signatures, replay windows, idempotency digest mismatch, audit completeness, and
-all fail-closed rules in the [threat model](threat-model.md).
+Test password/session lifecycle, credential-digest persistence, restore-time
+session invariant validation, atomic rotation, cookie flags, revocation, RBAC
+deny-by-default, role changes, brute-force/rate limits, CSRF/CORS, SSRF redirect
+and address cases, path traversal/symlinks, upload limits, security headers, key
+rotation, webhook signatures, replay windows, idempotency digest mismatch, audit
+completeness, append-only enforcement, actor/tenant attribution, and all
+fail-closed rules in the [threat model](threat-model.md).
 
 ### Jobs and events
 
@@ -133,7 +135,11 @@ production configuration. Phase 3 extends the database path with distinct
 migration/runtime credentials and negative RLS checks: migration commands reject
 runtime-only configuration, the serving process receives only the runtime URL,
 the runtime role has no DDL authority, missing tenant settings deny visibility,
-and two-tenant reads/writes remain isolated.
+and two-tenant reads/writes remain isolated. It also exercises the reserved Forge
+identity migration: session lookup uses a fixed-size digest, membership lookup
+fails closed without context, authenticated principals can resolve their own
+membership, audit attribution cannot forge another tenant, and ordinary runtime
+access cannot read/update/delete appended audit rows.
 
 ## Concurrency correctness
 
