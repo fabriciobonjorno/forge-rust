@@ -5,9 +5,8 @@
 
 use async_trait::async_trait;
 use forge::auth::{
-    CsrfTokenDigest, PasswordCredential, PasswordCredentialStore,
-    PasswordCredentialStoreError, PasswordCredentialVersion, PasswordHash, Session,
-    SessionCredentialDigest, SessionId,
+    CsrfTokenDigest, PasswordCredential, PasswordCredentialStore, PasswordCredentialStoreError,
+    PasswordCredentialVersion, PasswordHash, Session, SessionCredentialDigest, SessionId,
     SessionStore, SessionStoreError, UnixTimestamp,
 };
 use forge::security::PrincipalId;
@@ -124,10 +123,7 @@ impl SessionStore for PostgresSessionStore {
     ) -> Result<(), SessionStoreError> {
         let issued_at = timestamp_to_i64(session.issued_at())?;
         let expires_at = timestamp_to_i64(session.expires_at())?;
-        let revoked_at = session
-            .revoked_at()
-            .map(timestamp_to_i64)
-            .transpose()?;
+        let revoked_at = session.revoked_at().map(timestamp_to_i64).transpose()?;
 
         sqlx::query(
             "INSERT INTO forge_sessions (
@@ -244,10 +240,7 @@ impl SessionStore for PostgresSessionStore {
         let revoked_at = timestamp_to_i64(revoked_at)?;
         let issued_at = timestamp_to_i64(replacement.issued_at())?;
         let expires_at = timestamp_to_i64(replacement.expires_at())?;
-        let replacement_revoked_at = replacement
-            .revoked_at()
-            .map(timestamp_to_i64)
-            .transpose()?;
+        let replacement_revoked_at = replacement.revoked_at().map(timestamp_to_i64).transpose()?;
 
         let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
 
@@ -303,13 +296,7 @@ impl SessionStore for PostgresSessionStore {
 }
 
 fn restore_session(
-    (id, principal_id, issued_at, expires_at, revoked_at): (
-        Uuid,
-        Uuid,
-        i64,
-        i64,
-        Option<i64>,
-    ),
+    (id, principal_id, issued_at, expires_at, revoked_at): (Uuid, Uuid, i64, i64, Option<i64>),
 ) -> Result<Session, SessionStoreError> {
     let id = SessionId::from_uuid(id).map_err(|_| SessionStoreError::CorruptRecord)?;
     let principal_id =

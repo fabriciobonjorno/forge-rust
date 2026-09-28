@@ -56,7 +56,9 @@ impl fmt::Display for CliError {
             Self::InvalidMigrationName { name, reason } => {
                 write!(formatter, "invalid migration name {name:?}: {reason}")
             }
-            Self::Clock(error) => write!(formatter, "system clock is before the Unix epoch: {error}"),
+            Self::Clock(error) => {
+                write!(formatter, "system clock is before the Unix epoch: {error}")
+            }
             Self::DestinationExists(path) => write!(
                 formatter,
                 "destination `{}` already exists; refusing to overwrite it",

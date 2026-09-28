@@ -284,10 +284,7 @@ impl Session {
     /// Authenticates this session at a trusted current time.
     ///
     /// Expiry is exclusive: authentication exactly at expires_at is denied.
-    pub fn authenticate(
-        &self,
-        now: UnixTimestamp,
-    ) -> Result<AuthenticatedPrincipal, SessionError> {
+    pub fn authenticate(&self, now: UnixTimestamp) -> Result<AuthenticatedPrincipal, SessionError> {
         if self.revoked_at.is_some() {
             return Err(SessionError::Revoked);
         }
@@ -677,7 +674,9 @@ mod tests {
         let mut session = Session::new(principal, time(10), time(40)).expect("valid session");
 
         session.revoke(time(20)).expect("revocation should succeed");
-        session.revoke(time(30)).expect("repeated revocation should succeed");
+        session
+            .revoke(time(30))
+            .expect("repeated revocation should succeed");
 
         assert_eq!(session.revoked_at(), Some(time(20)));
     }

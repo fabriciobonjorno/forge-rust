@@ -55,11 +55,11 @@ fn validate_name(value: String, kind: &'static str) -> Result<String, SecurityNa
     let valid = !value.is_empty()
         && value.len() <= 64
         && value.is_ascii()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
                 || byte.is_ascii_digit()
-                || matches!(byte, b':' | b'.' | b'_' | b'-'))
+                || matches!(byte, b':' | b'.' | b'_' | b'-')
+        })
         && value
             .as_bytes()
             .first()
@@ -206,8 +206,18 @@ mod tests {
 
     #[test]
     fn names_are_strict_and_not_normalized() {
-        for invalid in ["", "Admin", " users:read", "users/read", "users:read:", "a b"] {
-            assert!(Role::new(invalid).is_err(), "accepted invalid role {invalid:?}");
+        for invalid in [
+            "",
+            "Admin",
+            " users:read",
+            "users/read",
+            "users:read:",
+            "a b",
+        ] {
+            assert!(
+                Role::new(invalid).is_err(),
+                "accepted invalid role {invalid:?}"
+            );
             assert!(
                 Permission::new(invalid).is_err(),
                 "accepted invalid permission {invalid:?}"

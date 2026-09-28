@@ -7,6 +7,8 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/forge-e2e.XXXXXX")"
+skip_docker="${FORGE_E2E_SKIP_DOCKER:-0}"
+unset FORGE_E2E_SKIP_DOCKER
 app_name="forge-e2e-app"
 app_dir="$work_dir/$app_name"
 server_pid=""
@@ -44,7 +46,7 @@ forge="$repo_root/target/debug/forge"
 
 log "Generating $app_name"
 new_args=(new "$app_name" --skip-lockfile --forge-path .forge/crates/forge)
-if [[ "${FORGE_E2E_SKIP_DOCKER:-0}" == 1 ]]; then
+if [[ "$skip_docker" == 1 ]]; then
   new_args+=(--skip-database)
 fi
 (cd "$work_dir" && "$forge" "${new_args[@]}")
@@ -62,8 +64,10 @@ cargo test --quiet --locked
 
 runtime_database_url=""
 migration_database_url=""
-if [[ "${FORGE_E2E_SKIP_DOCKER:-0}" != 1 ]]; then
+if [[ "$skip_docker" != 1 ]]; then
   log "Starting PostgreSQL and exercising reversible migrations"
+  postgres_port="$(free_port)"
+  printf 'POSTGRES_PUBLISHED_PORT=%s\n' "$postgres_port" > .env
   "$forge" generate migration create_e2e_probe >/dev/null
   up_file="$(find migrations -maxdepth 1 -name '*_create_e2e_probe.up.sql' -print -quit)"
   down_file="$(find migrations -maxdepth 1 -name '*_create_e2e_probe.down.sql' -print -quit)"
@@ -100,9 +104,9 @@ SQL
 
   # sqlx::migrate!() embeds migrations at compile time, so rebuild after creating it.
   cargo build --quiet --locked
-  docker compose up --detach db >/dev/null
-  runtime_database_url="postgres://app_runtime:app_runtime@127.0.0.1:5432/forge_e2e_app"
-  migration_database_url="postgres://app_migrator:app_migrator@127.0.0.1:5432/forge_e2e_app"
+  docker compose up --detach --wait db >/dev/null
+  runtime_database_url="postgres://app_runtime:app_runtime@127.0.0.1:${postgres_port}/forge_e2e_app"
+  migration_database_url="postgres://app_migrator:app_migrator@127.0.0.1:${postgres_port}/forge_e2e_app"
 
   if FORGE_DATABASE_URL="$runtime_database_url" "target/debug/$app_name" migrate 2>/dev/null; then
     fail "migrate must not accept the runtime database credential"
@@ -178,7 +182,7 @@ SQL
       "SELECT count(*) FROM forge_principals WHERE id = '$principal'")" == 1 ]] \
     || fail "runtime credential lookup cannot read principal"
 
-  upgraded_version="$(docker compose exec -T db psql -U app_runtime -d forge_e2e_app -Atc "
+  upgraded_version="$(docker compose exec -T db psql -U app_runtime -d forge_e2e_app -qAtc "
     UPDATE forge_principals
     SET password_hash = password_hash,
         updated_at = clock_timestamp(),
@@ -186,10 +190,13 @@ SQL
     WHERE id = '$principal' AND version = 1 AND disabled_at IS NULL
     RETURNING version;
   ")"
-  [[ "$upgraded_version" == 2 ]] \
-    || fail "runtime password rehash update did not advance optimistic version"
+  if [[ "$upgraded_version" != 2 ]]; then
+    principal_version="$(docker compose exec -T db psql -U app_runtime -d forge_e2e_app -Atc \
+      "SELECT version FROM forge_principals WHERE id = '$principal'")"
+    fail "runtime password rehash update did not advance optimistic version (returned '$upgraded_version'; stored version '$principal_version')"
+  fi
 
-  stale_upgrade="$(docker compose exec -T db psql -U app_runtime -d forge_e2e_app -Atc "
+  stale_upgrade="$(docker compose exec -T db psql -U app_runtime -d forge_e2e_app -qAtc "
     UPDATE forge_principals
     SET password_hash = password_hash,
         updated_at = clock_timestamp(),
@@ -357,7 +364,7 @@ if env "${env_args[@]}" "target/debug/$app_name" healthcheck 2>/dev/null; then
 fi
 echo "host run OK"
 
-if [[ "${FORGE_E2E_SKIP_DOCKER:-0}" == 1 ]]; then
+if [[ "$skip_docker" == 1 ]]; then
   log "Skipping database/container checks (FORGE_E2E_SKIP_DOCKER=1)"
   exit 0
 fi

@@ -22,6 +22,7 @@ forge check && forge lint && forge test
 ```
 
 Binary commands: `serve` (default), `healthcheck`, `version`, `help`.
+
 Configuration uses `FORGE_*` environment variables; unknown `FORGE_*` keys are
 rejected at startup. Run `cargo run -- help` for the full list.
 
@@ -30,7 +31,7 @@ rejected at startup. Run `cargo run -- help` for the full list.
 ```bash
 docker build -t hello-forge .
 docker run --rm -p 3000:3000 hello-forge
-docker compose up --build     # read-only, non-root, all capabilities dropped
+docker compose up --build
 ```
 
 The image is built with `cargo build --release --locked`, so commit

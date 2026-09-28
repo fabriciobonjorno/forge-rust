@@ -95,13 +95,11 @@ fn valid_name(value: &str, maximum: usize) -> bool {
     !value.is_empty()
         && value.len() <= maximum
         && value.is_ascii()
-        && value
-            .bytes()
-            .all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b':' | b'.' | b'_' | b'-')
-            })
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b':' | b'.' | b'_' | b'-')
+        })
         && value
             .as_bytes()
             .first()
@@ -249,11 +247,7 @@ pub struct AuditError {
 impl AuditError {
     /// Creates a safe classified audit error.
     #[must_use]
-    pub const fn new(
-        kind: AuditErrorKind,
-        message: &'static str,
-        retryable: bool,
-    ) -> Self {
+    pub const fn new(kind: AuditErrorKind, message: &'static str, retryable: bool) -> Self {
         Self {
             kind,
             message,
@@ -311,7 +305,12 @@ mod tests {
 
     #[test]
     fn action_names_are_strict_and_bounded() {
-        for valid in ["auth.login", "session.revoke", "invoice:approve", "user_2fa.enable"] {
+        for valid in [
+            "auth.login",
+            "session.revoke",
+            "invoice:approve",
+            "user_2fa.enable",
+        ] {
             assert_eq!(
                 AuditAction::new(valid)
                     .expect("fixture action should be valid")
@@ -320,7 +319,14 @@ mod tests {
             );
         }
 
-        for invalid in ["", "Auth.Login", " auth.login", "auth/login", "auth.login.", "a b"] {
+        for invalid in [
+            "",
+            "Auth.Login",
+            " auth.login",
+            "auth/login",
+            "auth.login.",
+            "a b",
+        ] {
             assert_eq!(
                 AuditAction::new(invalid),
                 Err(AuditValueError::InvalidAction),
@@ -333,7 +339,10 @@ mod tests {
     fn linkage_rejects_controls_and_unbounded_values() {
         assert!(AuditLink::new("01941f29-7c00-7000-8000-000000000001").is_ok());
         assert_eq!(AuditLink::new(""), Err(AuditValueError::InvalidLink));
-        assert_eq!(AuditLink::new("request\nsmuggle"), Err(AuditValueError::InvalidLink));
+        assert_eq!(
+            AuditLink::new("request\nsmuggle"),
+            Err(AuditValueError::InvalidLink)
+        );
         assert_eq!(
             AuditLink::new("x".repeat(129)),
             Err(AuditValueError::InvalidLink)
@@ -388,13 +397,8 @@ mod tests {
         .expect("valid session")
         .authenticate(UnixTimestamp::from_secs(11))
         .expect("valid authentication");
-        let context = TenantContext::authorize(
-            authenticated,
-            &membership,
-            &policy,
-            &permission,
-        )
-        .expect("authorized tenant context");
+        let context = TenantContext::authorize(authenticated, &membership, &policy, &permission)
+            .expect("authorized tenant context");
 
         let event = AuditEvent::from_tenant_context(
             UnixTimestamp::from_secs(12),
@@ -409,11 +413,7 @@ mod tests {
 
     #[test]
     fn audit_errors_are_classified_without_internal_details() {
-        let error = AuditError::new(
-            AuditErrorKind::Unavailable,
-            "audit sink unavailable",
-            true,
-        );
+        let error = AuditError::new(AuditErrorKind::Unavailable, "audit sink unavailable", true);
 
         assert_eq!(error.kind(), AuditErrorKind::Unavailable);
         assert!(error.retryable());
