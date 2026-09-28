@@ -80,7 +80,8 @@ tenant/principal settings are installed, and cannot write another tenant's row.
 
 Test password/session lifecycle, Argon2id parameter selection and malformed PHC
 handling, policy-upgrade detection and optimistic rehash conflicts, generic
-credential denial, bounded password input, bearer/CSRF entropy
+credential denial, durable login/origin throttling under concurrent attempts,
+bounded password input, bearer/CSRF entropy
 and independence, digest-only persistence, cookie flags, session revocation and
 rotation, CSRF safe/unsafe method behavior, RBAC deny-by-default, role changes,
 brute-force/rate limits, CORS, SSRF redirect and address cases, path
@@ -143,8 +144,9 @@ and two-tenant reads/writes remain isolated. The same generated-app path verifie
 that Forge identity migrations create principal/session/membership storage, bearer
 and CSRF digests are persisted without raw secrets, session mutation is limited to
 monotonic revocation, membership state persists independently from session
-credentials, and runtime password rehash updates are restricted to hash metadata
-with stale versions rejected.
+credentials, runtime password rehash updates are restricted to hash metadata
+with stale versions rejected, and the PostgreSQL login throttle serializes
+parallel reservations so the attempt ceiling cannot be exceeded.
 
 ## Concurrency correctness
 

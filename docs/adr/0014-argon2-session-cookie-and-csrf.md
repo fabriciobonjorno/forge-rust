@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-27
 - Refines: [ADR 0010](0010-session-and-tenant-authorization-context.md), [ADR 0013](0013-persistent-principals-sessions-and-memberships.md)
+- Refined by: [ADR 0015](0015-login-and-origin-credential-throttling.md)
 
 ## Context
 
@@ -67,7 +68,8 @@ custom cookie grammar.
 - Successful authentication upgrades outdated Argon2id parameters without
   exposing infrastructure types to application code.
 - Concurrent password changes/disables cannot be overwritten by a stale rehash.
-- Applications need rate limiting/throttling in addition to expensive hashing.
+- Generated database applications apply durable login/origin throttling before
+  expensive password verification; see [ADR 0015](0015-login-and-origin-credential-throttling.md).
 - HTTP login/logout/tenant-selection endpoints remain application adapters built
   from these mechanisms rather than universal routes imposed by the framework.
 

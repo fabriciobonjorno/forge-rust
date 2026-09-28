@@ -8,9 +8,9 @@ in progress: server-side session lifecycle, deny-by-default RBAC, explicit
 membership and authorized TenantContext contracts, least-privilege PostgreSQL/RLS,
 digest-only persistent sessions, Argon2id password verification, opaque
 session/CSRF secrets, secure cookie helpers, and append-only audit persistence
-are implemented, including optimistic Argon2id rehash-on-policy-upgrade after a
-successful login. Login throttling, turnkey HTTP auth route composition, and
-stronger audit integrity/retention controls remain open.
+are implemented, including optimistic Argon2id rehash-on-policy-upgrade and
+durable login/origin throttling before password verification. Turnkey HTTP auth
+route composition and stronger audit integrity/retention controls remain open.
 
 Forge is an opinionated Rust application framework for long-lived services. Its
 value is the integration of explicit application architecture, secure defaults,
@@ -228,8 +228,15 @@ unsafe cookie-authenticated HTTP methods require the independent
 missing, disabled, or has the wrong password. Successfully verified passwords
 whose PHC parameters no longer match policy are rehashed and updated with an
 optimistic credential version; a concurrent password change/disable wins and the
-login fails closed rather than overwriting it. See
-[ADR 0014](adr/0014-argon2-session-cookie-and-csrf.md).
+login fails closed rather than overwriting it.
+
+Password verification is preceded by durable per-login and per-origin attempt
+reservation. Generated applications use opaque SHA-256 throttle keys and a
+PostgreSQL store serialized with transaction-scoped advisory locks, so parallel
+requests cannot bypass the budget. Successful authentication clears only the
+login-scoped budget; the origin budget remains. See
+[ADR 0014](adr/0014-argon2-session-cookie-and-csrf.md) and
+[ADR 0015](adr/0015-login-and-origin-credential-throttling.md).
 
 ### Database and transactions
 

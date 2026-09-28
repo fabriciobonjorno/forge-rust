@@ -160,10 +160,13 @@ database boundary. It verifies migration/runtime privilege separation, tenant
 RLS isolation, append-only audit restrictions, identity/session schema
 invariants, digest-only session persistence, and membership lifecycle storage.
 Unit tests in the generated security module cover Argon2id authentication,
-policy-upgrade detection, generic login denial, opaque token generation, cookie
-attributes, session lookup, and CSRF enforcement. The generated database E2E also
-checks that runtime password-hash updates are column-restricted and use an
-optimistic credential version so stale upgrades do not overwrite newer state.
+policy-upgrade detection, generic login denial, canonical login/origin throttle
+keys, opaque token generation, cookie attributes, session lookup, and CSRF
+enforcement. The generated database E2E also checks that runtime password-hash
+updates are column-restricted and use an optimistic credential version so stale
+upgrades do not overwrite newer state. A dedicated generated-app integration test
+fires concurrent attempts through the PostgreSQL throttle adapter and verifies
+the configured budget, blocking window, expiry and clear semantics.
 
 Append-only audit persistence remains a separate structured security-evidence
 channel. The generated runtime role can INSERT audit events but cannot SELECT,
@@ -171,10 +174,10 @@ UPDATE, or DELETE them, and a database trigger rejects audit-row mutation. This
 does not claim tamper-evident cryptographic integrity or immutable external
 storage.
 
-Remaining Phase 3 threat-model controls are not claimed complete: per-account and
-per-origin credential throttling, turnkey HTTP login/logout/tenant-selection
-composition, audit integrity chaining/retention and privileged reader workflows,
-and administrative cross-tenant role separation still require implementation and
+Remaining Phase 3 threat-model controls are not claimed complete: turnkey HTTP
+login/logout/tenant-selection composition, trusted-proxy client-address policy,
+audit integrity chaining/retention and privileged reader workflows, and
+administrative cross-tenant role separation still require implementation and
 abuse tests.
 
 ## Review cadence

@@ -11,7 +11,8 @@ use argon2::{
 use async_trait::async_trait;
 use cookie::{Cookie, SameSite};
 use forge::auth::{
-    AuthenticatedPrincipal, CsrfToken, CsrfTokenDigest, PasswordCredentialStore,
+    AuthenticatedPrincipal, CsrfToken, CsrfTokenDigest, LoginThrottleDecision, LoginThrottleKey,
+    LoginThrottlePolicy, LoginThrottleStore, LoginThrottleStoreError, PasswordCredentialStore,
     PasswordCredentialStoreError, PasswordHash, PasswordHashError, PasswordHasher, Session,
     SessionBearerToken, SessionCredentialDigest, SessionError, SessionStore, SessionStoreError,
     UnixTimestamp,
@@ -19,6 +20,7 @@ use forge::auth::{
 use forge::http::{Method, Request, header};
 use forge::security::PrincipalId;
 use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
 
 /// Name of the host-only session cookie.
 ///
@@ -34,6 +36,12 @@ const ARGON2_ITERATIONS: u32 = 2;
 const ARGON2_PARALLELISM: u32 = 1;
 const ARGON2_OUTPUT_BYTES: usize = 32;
 const MAX_PASSWORD_BYTES: usize = 1024;
+const LOGIN_MAX_ATTEMPTS: u32 = 5;
+const LOGIN_WINDOW_SECONDS: u64 = 300;
+const LOGIN_BLOCK_SECONDS: u64 = 900;
+const ORIGIN_MAX_ATTEMPTS: u32 = 50;
+const ORIGIN_WINDOW_SECONDS: u64 = 300;
+const ORIGIN_BLOCK_SECONDS: u64 = 900;
 
 /// Password hashing adapter using Argon2id v19 with the project policy.
 #[derive(Clone, Copy, Debug, Default)]
@@ -142,30 +150,46 @@ fn password_hash_needs_rehash(expected: &PasswordHash) -> Result<bool, PasswordH
         || parallelism != Some(ARGON2_PARALLELISM))
 }
 
-/// Authenticates a login/password without exposing account existence.
+/// Authenticates a login/password with durable fail-closed throttling.
 ///
-/// Missing/invalid login identifiers still perform one Argon2id operation via
-/// the supplied hasher. Disabled accounts verify against their stored hash but
-/// are always denied. The public result therefore does not distinguish unknown
-/// login, disabled account, or wrong password.
+/// One origin-scoped attempt and one login-scoped attempt are atomically
+/// reserved before Argon2id work. Successful authentication clears only the
+/// login-scoped budget; the origin budget remains so one valid account cannot
+/// reset brute-force capacity for the whole source address.
+///
+/// Missing/invalid login identifiers still perform one Argon2id operation when
+/// the throttle allows it. Disabled accounts verify against their stored hash
+/// but are always denied. The public result therefore does not distinguish
+/// unknown login, disabled account, or wrong password.
 pub async fn authenticate_password(
     store: &dyn PasswordCredentialStore,
     hasher: &dyn PasswordHasher,
+    throttle: &dyn LoginThrottleStore,
     login: &str,
     password: &[u8],
+    remote_addr: SocketAddr,
+    now: UnixTimestamp,
 ) -> Result<PrincipalId, LoginError> {
-    let login_valid = !login.trim().is_empty()
-        && login.len() <= 320
-        && !login.bytes().any(|byte| byte.is_ascii_control());
+    let origin_key = origin_throttle_key(remote_addr);
+    reserve_login_attempt(throttle, &origin_key, now, origin_policy()?).await?;
+
+    let login_key = login_throttle_key(login);
+    reserve_login_attempt(throttle, &login_key, now, login_policy()?).await?;
+
+    let canonical_login = canonical_login(login);
     let password_valid = !password.is_empty() && password.len() <= MAX_PASSWORD_BYTES;
 
-    if !login_valid || !password_valid {
+    let Some(canonical_login) = canonical_login else {
+        perform_dummy_password_work(hasher).await?;
+        return Err(LoginError::InvalidCredentials);
+    };
+    if !password_valid {
         perform_dummy_password_work(hasher).await?;
         return Err(LoginError::InvalidCredentials);
     }
 
     let credential = store
-        .find_by_login(login)
+        .find_by_login(&canonical_login)
         .await
         .map_err(map_credential_store_error)?;
 
@@ -201,7 +225,86 @@ pub async fn authenticate_password(
             .map_err(map_credential_store_error)?;
     }
 
+    throttle
+        .clear(&login_key)
+        .await
+        .map_err(map_throttle_store_error)?;
+
     Ok(credential.principal_id())
+}
+
+fn canonical_login(login: &str) -> Option<String> {
+    let login = login.trim();
+    if login.is_empty() || login.len() > 320 || login.bytes().any(|byte| byte.is_ascii_control()) {
+        return None;
+    }
+    Some(login.to_lowercase())
+}
+
+/// Stable opaque key for a case-insensitive login identifier.
+///
+/// This avoids storing the raw login in the throttle table. It is not intended
+/// as an anonymity boundary against offline guessing of low-entropy identifiers.
+#[must_use]
+pub fn login_throttle_key(login: &str) -> LoginThrottleKey {
+    let canonical = login.trim().to_lowercase();
+    throttle_key(b"login", canonical.as_bytes())
+}
+
+/// Stable opaque key for the peer IP address, excluding the ephemeral port.
+#[must_use]
+pub fn origin_throttle_key(remote_addr: SocketAddr) -> LoginThrottleKey {
+    let address = remote_addr.ip().to_string();
+    throttle_key(b"origin", address.as_bytes())
+}
+
+fn throttle_key(namespace: &[u8], value: &[u8]) -> LoginThrottleKey {
+    let mut digest = Sha256::new();
+    digest.update(namespace);
+    digest.update([0_u8]);
+    digest.update(value);
+    let output = digest.finalize();
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(&output);
+    LoginThrottleKey::from_bytes(bytes)
+}
+
+fn login_policy() -> Result<LoginThrottlePolicy, LoginError> {
+    LoginThrottlePolicy::new(
+        LOGIN_MAX_ATTEMPTS,
+        LOGIN_WINDOW_SECONDS,
+        LOGIN_BLOCK_SECONDS,
+    )
+    .ok_or(LoginError::AuthenticationUnavailable)
+}
+
+fn origin_policy() -> Result<LoginThrottlePolicy, LoginError> {
+    LoginThrottlePolicy::new(
+        ORIGIN_MAX_ATTEMPTS,
+        ORIGIN_WINDOW_SECONDS,
+        ORIGIN_BLOCK_SECONDS,
+    )
+    .ok_or(LoginError::AuthenticationUnavailable)
+}
+
+async fn reserve_login_attempt(
+    throttle: &dyn LoginThrottleStore,
+    key: &LoginThrottleKey,
+    now: UnixTimestamp,
+    policy: LoginThrottlePolicy,
+) -> Result<(), LoginError> {
+    match throttle
+        .reserve(key, now, policy)
+        .await
+        .map_err(map_throttle_store_error)?
+    {
+        LoginThrottleDecision::Allowed => Ok(()),
+        LoginThrottleDecision::Denied {
+            retry_after_seconds,
+        } => Err(LoginError::Throttled {
+            retry_after_seconds,
+        }),
+    }
 }
 
 async fn perform_dummy_password_work(hasher: &dyn PasswordHasher) -> Result<(), LoginError> {
@@ -225,12 +328,22 @@ fn map_credential_store_error(error: PasswordCredentialStoreError) -> LoginError
     }
 }
 
+fn map_throttle_store_error(_error: LoginThrottleStoreError) -> LoginError {
+    LoginError::AuthenticationUnavailable
+}
+
 /// Public login result deliberately collapses all credential denials.
 #[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
 pub enum LoginError {
     /// Login/password pair is not accepted.
     #[error("invalid credentials")]
     InvalidCredentials,
+    /// Credential verification is temporarily throttled.
+    #[error("authentication temporarily throttled")]
+    Throttled {
+        /// Positive interval suitable for a Retry-After response.
+        retry_after_seconds: u64,
+    },
     /// Authentication dependencies could not complete safely.
     #[error("authentication unavailable")]
     AuthenticationUnavailable,
@@ -584,6 +697,25 @@ mod tests {
             password_hash_needs_rehash(&weaker),
             "older policy should request rehash",
         ));
+    }
+
+    #[test]
+    fn throttle_keys_are_canonical_and_origin_scoped() {
+        assert_eq!(
+            login_throttle_key(" User@Example.COM "),
+            login_throttle_key("user@example.com")
+        );
+        assert_ne!(
+            login_throttle_key("user@example.com"),
+            login_throttle_key("other@example.com")
+        );
+
+        let first: SocketAddr = result_ok("192.0.2.10:1234".parse(), "valid socket address");
+        let second: SocketAddr = result_ok("192.0.2.10:9999".parse(), "valid socket address");
+        let other: SocketAddr = result_ok("192.0.2.11:1234".parse(), "valid socket address");
+        assert_eq!(origin_throttle_key(first), origin_throttle_key(second));
+        assert_ne!(origin_throttle_key(first), origin_throttle_key(other));
+        assert_ne!(origin_throttle_key(first), login_throttle_key("192.0.2.10"));
     }
 
     #[test]

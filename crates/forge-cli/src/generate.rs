@@ -91,6 +91,14 @@ const TEMPLATES: &[Template] = &[
     ),
     template!(
         Group::Database,
+        "migrations/00000000000000000003_forge_login_throttle.up.sql" => "migrations/00000000000000000003_forge_login_throttle.up.sql.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "migrations/00000000000000000003_forge_login_throttle.down.sql" => "migrations/00000000000000000003_forge_login_throttle.down.sql.tmpl"
+    ),
+    template!(
+        Group::Database,
         "src/infrastructure/audit/mod.rs" => "src/infrastructure/audit/mod.rs.tmpl"
     ),
     template!(
@@ -697,6 +705,14 @@ mod tests {
             root.join("migrations/00000000000000000002_forge_identity.down.sql")
                 .is_file()
         );
+        assert!(
+            root.join("migrations/00000000000000000003_forge_login_throttle.up.sql")
+                .is_file()
+        );
+        assert!(
+            root.join("migrations/00000000000000000003_forge_login_throttle.down.sql")
+                .is_file()
+        );
         assert!(root.join("src/infrastructure/audit/mod.rs").is_file());
         assert!(root.join("src/infrastructure/auth/mod.rs").is_file());
         assert!(root.join("src/infrastructure/tenancy/mod.rs").is_file());
@@ -717,11 +733,16 @@ mod tests {
         assert!(auth_module.contains("PasswordCredentialVersion"));
         assert!(auth_module.contains("replace_password_hash"));
         assert!(auth_module.contains("version = version + 1"));
+        assert!(auth_module.contains("PostgresLoginThrottleStore"));
+        assert!(auth_module.contains("pg_advisory_xact_lock"));
 
         let security_module = read(&root, "src/infrastructure/security/mod.rs");
         assert!(security_module.contains("Argon2idPasswordHasher"));
         assert!(security_module.contains("needs_rehash"));
         assert!(security_module.contains("replace_password_hash"));
+        assert!(security_module.contains("LoginThrottleStore"));
+        assert!(security_module.contains("login_throttle_key"));
+        assert!(security_module.contains("origin_throttle_key"));
         assert!(security_module.contains("__Host-forge_session"));
         assert!(security_module.contains("x-csrf-token"));
 

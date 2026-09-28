@@ -1,0 +1,27 @@
+-- Forge Phase 3 credential-attempt throttling.
+
+CREATE TABLE forge_login_throttles (
+    throttle_key bytea PRIMARY KEY
+        CHECK (octet_length(throttle_key) = 32),
+    window_started_at timestamptz NOT NULL,
+    attempts bigint NOT NULL DEFAULT 0
+        CHECK (attempts >= 0),
+    blocked_until timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CHECK (
+        blocked_until IS NULL
+        OR blocked_until >= window_started_at
+    )
+);
+
+REVOKE ALL ON TABLE forge_login_throttles FROM PUBLIC;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+        REVOKE ALL ON TABLE forge_login_throttles FROM app_runtime;
+        GRANT SELECT, INSERT, UPDATE, DELETE
+            ON TABLE forge_login_throttles TO app_runtime;
+    END IF;
+END
+$$;
