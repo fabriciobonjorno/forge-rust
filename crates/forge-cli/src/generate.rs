@@ -103,6 +103,10 @@ const TEMPLATES: &[Template] = &[
     ),
     template!(
         Group::Database,
+        "src/infrastructure/security/mod.rs" => "src/infrastructure/security/mod.rs.tmpl"
+    ),
+    template!(
+        Group::Database,
         "src/infrastructure/database/mod.rs" => "src/infrastructure/database/mod.rs.tmpl"
     ),
     template!(
@@ -427,7 +431,12 @@ fn write_application(
     }
 
     for (directory, description) in RESERVED_MODULES {
-        if options.database && *directory == "src/infrastructure/database" {
+        if options.database
+            && matches!(
+                *directory,
+                "src/infrastructure/database" | "src/infrastructure/security"
+            )
+        {
             continue;
         }
         write_file(
@@ -657,6 +666,10 @@ mod tests {
         let manifest = read(&root, "Cargo.toml");
         assert!(manifest.contains("name = \"sample-app\""));
         assert!(manifest.contains("sqlx"));
+        assert!(manifest.contains("argon2"));
+        assert!(manifest.contains("cookie"));
+        assert!(manifest.contains("getrandom"));
+        assert!(manifest.contains("sha2"));
         assert!(root.join("build.rs").is_file());
         assert!(root.join("migrations/.gitkeep").is_file());
         assert!(
@@ -678,7 +691,20 @@ mod tests {
         assert!(root.join("src/infrastructure/audit/mod.rs").is_file());
         assert!(root.join("src/infrastructure/auth/mod.rs").is_file());
         assert!(root.join("src/infrastructure/tenancy/mod.rs").is_file());
+        assert!(root.join("src/infrastructure/security/mod.rs").is_file());
         assert!(root.join("docker/postgres/init.sql").is_file());
+
+        let identity_migration =
+            read(&root, "migrations/00000000000000000002_forge_identity.up.sql");
+        assert!(identity_migration.contains("CREATE TABLE forge_principals"));
+        assert!(identity_migration.contains("credential_digest bytea"));
+        assert!(identity_migration.contains("csrf_digest bytea"));
+        assert!(identity_migration.contains("CREATE TABLE forge_tenant_memberships"));
+
+        let security_module = read(&root, "src/infrastructure/security/mod.rs");
+        assert!(security_module.contains("Argon2idPasswordHasher"));
+        assert!(security_module.contains("__Host-forge_session"));
+        assert!(security_module.contains("x-csrf-token"));
 
         let database_module = read(&root, "src/infrastructure/database/mod.rs");
         assert!(database_module.contains("begin_tenant_transaction"));
@@ -746,6 +772,8 @@ mod tests {
         assert!(!root.join("src/infrastructure/audit").exists());
         assert!(!root.join("src/infrastructure/auth").exists());
         assert!(!root.join("src/infrastructure/tenancy").exists());
+        assert!(!read(&root, "Cargo.toml").contains("argon2"));
+        assert!(!read(&root, "Cargo.toml").contains("cookie"));
         assert!(!root.join("docker/postgres/init.sql").exists());
     }
 
