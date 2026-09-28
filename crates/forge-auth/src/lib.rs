@@ -551,7 +551,12 @@ impl LoginThrottlePolicy {
         window_seconds: u64,
         block_seconds: u64,
     ) -> Option<Self> {
-        if max_attempts == 0 || window_seconds == 0 || block_seconds == 0 {
+        if max_attempts == 0
+            || window_seconds == 0
+            || block_seconds == 0
+            || window_seconds > i64::MAX as u64
+            || block_seconds > i64::MAX as u64
+        {
             return None;
         }
         Some(Self {
