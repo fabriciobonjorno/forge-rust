@@ -72,6 +72,21 @@ The dependency is not added to the framework workspace merely for convenience:
 only generated applications that enable the database capability consume it.
 `--skip-database` removes SQLx entirely from a generated application's graph.
 
+## Phase 3 persistence dependency decision
+
+The persistent-session/audit slice introduces no new third-party package to the
+workspace. It reuses the already-admitted `async-trait 0.1.92` contract helper
+and the existing generated SQLx 0.9 PostgreSQL adapter. Database-enabled generated
+applications now declare `async-trait` directly because their SQLx
+`SessionStore` and `AuditSink` implementations implement framework traits
+that use that macro; database-free generated applications do not add it.
+
+Cryptographic dependencies are intentionally deferred from this slice. The
+`SessionStore` accepts only a fixed-size digest produced by a later reviewed
+credential adapter; it does not hash bearer tokens itself. Argon2/password,
+random-token, cookie/signature and constant-time comparison crates require their
+own admission review before installation.
+
 ## Features and public API containment
 
 - Set `default-features = false` when defaults add unused protocols, native
