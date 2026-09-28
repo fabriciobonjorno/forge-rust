@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+forge-audit = { path = "../forge-audit" }
 forge-auth = { path = "../forge-auth" }
 forge-config = { path = "../forge-config" }
 forge-core = { path = "../forge-core" }
