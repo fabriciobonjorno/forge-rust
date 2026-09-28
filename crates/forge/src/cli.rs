@@ -152,7 +152,14 @@ mod tests {
         let text = usage("demo");
 
         assert!(text.starts_with("Usage: demo [COMMAND]"));
-        for command in ["serve", "healthcheck", "migrate", "rollback", "version", "help"] {
+        for command in [
+            "serve",
+            "healthcheck",
+            "migrate",
+            "rollback",
+            "version",
+            "help",
+        ] {
             assert!(text.contains(command), "{command}");
         }
         for key in forge_config::KNOWN_KEYS {

@@ -4,24 +4,23 @@
 //! algorithm parameters, random credential generation, digesting, and HTTP
 //! cookie serialization/parsing.
 
-use async_trait::async_trait;
 use argon2::{
     Algorithm, Argon2, Params, Version,
     password_hash::{PasswordHasher as _, PasswordVerifier as _},
 };
+use async_trait::async_trait;
 use cookie::{Cookie, SameSite};
 use forge::auth::{
-    AuthenticatedPrincipal, CsrfToken, CsrfTokenDigest, LoginThrottleDecision,
-    LoginThrottleKey, LoginThrottlePolicy, LoginThrottleStore, LoginThrottleStoreError,
-    PasswordCredentialStore, PasswordCredentialStoreError, PasswordHash, PasswordHashError,
-    PasswordHasher, Session, SessionBearerToken, SessionCredentialDigest, SessionError,
-    SessionStore, SessionStoreError, UnixTimestamp,
+    AuthenticatedPrincipal, CsrfToken, CsrfTokenDigest, LoginThrottleDecision, LoginThrottleKey,
+    LoginThrottlePolicy, LoginThrottleStore, LoginThrottleStoreError, PasswordCredentialStore,
+    PasswordCredentialStoreError, PasswordHash, PasswordHashError, PasswordHasher, Session,
+    SessionBearerToken, SessionCredentialDigest, SessionError, SessionStore, SessionStoreError,
+    UnixTimestamp,
 };
-use std::net::SocketAddr;
-
-use forge::security::PrincipalId;
 use forge::http::{Method, Request, header};
+use forge::security::PrincipalId;
 use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
 
 /// Name of the host-only session cookie.
 ///
@@ -101,12 +100,8 @@ fn hash_password_blocking(password: &[u8]) -> Result<PasswordHash, PasswordHashE
     PasswordHash::new(encoded).map_err(|_| PasswordHashError::InvalidHash)
 }
 
-fn verify_password_blocking(
-    password: &[u8],
-    expected: &str,
-) -> Result<bool, PasswordHashError> {
-    let parsed = argon2::PasswordHash::new(expected)
-        .map_err(|_| PasswordHashError::InvalidHash)?;
+fn verify_password_blocking(password: &[u8], expected: &str) -> Result<bool, PasswordHashError> {
+    let parsed = argon2::PasswordHash::new(expected).map_err(|_| PasswordHashError::InvalidHash)?;
 
     // Verification intentionally uses the parameters encoded in the stored PHC
     // string, while restricting the accepted algorithm to Argon2id.
@@ -117,18 +112,15 @@ fn verify_password_blocking(
     Ok(Argon2::default().verify_password(password, &parsed).is_ok())
 }
 
-fn password_hash_needs_rehash(
-    expected: &PasswordHash,
-) -> Result<bool, PasswordHashError> {
+fn password_hash_needs_rehash(expected: &PasswordHash) -> Result<bool, PasswordHashError> {
     let encoded = expected.expose();
-    let parsed = argon2::PasswordHash::new(encoded)
-        .map_err(|_| PasswordHashError::InvalidHash)?;
+    let parsed = argon2::PasswordHash::new(encoded).map_err(|_| PasswordHashError::InvalidHash)?;
     if parsed.algorithm.as_str() != "argon2id" {
         return Err(PasswordHashError::InvalidHash);
     }
 
     let parts: Vec<&str> = encoded.split('$').collect();
-    if parts.len() != 6 || parts[0] != "" || parts[1] != "argon2id" {
+    if parts.len() != 6 || !parts[0].is_empty() || parts[1] != "argon2id" {
         return Err(PasswordHashError::InvalidHash);
     }
     if parts[2] != "v=19" {
@@ -243,10 +235,7 @@ pub async fn authenticate_password(
 
 fn canonical_login(login: &str) -> Option<String> {
     let login = login.trim();
-    if login.is_empty()
-        || login.len() > 320
-        || login.bytes().any(|byte| byte.is_ascii_control())
-    {
+    if login.is_empty() || login.len() > 320 || login.bytes().any(|byte| byte.is_ascii_control()) {
         return None;
     }
     Some(login.to_lowercase())
@@ -318,9 +307,7 @@ async fn reserve_login_attempt(
     }
 }
 
-async fn perform_dummy_password_work(
-    hasher: &dyn PasswordHasher,
-) -> Result<(), LoginError> {
+async fn perform_dummy_password_work(hasher: &dyn PasswordHasher) -> Result<(), LoginError> {
     hasher
         .hash(b"forge-login-enumeration-dummy")
         .await
@@ -335,8 +322,9 @@ fn map_password_hash_error(_error: PasswordHashError) -> LoginError {
 fn map_credential_store_error(error: PasswordCredentialStoreError) -> LoginError {
     match error {
         PasswordCredentialStoreError::Conflict => LoginError::InvalidCredentials,
-        PasswordCredentialStoreError::Unavailable
-        | PasswordCredentialStoreError::CorruptRecord => LoginError::AuthenticationUnavailable,
+        PasswordCredentialStoreError::Unavailable | PasswordCredentialStoreError::CorruptRecord => {
+            LoginError::AuthenticationUnavailable
+        }
     }
 }
 
@@ -399,11 +387,7 @@ pub async fn issue_persisted_session(
     let secrets = issue_session_secrets().map_err(SessionIssueError::Mechanism)?;
 
     store
-        .insert(
-            &session,
-            &secrets.bearer_digest,
-            &secrets.csrf_digest,
-        )
+        .insert(&session, &secrets.bearer_digest, &secrets.csrf_digest)
         .await
         .map_err(SessionIssueError::Store)?;
 
@@ -431,8 +415,7 @@ pub fn issue_session_secrets() -> Result<IssuedSessionSecrets, SecurityMechanism
 
     let bearer = SessionBearerToken::new(bearer)
         .map_err(|_| SecurityMechanismError::InvalidGeneratedToken)?;
-    let csrf =
-        CsrfToken::new(csrf).map_err(|_| SecurityMechanismError::InvalidGeneratedToken)?;
+    let csrf = CsrfToken::new(csrf).map_err(|_| SecurityMechanismError::InvalidGeneratedToken)?;
 
     Ok(IssuedSessionSecrets {
         bearer_digest: SessionCredentialDigest::from_bytes(sha256(bearer.expose())),
@@ -504,11 +487,8 @@ pub fn session_from_cookie_header(
 }
 
 /// Parses a CSRF header into the canonical token type.
-pub fn csrf_from_header(
-    header_value: &str,
-) -> Result<CsrfToken, SecurityMechanismError> {
-    CsrfToken::new(header_value.to_owned())
-        .map_err(|_| SecurityMechanismError::InvalidCsrfToken)
+pub fn csrf_from_header(header_value: &str) -> Result<CsrfToken, SecurityMechanismError> {
+    CsrfToken::new(header_value.to_owned()).map_err(|_| SecurityMechanismError::InvalidCsrfToken)
 }
 
 /// Authenticates a Forge HTTP request from the host-only session cookie.
@@ -522,7 +502,9 @@ pub async fn authenticate_request(
 ) -> Result<AuthenticatedPrincipal, RequestAuthError> {
     let mut bearer = None;
     for value in request.headers().get_all(header::COOKIE).iter() {
-        let value = value.to_str().map_err(|_| RequestAuthError::InvalidSession)?;
+        let value = value
+            .to_str()
+            .map_err(|_| RequestAuthError::InvalidSession)?;
         if let Some(found) =
             session_from_cookie_header(value).map_err(|_| RequestAuthError::InvalidSession)?
         {
@@ -582,10 +564,10 @@ pub async fn enforce_csrf(
 /// Returns whether a method is safe according to HTTP semantics.
 #[must_use]
 pub fn is_safe_method(method: &Method) -> bool {
-    method == &Method::GET
-        || method == &Method::HEAD
-        || method == &Method::OPTIONS
-        || method == &Method::TRACE
+    method == Method::GET
+        || method == Method::HEAD
+        || method == Method::OPTIONS
+        || method == Method::TRACE
 }
 
 fn map_session_store_error(error: SessionStoreError) -> RequestAuthError {
@@ -728,23 +710,17 @@ mod tests {
             login_throttle_key("other@example.com")
         );
 
-        let first: SocketAddr = "192.0.2.10:1234".parse().expect("valid address");
-        let second: SocketAddr = "192.0.2.10:9999".parse().expect("valid address");
-        let other: SocketAddr = "192.0.2.11:1234".parse().expect("valid address");
+        let first: SocketAddr = result_ok("192.0.2.10:1234".parse(), "valid socket address");
+        let second: SocketAddr = result_ok("192.0.2.10:9999".parse(), "valid socket address");
+        let other: SocketAddr = result_ok("192.0.2.11:1234".parse(), "valid socket address");
         assert_eq!(origin_throttle_key(first), origin_throttle_key(second));
         assert_ne!(origin_throttle_key(first), origin_throttle_key(other));
-        assert_ne!(
-            origin_throttle_key(first),
-            login_throttle_key("192.0.2.10")
-        );
+        assert_ne!(origin_throttle_key(first), login_throttle_key("192.0.2.10"));
     }
 
     #[test]
     fn issued_secrets_are_independent_and_canonical() {
-        let issued = result_ok(
-            issue_session_secrets(),
-            "OS randomness should be available",
-        );
+        let issued = result_ok(issue_session_secrets(), "OS randomness should be available");
         assert_eq!(issued.bearer.expose().len(), 64);
         assert_eq!(issued.csrf.expose().len(), 64);
         assert_ne!(issued.bearer.expose(), issued.csrf.expose());
@@ -754,10 +730,7 @@ mod tests {
 
     #[test]
     fn cookie_is_host_only_secure_http_only_and_lax() {
-        let token = result_ok(
-            SessionBearerToken::new("ab".repeat(32)),
-            "valid token",
-        );
+        let token = result_ok(SessionBearerToken::new("ab".repeat(32)), "valid token");
         let rendered = session_set_cookie(&token);
         assert!(rendered.starts_with("__Host-forge_session="));
         assert!(rendered.contains("Path=/"));

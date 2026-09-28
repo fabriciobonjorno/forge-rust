@@ -6,7 +6,7 @@ use forge::tenancy::{
     Membership, MembershipState, MembershipStore, MembershipStoreError, MembershipStoreErrorKind,
     TenantId,
 };
-use sqlx::{PgPool, Row, types::Uuid};
+use sqlx::{PgPool, Row};
 
 /// PostgreSQL-backed tenant-membership store.
 #[derive(Clone, Debug)]
@@ -130,14 +130,14 @@ fn corrupt() -> MembershipStoreError {
 }
 
 fn classify_sqlx_error(error: sqlx::Error) -> MembershipStoreError {
-    if let sqlx::Error::Database(database) = &error {
-        if database.is_unique_violation() {
-            return MembershipStoreError::new(
-                MembershipStoreErrorKind::Conflict,
-                "membership persistence conflict",
-                false,
-            );
-        }
+    if let sqlx::Error::Database(database) = &error
+        && database.is_unique_violation()
+    {
+        return MembershipStoreError::new(
+            MembershipStoreErrorKind::Conflict,
+            "membership persistence conflict",
+            false,
+        );
     }
 
     MembershipStoreError::new(

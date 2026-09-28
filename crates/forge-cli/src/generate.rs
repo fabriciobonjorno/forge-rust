@@ -198,10 +198,7 @@ const RESERVED_MODULES: &[(&str, &str)] = &[
     ),
 ];
 
-pub(crate) fn create_migration(
-    root: &Path,
-    name: &str,
-) -> Result<(PathBuf, PathBuf), CliError> {
+pub(crate) fn create_migration(root: &Path, name: &str) -> Result<(PathBuf, PathBuf), CliError> {
     let normalized = normalize_migration_name(name)?;
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -217,14 +214,8 @@ pub(crate) fn create_migration(
     let up = migrations.join(format!("{stem}.up.sql"));
     let down = migrations.join(format!("{stem}.down.sql"));
 
-    write_new_file(
-        &up,
-        &format!("-- {normalized}: apply migration\n\n"),
-    )?;
-    if let Err(error) = write_new_file(
-        &down,
-        &format!("-- {normalized}: revert migration\n\n"),
-    ) {
+    write_new_file(&up, &format!("-- {normalized}: apply migration\n\n"))?;
+    if let Err(error) = write_new_file(&down, &format!("-- {normalized}: revert migration\n\n")) {
         let _ = fs::remove_file(&up);
         return Err(error);
     }
@@ -433,7 +424,12 @@ fn write_application(
             Group::DatabaseDocker => options.database && options.docker,
         };
         if enabled {
-            let content = render(template.content, &variables, options.docker, options.database);
+            let content = render(
+                template.content,
+                &variables,
+                options.docker,
+                options.database,
+            );
             write_file(&root.join(template.path), &content)?;
         }
     }
@@ -461,12 +457,7 @@ fn write_application(
 /// PostgreSQL is the only database capability currently enabled. MySQL and
 /// SQLite markers are understood only so stale/unsupported template branches
 /// cannot leak into generated applications.
-fn render(
-    template: &str,
-    variables: &[(&str, &str)],
-    docker: bool,
-    database: bool,
-) -> String {
+fn render(template: &str, variables: &[(&str, &str)], docker: bool, database: bool) -> String {
     let condition = |name: &str| match name {
         "docker" => docker,
         "database" | "postgresql" => database,
@@ -489,7 +480,10 @@ fn render(
             }
             _ if marker.starts_with("%%if ") && marker.ends_with("%%") => {
                 let name = &marker[5..marker.len() - 2];
-                Some((name.strip_prefix('!').unwrap_or(name), name.starts_with('!')))
+                Some((
+                    name.strip_prefix('!').unwrap_or(name),
+                    name.starts_with('!'),
+                ))
             }
             "%%end%%" => {
                 if stack.len() > 1 {
@@ -610,17 +604,32 @@ mod tests {
 
         assert!(up.is_file());
         assert!(down.is_file());
-        assert!(up.file_name().unwrap().to_string_lossy().ends_with("_create_users.up.sql"));
+        assert!(
+            up.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("_create_users.up.sql")
+        );
         assert!(
             down.file_name()
                 .unwrap()
                 .to_string_lossy()
                 .ends_with("_create_users.down.sql")
         );
-        assert!(read(root.path(), up.strip_prefix(root.path()).unwrap().to_str().unwrap())
-            .contains("apply migration"));
-        assert!(read(root.path(), down.strip_prefix(root.path()).unwrap().to_str().unwrap())
-            .contains("revert migration"));
+        assert!(
+            read(
+                root.path(),
+                up.strip_prefix(root.path()).unwrap().to_str().unwrap()
+            )
+            .contains("apply migration")
+        );
+        assert!(
+            read(
+                root.path(),
+                down.strip_prefix(root.path()).unwrap().to_str().unwrap()
+            )
+            .contains("revert migration")
+        );
     }
 
     #[test]
@@ -710,8 +719,10 @@ mod tests {
         assert!(root.join("src/infrastructure/security/mod.rs").is_file());
         assert!(root.join("docker/postgres/init.sql").is_file());
 
-        let identity_migration =
-            read(&root, "migrations/00000000000000000002_forge_identity.up.sql");
+        let identity_migration = read(
+            &root,
+            "migrations/00000000000000000002_forge_identity.up.sql",
+        );
         assert!(identity_migration.contains("CREATE TABLE forge_principals"));
         assert!(identity_migration.contains("credential_digest bytea"));
         assert!(identity_migration.contains("csrf_digest bytea"));

@@ -128,11 +128,7 @@ impl LoginThrottleStore for PostgresLoginThrottleStore {
         let block_seconds = i64::try_from(policy.block_seconds())
             .map_err(|_| LoginThrottleStoreError::CorruptRecord)?;
 
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(map_throttle_sqlx_error)?;
+        let mut transaction = self.pool.begin().await.map_err(map_throttle_sqlx_error)?;
         throttle_advisory_lock(&mut transaction, key).await?;
 
         sqlx::query(
@@ -170,7 +166,10 @@ impl LoginThrottleStore for PostgresLoginThrottleStore {
 
         if let Some(blocked_until) = blocked_until {
             if blocked_until > now {
-                transaction.commit().await.map_err(map_throttle_sqlx_error)?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(map_throttle_sqlx_error)?;
                 return Ok(LoginThrottleDecision::Denied {
                     retry_after_seconds: u64::try_from(blocked_until - now)
                         .map_err(|_| LoginThrottleStoreError::CorruptRecord)?
@@ -205,7 +204,10 @@ impl LoginThrottleStore for PostgresLoginThrottleStore {
             .await
             .map_err(map_throttle_sqlx_error)?;
 
-            transaction.commit().await.map_err(map_throttle_sqlx_error)?;
+            transaction
+                .commit()
+                .await
+                .map_err(map_throttle_sqlx_error)?;
             return Ok(LoginThrottleDecision::Allowed);
         }
 
@@ -225,18 +227,17 @@ impl LoginThrottleStore for PostgresLoginThrottleStore {
         .await
         .map_err(map_throttle_sqlx_error)?;
 
-        transaction.commit().await.map_err(map_throttle_sqlx_error)?;
+        transaction
+            .commit()
+            .await
+            .map_err(map_throttle_sqlx_error)?;
         Ok(LoginThrottleDecision::Denied {
             retry_after_seconds: policy.block_seconds(),
         })
     }
 
     async fn clear(&self, key: &LoginThrottleKey) -> Result<(), LoginThrottleStoreError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(map_throttle_sqlx_error)?;
+        let mut transaction = self.pool.begin().await.map_err(map_throttle_sqlx_error)?;
         throttle_advisory_lock(&mut transaction, key).await?;
 
         sqlx::query(
@@ -269,9 +270,7 @@ async fn throttle_advisory_lock(
     Ok(())
 }
 
-fn throttle_timestamp_to_i64(
-    timestamp: UnixTimestamp,
-) -> Result<i64, LoginThrottleStoreError> {
+fn throttle_timestamp_to_i64(timestamp: UnixTimestamp) -> Result<i64, LoginThrottleStoreError> {
     i64::try_from(timestamp.as_secs()).map_err(|_| LoginThrottleStoreError::CorruptRecord)
 }
 
@@ -303,10 +302,7 @@ impl SessionStore for PostgresSessionStore {
     ) -> Result<(), SessionStoreError> {
         let issued_at = timestamp_to_i64(session.issued_at())?;
         let expires_at = timestamp_to_i64(session.expires_at())?;
-        let revoked_at = session
-            .revoked_at()
-            .map(timestamp_to_i64)
-            .transpose()?;
+        let revoked_at = session.revoked_at().map(timestamp_to_i64).transpose()?;
 
         sqlx::query(
             "INSERT INTO forge_sessions (
@@ -423,10 +419,7 @@ impl SessionStore for PostgresSessionStore {
         let revoked_at = timestamp_to_i64(revoked_at)?;
         let issued_at = timestamp_to_i64(replacement.issued_at())?;
         let expires_at = timestamp_to_i64(replacement.expires_at())?;
-        let replacement_revoked_at = replacement
-            .revoked_at()
-            .map(timestamp_to_i64)
-            .transpose()?;
+        let replacement_revoked_at = replacement.revoked_at().map(timestamp_to_i64).transpose()?;
 
         let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
 
@@ -482,13 +475,7 @@ impl SessionStore for PostgresSessionStore {
 }
 
 fn restore_session(
-    (id, principal_id, issued_at, expires_at, revoked_at): (
-        Uuid,
-        Uuid,
-        i64,
-        i64,
-        Option<i64>,
-    ),
+    (id, principal_id, issued_at, expires_at, revoked_at): (Uuid, Uuid, i64, i64, Option<i64>),
 ) -> Result<Session, SessionStoreError> {
     let id = SessionId::from_uuid(id).map_err(|_| SessionStoreError::CorruptRecord)?;
     let principal_id =

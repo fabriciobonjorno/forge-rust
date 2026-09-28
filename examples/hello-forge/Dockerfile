@@ -20,7 +20,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
     cargo build --release --locked --bin hello-forge \
     && install -D -m 0755 target/release/hello-forge /out/hello-forge
-
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 COPY --from=build /out/hello-forge /usr/local/bin/hello-forge
 ENV FORGE_ENV=production \

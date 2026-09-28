@@ -284,10 +284,7 @@ impl Session {
     /// Authenticates this session at a trusted current time.
     ///
     /// Expiry is exclusive: authentication exactly at expires_at is denied.
-    pub fn authenticate(
-        &self,
-        now: UnixTimestamp,
-    ) -> Result<AuthenticatedPrincipal, SessionError> {
+    pub fn authenticate(&self, now: UnixTimestamp) -> Result<AuthenticatedPrincipal, SessionError> {
         if self.revoked_at.is_some() {
             return Err(SessionError::Revoked);
         }
@@ -546,11 +543,7 @@ pub struct LoginThrottlePolicy {
 impl LoginThrottlePolicy {
     /// Creates a positive bounded-attempt policy.
     #[must_use]
-    pub const fn new(
-        max_attempts: u32,
-        window_seconds: u64,
-        block_seconds: u64,
-    ) -> Option<Self> {
+    pub const fn new(max_attempts: u32, window_seconds: u64, block_seconds: u64) -> Option<Self> {
         if max_attempts == 0
             || window_seconds == 0
             || block_seconds == 0
@@ -807,7 +800,9 @@ mod tests {
         let mut session = Session::new(principal, time(10), time(40)).expect("valid session");
 
         session.revoke(time(20)).expect("revocation should succeed");
-        session.revoke(time(30)).expect("repeated revocation should succeed");
+        session
+            .revoke(time(30))
+            .expect("repeated revocation should succeed");
 
         assert_eq!(session.revoked_at(), Some(time(20)));
     }
