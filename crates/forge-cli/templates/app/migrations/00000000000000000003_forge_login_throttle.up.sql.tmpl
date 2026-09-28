@@ -4,7 +4,7 @@ CREATE TABLE forge_login_throttles (
     throttle_key bytea PRIMARY KEY
         CHECK (octet_length(throttle_key) = 32),
     window_started_at timestamptz NOT NULL,
-    attempts integer NOT NULL DEFAULT 0
+    attempts bigint NOT NULL DEFAULT 0
         CHECK (attempts >= 0),
     blocked_until timestamptz,
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
