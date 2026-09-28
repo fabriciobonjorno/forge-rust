@@ -156,6 +156,24 @@ impl AuditEvent {
         }
     }
 
+    /// Creates an event whose actor and tenant are derived from an authorized
+    /// TenantContext instead of caller-provided identifiers.
+    #[must_use]
+    pub fn from_tenant_context(
+        occurred_at: UnixTimestamp,
+        context: &forge_tenancy::TenantContext,
+        action: AuditAction,
+        outcome: AuditOutcome,
+    ) -> Self {
+        Self::new(
+            occurred_at,
+            AuditActor::Principal(context.principal_id()),
+            Some(context.tenant_id()),
+            action,
+            outcome,
+        )
+    }
+
     /// Adds a validated request/correlation linkage before persistence.
     #[must_use]
     pub fn with_request_link(mut self, link: AuditLink) -> Self {
@@ -347,6 +365,46 @@ mod tests {
             event.request_link().expect("request link").as_str(),
             "request-123"
         );
+    }
+
+    #[test]
+    fn tenant_context_controls_event_attribution() {
+        use forge_auth::Session;
+        use forge_security::{Permission, RbacPolicy, Role};
+        use forge_tenancy::{Membership, TenantContext};
+
+        let principal = PrincipalId::new();
+        let tenant = TenantId::new();
+        let permission = Permission::new("invoice:approve").expect("valid permission");
+        let role = Role::new("approver").expect("valid role");
+        let membership = Membership::active(tenant, principal, vec![role.clone()]);
+        let mut policy = RbacPolicy::new();
+        policy.allow(role, permission.clone());
+        let authenticated = Session::new(
+            principal,
+            UnixTimestamp::from_secs(10),
+            UnixTimestamp::from_secs(20),
+        )
+        .expect("valid session")
+        .authenticate(UnixTimestamp::from_secs(11))
+        .expect("valid authentication");
+        let context = TenantContext::authorize(
+            authenticated,
+            &membership,
+            &policy,
+            &permission,
+        )
+        .expect("authorized tenant context");
+
+        let event = AuditEvent::from_tenant_context(
+            UnixTimestamp::from_secs(12),
+            &context,
+            AuditAction::new("invoice:approve").expect("valid action"),
+            AuditOutcome::Succeeded,
+        );
+
+        assert_eq!(event.actor(), AuditActor::Principal(principal));
+        assert_eq!(event.tenant_id(), Some(tenant));
     }
 
     #[test]
