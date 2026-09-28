@@ -168,6 +168,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 name = "forge"
 version = "0.1.0"
 dependencies = [
+ "forge-audit",
  "forge-auth",
  "forge-config",
  "forge-core",
@@ -182,9 +183,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-audit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "forge-auth",
+ "forge-core",
+ "forge-security",
+ "forge-tenancy",
+ "thiserror",
+]
+
+[[package]]
 name = "forge-auth"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "forge-core",
  "forge-security",
  "thiserror",
