@@ -83,7 +83,23 @@ const TEMPLATES: &[Template] = &[
     ),
     template!(
         Group::Database,
+        "migrations/00000000000000000002_forge_identity.up.sql" => "migrations/00000000000000000002_forge_identity.up.sql.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "migrations/00000000000000000002_forge_identity.down.sql" => "migrations/00000000000000000002_forge_identity.down.sql.tmpl"
+    ),
+    template!(
+        Group::Database,
         "src/infrastructure/audit/mod.rs" => "src/infrastructure/audit/mod.rs.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "src/infrastructure/auth/mod.rs" => "src/infrastructure/auth/mod.rs.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "src/infrastructure/tenancy/mod.rs" => "src/infrastructure/tenancy/mod.rs.tmpl"
     ),
     template!(
         Group::Database,
@@ -651,7 +667,17 @@ mod tests {
             root.join("migrations/00000000000000000001_forge_audit.down.sql")
                 .is_file()
         );
+        assert!(
+            root.join("migrations/00000000000000000002_forge_identity.up.sql")
+                .is_file()
+        );
+        assert!(
+            root.join("migrations/00000000000000000002_forge_identity.down.sql")
+                .is_file()
+        );
         assert!(root.join("src/infrastructure/audit/mod.rs").is_file());
+        assert!(root.join("src/infrastructure/auth/mod.rs").is_file());
+        assert!(root.join("src/infrastructure/tenancy/mod.rs").is_file());
         assert!(root.join("docker/postgres/init.sql").is_file());
 
         let database_module = read(&root, "src/infrastructure/database/mod.rs");
@@ -718,6 +744,8 @@ mod tests {
         assert!(!read(&root, "Cargo.toml").contains("sqlx"));
         assert!(!root.join("migrations").exists());
         assert!(!root.join("src/infrastructure/audit").exists());
+        assert!(!root.join("src/infrastructure/auth").exists());
+        assert!(!root.join("src/infrastructure/tenancy").exists());
         assert!(!root.join("docker/postgres/init.sql").exists());
     }
 
