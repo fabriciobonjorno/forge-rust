@@ -98,8 +98,8 @@ Kubernetes and systemd deployment is covered in
 - PostgreSQL-first generation with SQLx confined to the generated
   infrastructure/bootstrap boundary, reversible embedded migrations, separate
   least-privilege runtime/migration roles, transaction-local tenant/principal
-  RLS context, a health-ordered Compose database, and
-  `forge generate migration <name>`.
+  RLS context, append-only PostgreSQL audit storage, a health-ordered Compose
+  database, and `forge generate migration <name>`.
 - Typed `FORGE_*` environment configuration. Database URLs are redacted from
   normal debug/serialization output, and unknown `FORGE_*` keys are
   rejected at startup.
@@ -116,6 +116,7 @@ Kubernetes and systemd deployment is covered in
 ```text
 crates/
 ├── forge          # facade: forge::App and framework-owned re-exports
+├── forge-audit    # immutable security audit events and append-only sink contract
 ├── forge-auth     # server-side session lifecycle and authenticated identity
 ├── forge-core     # lifecycle, errors, UUIDv7 identifiers
 ├── forge-config   # typed FORGE_* configuration and secret redaction

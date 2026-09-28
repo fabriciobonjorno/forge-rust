@@ -82,7 +82,9 @@ Test password/session lifecycle, cookie flags, revocation, RBAC deny-by-default,
 role changes, brute-force/rate limits, CSRF/CORS, SSRF redirect and address cases,
 path traversal/symlinks, upload limits, security headers, key rotation, webhook
 signatures, replay windows, idempotency digest mismatch, audit completeness, and
-all fail-closed rules in the [threat model](threat-model.md).
+all fail-closed rules in the [threat model](threat-model.md). Database-enabled
+generated-app tests additionally prove the runtime audit writer can append one
+event but cannot SELECT, UPDATE, or DELETE audit history.
 
 ### Jobs and events
 

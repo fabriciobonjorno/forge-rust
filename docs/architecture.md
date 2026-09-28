@@ -5,8 +5,10 @@ Phase 2 behavior is implemented through PostgreSQL generation, reversible
 migrations, transaction/repository contracts and optimistic locking, but the
 GitHub Actions runner gate remains blocked before job steps execute. Phase 3 is
 in progress: server-side session lifecycle, deny-by-default RBAC, explicit
-membership and authorized TenantContext contracts are implemented; PostgreSQL
-RLS, concrete authentication adapters and audit persistence remain open.
+membership and authorized TenantContext contracts are implemented; generated
+PostgreSQL RLS/least-privilege roles and append-only audit persistence are now
+implemented. Concrete password/cookie authentication adapters and stronger audit
+integrity/retention controls remain open.
 
 Forge is an opinionated Rust application framework for long-lived services. Its
 value is the integration of explicit application architecture, secure defaults,
@@ -234,6 +236,22 @@ schema ownership or `BYPASSRLS`. Administrative cross-tenant access is a
 separate future capability/role and is never implicit. See
 [ADR 0004](adr/0004-tenancy-and-rls.md) and
 [ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md).
+
+### Security audit evidence
+
+Security audit events are structured immutable records, separate from ordinary
+application logs. They carry a UUIDv7 event identity, trusted timestamp, actor,
+optional tenant, validated action, explicit outcome and optional request linkage.
+When tenant context exists, attribution is derived directly from the authorized
+`TenantContext`.
+
+Database-enabled generated applications include a PostgreSQL `AuditSink` and
+the `forge_audit_events` migration. The generated runtime role can append but
+cannot read, update or delete audit rows; a trigger also rejects mutation to
+preserve append-only semantics. Cryptographic integrity chaining, immutable
+external sinks, retention enforcement and privileged reader workflows remain
+separate controls. See
+[ADR 0012](adr/0012-structured-append-only-audit-evidence.md).
 
 ### Jobs and events
 

@@ -75,6 +75,18 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Database, "migrations/.gitkeep" => "migrations/gitkeep.tmpl"),
     template!(
         Group::Database,
+        "migrations/00000000000000000001_forge_audit.up.sql" => "migrations/00000000000000000001_forge_audit.up.sql.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "migrations/00000000000000000001_forge_audit.down.sql" => "migrations/00000000000000000001_forge_audit.down.sql.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "src/infrastructure/audit/mod.rs" => "src/infrastructure/audit/mod.rs.tmpl"
+    ),
+    template!(
+        Group::Database,
         "src/infrastructure/database/mod.rs" => "src/infrastructure/database/mod.rs.tmpl"
     ),
     template!(
@@ -631,6 +643,15 @@ mod tests {
         assert!(manifest.contains("sqlx"));
         assert!(root.join("build.rs").is_file());
         assert!(root.join("migrations/.gitkeep").is_file());
+        assert!(
+            root.join("migrations/00000000000000000001_forge_audit.up.sql")
+                .is_file()
+        );
+        assert!(
+            root.join("migrations/00000000000000000001_forge_audit.down.sql")
+                .is_file()
+        );
+        assert!(root.join("src/infrastructure/audit/mod.rs").is_file());
         assert!(root.join("docker/postgres/init.sql").is_file());
 
         let database_module = read(&root, "src/infrastructure/database/mod.rs");
@@ -696,6 +717,7 @@ mod tests {
         assert!(!read(&root, "README.md").contains("docker"));
         assert!(!read(&root, "Cargo.toml").contains("sqlx"));
         assert!(!root.join("migrations").exists());
+        assert!(!root.join("src/infrastructure/audit").exists());
         assert!(!root.join("docker/postgres/init.sql").exists());
     }
 

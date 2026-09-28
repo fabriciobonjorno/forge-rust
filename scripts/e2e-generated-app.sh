@@ -110,6 +110,38 @@ SQL
 
   FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" migrate
   [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" == "forge_e2e_probe" ]]     || fail "migrate did not create the probe table"
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_audit_events')")" == "forge_audit_events" ]] \
+    || fail "framework audit migration did not create the audit table"
+
+  audit_id="01941f29-7c00-7000-8000-000000000010"
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app -v ON_ERROR_STOP=1 -c "
+    INSERT INTO forge_audit_events (
+      id, occurred_at_unix, actor_kind, action, outcome, request_link
+    ) VALUES (
+      '$audit_id', 42, 'system', 'e2e.audit', 'succeeded', 'e2e-request'
+    );
+  " >/dev/null
+
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc \
+      "SELECT count(*) FROM forge_audit_events WHERE id = '$audit_id'")" == 1 ]] \
+    || fail "runtime audit append was not persisted"
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c 'SELECT * FROM forge_audit_events;' >/dev/null 2>&1; then
+    fail "runtime audit writer must not be able to read audit events"
+  fi
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "UPDATE forge_audit_events SET outcome = 'failed' WHERE id = '$audit_id';" \
+      >/dev/null 2>&1; then
+    fail "runtime audit writer must not be able to update audit events"
+  fi
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "DELETE FROM forge_audit_events WHERE id = '$audit_id';" \
+      >/dev/null 2>&1; then
+    fail "runtime audit writer must not be able to delete audit events"
+  fi
 
   if docker compose exec -T db psql -U app_runtime -d forge_e2e_app \
       -v ON_ERROR_STOP=1 \

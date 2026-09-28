@@ -38,7 +38,12 @@ export FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'
 cargo run
 ```
 
-Create a reversible migration with:
+Database-enabled applications also include the framework
+`forge_audit_events` migration and
+`infrastructure::audit::PgAuditSink`. The runtime role can append structured
+security-audit events but cannot read, update, or delete the audit history.
+
+Create a reversible application migration with:
 
 ```bash
 forge generate migration create_customers
