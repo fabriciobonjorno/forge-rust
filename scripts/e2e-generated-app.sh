@@ -153,6 +153,97 @@ SQL
   tenant_one="01941f29-7c00-7000-8000-000000000001"
   tenant_two="01941f29-7c00-7000-8000-000000000002"
   principal="01941f29-7c00-7000-8000-000000000003"
+  session_id="01941f29-7c00-7000-8000-000000000020"
+
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc \
+      "SELECT to_regclass('public.forge_principals')")" == "forge_principals" ]] \
+    || fail "framework identity migration did not create principals"
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc \
+      "SELECT to_regclass('public.forge_sessions')")" == "forge_sessions" ]] \
+    || fail "framework identity migration did not create sessions"
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc \
+      "SELECT to_regclass('public.forge_tenant_memberships')")" == "forge_tenant_memberships" ]] \
+    || fail "framework identity migration did not create memberships"
+
+  docker compose exec -T db psql -q -U postgres -d forge_e2e_app -v ON_ERROR_STOP=1 -c "
+    INSERT INTO forge_principals (id, login, password_hash)
+    VALUES (
+      '$principal',
+      'e2e@example.invalid',
+      '\$argon2id\$v=19\$m=19456,t=2,p=1\$Zm9yZ2VzYWx0Zm9yZ2VzYWx0\$Zm9yZ2VoYXNoZm9yZ2VoYXNoZm9yZ2VoYXNoZm9yZ2U'
+    );
+  " >/dev/null
+
+  [[ "$(docker compose exec -T db psql -U app_runtime -d forge_e2e_app -Atc \
+      "SELECT count(*) FROM forge_principals WHERE id = '$principal'")" == 1 ]] \
+    || fail "runtime credential lookup cannot read principal"
+
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app -v ON_ERROR_STOP=1 -c "
+    INSERT INTO forge_sessions (
+      id, principal_id, credential_digest, csrf_digest, issued_at, expires_at
+    ) VALUES (
+      '$session_id',
+      '$principal',
+      decode(repeat('ab', 32), 'hex'),
+      decode(repeat('cd', 32), 'hex'),
+      now() - interval '1 minute',
+      now() + interval '1 hour'
+    );
+  " >/dev/null
+
+  [[ "$(docker compose exec -T db psql -U app_runtime -d forge_e2e_app -Atc "
+      SELECT count(*) FROM forge_sessions
+      WHERE credential_digest = decode(repeat('ab', 32), 'hex')
+        AND csrf_digest = decode(repeat('cd', 32), 'hex');
+    ")" == 1 ]] \
+    || fail "session bearer/CSRF digests were not persisted"
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+        UPDATE forge_sessions
+        SET issued_at = issued_at + interval '1 second'
+        WHERE id = '$session_id';
+      " >/dev/null 2>&1; then
+    fail "persisted session lifetime must be immutable"
+  fi
+
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app -v ON_ERROR_STOP=1 -c "
+    UPDATE forge_sessions
+    SET revoked_at = now()
+    WHERE id = '$session_id';
+  " >/dev/null
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+        UPDATE forge_sessions
+        SET revoked_at = revoked_at + interval '1 second'
+        WHERE id = '$session_id';
+      " >/dev/null 2>&1; then
+    fail "session revocation must be monotonic"
+  fi
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "DELETE FROM forge_sessions WHERE id = '$session_id';" \
+      >/dev/null 2>&1; then
+    fail "runtime role must not delete session history"
+  fi
+
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app -v ON_ERROR_STOP=1 -c "
+    INSERT INTO forge_tenant_memberships (
+      tenant_id, principal_id, roles, state
+    ) VALUES (
+      '$tenant_one', '$principal', ARRAY['member'], 'active'
+    );
+    UPDATE forge_tenant_memberships
+    SET roles = ARRAY['member', 'approver'], state = 'suspended'
+    WHERE tenant_id = '$tenant_one' AND principal_id = '$principal';
+  " >/dev/null
+
+  [[ "$(docker compose exec -T db psql -U app_runtime -d forge_e2e_app -Atc "
+      SELECT state FROM forge_tenant_memberships
+      WHERE tenant_id = '$tenant_one' AND principal_id = '$principal';
+    ")" == "suspended" ]] \
+    || fail "membership suspension did not persist"
 
   docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
       -v ON_ERROR_STOP=1 -c "
