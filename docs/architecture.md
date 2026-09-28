@@ -206,6 +206,20 @@ by installing tenant/principal values as transaction-local settings for RLS.
 See [ADR 0010](adr/0010-session-and-tenant-authorization-context.md) and
 [ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md).
 
+Server-side sessions persist only a 256-bit digest of the bearer credential.
+`SessionStore` owns insert, lookup, revocation and atomic rotation; restoring a
+record revalidates session lifetime invariants before authentication. Generated
+PostgreSQL applications include a concrete SQLx session store plus framework
+tables for principals, sessions and tenant memberships.
+
+Audit events are structured Forge-owned values containing actor/tenant
+attribution, action, outcome, optional resource target and request/correlation
+identity. Generated applications include a PostgreSQL `AuditSink` and forced-RLS
+audit table whose ordinary runtime path is insert-only. Arbitrary request bodies
+and metadata maps are not part of the stable audit contract. Cryptographic
+integrity chaining remains open. See
+[ADR 0012](adr/0012-persistent-sessions-and-append-only-audit.md).
+
 ### Database and transactions
 
 PostgreSQL is the first database. SQL remains visible, with compile-time checked
