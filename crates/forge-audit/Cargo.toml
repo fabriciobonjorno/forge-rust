@@ -1,0 +1,19 @@
+[package]
+name = "forge-audit"
+description = "Immutable security audit event and append-only sink contracts for Forge applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+forge-auth = { path = "../forge-auth" }
+forge-core = { path = "../forge-core" }
+forge-security = { path = "../forge-security" }
+forge-tenancy = { path = "../forge-tenancy" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
