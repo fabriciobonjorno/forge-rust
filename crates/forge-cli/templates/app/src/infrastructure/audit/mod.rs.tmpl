@@ -1,0 +1,89 @@
+//! PostgreSQL append-only audit sink.
+
+use async_trait::async_trait;
+use forge::audit::{AuditError, AuditEvent, AuditOutcome, AuditSink};
+use sqlx::PgPool;
+
+/// SQLx-backed append-only audit sink.
+#[derive(Clone)]
+pub struct PostgresAuditSink {
+    pool: PgPool,
+}
+
+impl PostgresAuditSink {
+    /// Creates an audit sink using the least-privilege runtime pool.
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl AuditSink for PostgresAuditSink {
+    async fn append(&self, event: &AuditEvent) -> Result<(), AuditError> {
+        let occurred_at =
+            i64::try_from(event.occurred_at().as_secs()).map_err(|_| AuditError::Rejected)?;
+        let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
+
+        if let Some(principal_id) = event.principal_id() {
+            sqlx::query("SELECT set_config('forge.principal_id', $1, true)")
+                .bind(principal_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+        if let Some(tenant_id) = event.tenant_id() {
+            sqlx::query("SELECT set_config('forge.tenant_id', $1, true)")
+                .bind(tenant_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+
+        let outcome = match event.outcome() {
+            AuditOutcome::Denied => "denied",
+            AuditOutcome::Succeeded => "succeeded",
+            AuditOutcome::Failed => "failed",
+        };
+        let target_kind = event.target().map(|target| target.kind().as_str());
+        let target_id = event.target().and_then(|target| target.id());
+        let request_id = event.request_id().map(|request_id| request_id.as_str());
+
+        sqlx::query(
+            "INSERT INTO forge_audit_log (
+                event_id, occurred_at, principal_id, tenant_id,
+                action, outcome, target_kind, target_id, request_id
+             )
+             VALUES (
+                $1, to_timestamp($2::double precision), $3, $4,
+                $5, $6, $7, $8, $9
+             )",
+        )
+        .bind(event.id().into_uuid())
+        .bind(occurred_at)
+        .bind(event.principal_id().map(|id| id.into_uuid()))
+        .bind(event.tenant_id().map(|id| id.into_uuid()))
+        .bind(event.action().as_str())
+        .bind(outcome)
+        .bind(target_kind)
+        .bind(target_id)
+        .bind(request_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        transaction.commit().await.map_err(map_sqlx_error)
+    }
+}
+
+fn map_sqlx_error(error: sqlx::Error) -> AuditError {
+    if error.as_database_error().is_some_and(|database| {
+        database.code().as_deref().is_some_and(|code| {
+            code.starts_with("23") || code == "42501"
+        })
+    }) {
+        AuditError::Rejected
+    } else {
+        AuditError::Unavailable
+    }
+}
