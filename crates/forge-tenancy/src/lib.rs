@@ -4,6 +4,7 @@
 //! by combining a currently authenticated principal, an active membership for
 //! the same principal, and an explicit successful RBAC decision.
 
+use async_trait::async_trait;
 use forge_auth::AuthenticatedPrincipal;
 use forge_core::Id;
 use forge_security::{
@@ -45,6 +46,22 @@ impl Membership {
             principal_id,
             roles,
             state: MembershipState::Active,
+        }
+    }
+
+    /// Restores a persisted membership with its current lifecycle state.
+    #[must_use]
+    pub fn restore(
+        tenant_id: TenantId,
+        principal_id: PrincipalId,
+        roles: Vec<Role>,
+        state: MembershipState,
+    ) -> Self {
+        Self {
+            tenant_id,
+            principal_id,
+            roles,
+            state,
         }
     }
 
@@ -152,6 +169,78 @@ pub enum TenantContextError {
     Authorization(#[source] AuthorizationError),
 }
 
+/// Safe persistence error categories for tenant memberships.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipStoreErrorKind {
+    /// Membership storage is unavailable.
+    Unavailable,
+    /// A concurrent membership transition prevented the requested write.
+    Conflict,
+    /// Persisted membership data violated Forge invariants.
+    Corrupt,
+}
+
+/// Membership persistence failure with a bounded safe message.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct MembershipStoreError {
+    kind: MembershipStoreErrorKind,
+    message: &'static str,
+    retryable: bool,
+}
+
+impl MembershipStoreError {
+    /// Creates a classified membership storage error.
+    #[must_use]
+    pub const fn new(
+        kind: MembershipStoreErrorKind,
+        message: &'static str,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            kind,
+            message,
+            retryable,
+        }
+    }
+
+    /// Stable storage error category.
+    #[must_use]
+    pub const fn kind(&self) -> MembershipStoreErrorKind {
+        self.kind
+    }
+
+    /// Whether a bounded retry may be reasonable.
+    #[must_use]
+    pub const fn retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+/// Persistence contract for tenant membership and current tenant-scoped roles.
+///
+/// Memberships are resolved independently from sessions so role changes and
+/// suspension take effect on the next authorization decision.
+#[async_trait]
+pub trait MembershipStore: Send + Sync {
+    /// Loads one principal's membership for one tenant.
+    async fn find(
+        &self,
+        tenant_id: TenantId,
+        principal_id: PrincipalId,
+    ) -> Result<Option<Membership>, MembershipStoreError>;
+
+    /// Inserts or replaces the current roles/state for a membership.
+    async fn upsert(&self, membership: &Membership) -> Result<(), MembershipStoreError>;
+
+    /// Idempotently suspends a membership.
+    async fn suspend(
+        &self,
+        tenant_id: TenantId,
+        principal_id: PrincipalId,
+    ) -> Result<(), MembershipStoreError>;
+}
+
 #[cfg(test)]
 mod tests {
     use forge_auth::{Session, UnixTimestamp};
@@ -215,6 +304,25 @@ mod tests {
             ),
             Err(TenantContextError::PrincipalMismatch)
         );
+    }
+
+    #[test]
+    fn restored_membership_preserves_current_state() {
+        let tenant = TenantId::new();
+        let principal = PrincipalId::new();
+        let role = Role::new("member").expect("valid role");
+
+        let membership = Membership::restore(
+            tenant,
+            principal,
+            vec![role.clone()],
+            MembershipState::Suspended,
+        );
+
+        assert_eq!(membership.tenant_id(), tenant);
+        assert_eq!(membership.principal_id(), principal);
+        assert_eq!(membership.roles(), &[role]);
+        assert_eq!(membership.state(), MembershipState::Suspended);
     }
 
     #[test]
