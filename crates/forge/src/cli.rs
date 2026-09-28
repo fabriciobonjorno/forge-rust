@@ -80,6 +80,7 @@ Environment:
   FORGE_SHUTDOWN_GRACE_SECS   connection drain period on shutdown in seconds (default: 15)
   FORGE_MAX_BODY_BYTES        maximum request body size in bytes (default: 1048576)
   FORGE_MAX_CONNECTIONS       maximum concurrent connections (default: 10000)
+  FORGE_TRUSTED_PROXIES       comma-separated CIDRs allowed to assert X-Forwarded-For
   FORGE_LOG                   log filter directives (default: info)
   FORGE_LOG_FORMAT            json | text (default: json in production, text otherwise)
   FORGE_DATABASE_URL           least-privilege PostgreSQL runtime connection URL

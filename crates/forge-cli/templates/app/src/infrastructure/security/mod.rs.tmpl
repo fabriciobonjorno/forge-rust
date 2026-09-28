@@ -20,7 +20,7 @@ use forge::auth::{
 use forge::http::{Method, Request, header};
 use forge::security::PrincipalId;
 use sha2::{Digest, Sha256};
-use std::net::SocketAddr;
+use std::net::IpAddr;
 
 /// Name of the host-only session cookie.
 ///
@@ -167,10 +167,10 @@ pub async fn authenticate_password(
     throttle: &dyn LoginThrottleStore,
     login: &str,
     password: &[u8],
-    remote_addr: SocketAddr,
+    client_addr: IpAddr,
     now: UnixTimestamp,
 ) -> Result<PrincipalId, LoginError> {
-    let origin_key = origin_throttle_key(remote_addr);
+    let origin_key = origin_throttle_key(client_addr);
     reserve_login_attempt(throttle, &origin_key, now, origin_policy()?).await?;
 
     let login_key = login_throttle_key(login);
@@ -251,10 +251,17 @@ pub fn login_throttle_key(login: &str) -> LoginThrottleKey {
     throttle_key(b"login", canonical.as_bytes())
 }
 
-/// Stable opaque key for the peer IP address, excluding the ephemeral port.
+/// Stable opaque key for the request's resolved client IP address.
 #[must_use]
-pub fn origin_throttle_key(remote_addr: SocketAddr) -> LoginThrottleKey {
-    let address = remote_addr.ip().to_string();
+pub fn origin_throttle_key(client_addr: IpAddr) -> LoginThrottleKey {
+    let address = match client_addr {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        IpAddr::V4(address) => IpAddr::V4(address),
+    }
+    .to_string();
     throttle_key(b"origin", address.as_bytes())
 }
 
@@ -710,10 +717,10 @@ mod tests {
             login_throttle_key("other@example.com")
         );
 
-        let first: SocketAddr = result_ok("192.0.2.10:1234".parse(), "valid socket address");
-        let second: SocketAddr = result_ok("192.0.2.10:9999".parse(), "valid socket address");
-        let other: SocketAddr = result_ok("192.0.2.11:1234".parse(), "valid socket address");
-        assert_eq!(origin_throttle_key(first), origin_throttle_key(second));
+        let first: IpAddr = result_ok("192.0.2.10".parse(), "valid client IP");
+        let mapped: IpAddr = result_ok("::ffff:192.0.2.10".parse(), "valid mapped IP");
+        let other: IpAddr = result_ok("192.0.2.11".parse(), "valid client IP");
+        assert_eq!(origin_throttle_key(first), origin_throttle_key(mapped));
         assert_ne!(origin_throttle_key(first), origin_throttle_key(other));
         assert_ne!(origin_throttle_key(first), login_throttle_key("192.0.2.10"));
     }

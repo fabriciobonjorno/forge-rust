@@ -38,6 +38,8 @@ fn new_generates_a_dockerized_application() {
     let compose = std::fs::read_to_string(root.join("compose.yaml")).expect("compose");
     assert!(compose.contains("postgres:18.6-trixie@sha256:"));
     assert!(compose.contains("command: [\"migrate\"]"));
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("readme");
+    assert!(readme.contains("FORGE_TRUSTED_PROXIES"));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Created Forge application `shop`"));

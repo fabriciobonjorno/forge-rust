@@ -120,6 +120,19 @@ the cookie carries a 256-bit opaque server-side bearer value, not trusted claims
 Only its parser/builder and `Secure`, `HttpOnly`, `SameSite`, `Path`
 attributes are required.
 
+## Phase 3 trusted-proxy dependency decision
+
+`forge-config` directly depends on `ipnet 2.12.2` for validated IPv4/IPv6 CIDR
+parsing and membership checks used by the explicit trusted-proxy policy. Its
+public policy wrapper does not expose `IpNet`. The crate is pure Rust, declares
+no build script or native dependencies, and uses only the already-present
+`serde` crate when the `serde` feature is enabled. The selected release is
+MIT/Apache-2.0 and upstream documents stable-toolchain support. Default features
+enable only `std`; optional schema/heapless features remain disabled. The Rust
+source contains no `unsafe` blocks. Upstream release history and repository
+activity were checked during admission; this does not replace the repository's
+automated `cargo deny`/RustSec gates.
+
 
 ## Features and public API containment
 

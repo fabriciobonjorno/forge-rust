@@ -3,8 +3,15 @@
 //! Environment access is isolated at the process boundary. Application code
 //! receives a validated [`AppConfig`] and never needs to parse ad-hoc strings.
 
-use std::{collections::HashMap, ffi::OsString, net::SocketAddr, str::FromStr, time::Duration};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+    time::Duration,
+};
 
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -31,6 +38,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_MAX_CONNECTIONS",
     "FORGE_LOG",
     "FORGE_LOG_FORMAT",
+    "FORGE_TRUSTED_PROXIES",
     "FORGE_DATABASE_URL",
     "FORGE_MIGRATION_DATABASE_URL",
 ];
@@ -46,6 +54,61 @@ pub enum Environment {
     Test,
     /// Internet-facing production process.
     Production,
+}
+
+/// CIDR ranges allowed to supply the `X-Forwarded-For` client chain.
+///
+/// An empty policy trusts no proxy and preserves the TCP peer address. The
+/// contained network types are private so Forge can replace its parser without
+/// exposing a third-party dependency in application contracts.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TrustedProxyPolicy(Vec<IpNet>);
+
+/// Invalid trusted-proxy network configuration.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("invalid trusted proxy network list")]
+pub struct TrustedProxyPolicyParseError;
+
+impl TrustedProxyPolicy {
+    /// Returns whether the address belongs to a configured trusted network.
+    #[must_use]
+    pub fn contains(&self, address: IpAddr) -> bool {
+        let address = normalize_ip(address);
+        self.0.iter().any(|network| network.contains(&address))
+    }
+}
+
+impl FromStr for TrustedProxyPolicy {
+    type Err = TrustedProxyPolicyParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.trim().is_empty() {
+            return Ok(Self::default());
+        }
+
+        let mut networks = Vec::new();
+        for item in value.split(',') {
+            let network = item
+                .trim()
+                .parse::<IpNet>()
+                .map_err(|_| TrustedProxyPolicyParseError)?;
+            if !networks.contains(&network) {
+                networks.push(network);
+            }
+        }
+        Ok(Self(networks))
+    }
+}
+
+fn normalize_ip(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        IpAddr::V4(address) => IpAddr::V4(address),
+    }
 }
 
 impl FromStr for Environment {
@@ -80,6 +143,9 @@ pub struct ServerConfig {
     pub max_body_bytes: usize,
     /// Maximum number of concurrently open client connections.
     pub max_connections: usize,
+    /// Networks permitted to assert `X-Forwarded-For` client addresses.
+    #[serde(default)]
+    pub trusted_proxies: TrustedProxyPolicy,
 }
 
 impl Default for ServerConfig {
@@ -92,6 +158,7 @@ impl Default for ServerConfig {
             shutdown_grace: Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_SECS),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            trusted_proxies: TrustedProxyPolicy::default(),
         }
     }
 }
@@ -281,6 +348,13 @@ impl AppConfig {
         if let Some(value) = lookup("FORGE_MAX_CONNECTIONS") {
             config.server.max_connections = parse_positive("FORGE_MAX_CONNECTIONS", &value)?;
         }
+        if let Some(value) = lookup("FORGE_TRUSTED_PROXIES") {
+            config.server.trusted_proxies = parse_value(
+                "FORGE_TRUSTED_PROXIES",
+                &value,
+                "a comma-separated list of CIDR networks (use /32 or /128 for one address)",
+            )?;
+        }
         if let Some(value) = lookup("FORGE_LOG") {
             let filter = value.trim();
             if filter.is_empty() {
@@ -408,6 +482,12 @@ mod tests {
         assert_eq!(config.environment, Environment::Development);
         assert!(config.server.bind.ip().is_loopback());
         assert_eq!(config.server.max_body_bytes, 1_048_576);
+        assert!(
+            !config
+                .server
+                .trusted_proxies
+                .contains("127.0.0.1".parse().expect("valid IP address"))
+        );
     }
 
     #[test]
@@ -418,6 +498,7 @@ mod tests {
             ("FORGE_REQUEST_TIMEOUT_SECS", "12"),
             ("FORGE_SHUTDOWN_GRACE_SECS", "7"),
             ("FORGE_MAX_BODY_BYTES", "4096"),
+            ("FORGE_TRUSTED_PROXIES", "10.0.0.0/8, 2001:db8::/32"),
         ]);
 
         let config = AppConfig::from_lookup(|key| values.get(key).map(ToString::to_string))
@@ -431,6 +512,67 @@ mod tests {
         assert_eq!(config.server.request_timeout, Duration::from_secs(12));
         assert_eq!(config.server.shutdown_grace, Duration::from_secs(7));
         assert_eq!(config.server.max_body_bytes, 4096);
+        assert!(
+            config
+                .server
+                .trusted_proxies
+                .contains("10.22.0.7".parse().expect("valid IP address"))
+        );
+        assert!(
+            config
+                .server
+                .trusted_proxies
+                .contains("2001:db8:1::1".parse().expect("valid IP address"))
+        );
+        assert!(
+            !config
+                .server
+                .trusted_proxies
+                .contains("192.0.2.1".parse().expect("valid IP address"))
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_configuration_rejects_invalid_networks() {
+        let error = AppConfig::from_lookup(|key| {
+            (key == "FORGE_TRUSTED_PROXIES").then(|| "10.0.0.0/8,not-a-network".to_owned())
+        })
+        .expect_err("invalid proxy network must fail closed");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidValue {
+                key: "FORGE_TRUSTED_PROXIES",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mapped_ipv4_addresses_match_ipv4_proxy_networks() {
+        let policy: TrustedProxyPolicy = "127.0.0.0/8".parse().expect("valid policy");
+        let mapped = "::ffff:127.0.0.1".parse().expect("valid mapped IP");
+
+        assert!(policy.contains(mapped));
+    }
+
+    #[test]
+    fn server_config_deserialization_defaults_the_new_proxy_policy() {
+        let mut serialized =
+            serde_json::to_value(ServerConfig::default()).expect("server config must serialize");
+        serialized
+            .as_object_mut()
+            .expect("server config serializes as an object")
+            .remove("trusted_proxies");
+
+        let restored: ServerConfig =
+            serde_json::from_value(serialized).expect("older server config must deserialize");
+
+        assert!(
+            !restored
+                .trusted_proxies
+                .contains("127.0.0.1".parse().expect("valid IP address"))
+        );
     }
 
     #[test]
@@ -652,6 +794,7 @@ mod tests {
             "10",
             "debug",
             "json",
+            "127.0.0.1/32",
             "postgres://runtime:secret@localhost/app",
             "postgres://migrator:secret@localhost/app",
         ];

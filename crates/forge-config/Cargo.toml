@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ipnet.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

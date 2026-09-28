@@ -57,6 +57,9 @@ time where possible instead of sleeps.
 Test routing, extraction, limits, content type, malformed JSON, validation, error
 redaction/status mapping, request IDs, deadlines, CORS, CSRF, compression, streaming
 backpressure, disconnect cancellation, SSE/WebSocket limits, and graceful shutdown.
+Client-address tests prove forwarding headers are ignored for untrusted peers,
+trusted chains are traversed right-to-left, and malformed or oversized chains
+from trusted peers are rejected before route dispatch.
 The same endpoint declaration must produce runtime validation and matching OpenAPI;
 contract snapshots are reviewed, not blindly rewritten.
 

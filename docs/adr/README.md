@@ -21,6 +21,7 @@ does not mean implementation exists.
 | [0013](0013-persistent-principals-sessions-and-memberships.md) | Persistent principals, credential-digest sessions, and memberships | Accepted |
 | [0014](0014-argon2-session-cookie-and-csrf.md) | Argon2id password authentication, opaque session cookies, and CSRF | Accepted |
 | [0015](0015-login-and-origin-credential-throttling.md) | Durable login and origin credential throttling | Accepted |
+| [0016](0016-explicit-trusted-proxy-client-addresses.md) | Explicit trusted-proxy client address resolution | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to
