@@ -18,6 +18,162 @@ pub enum SessionMarker {}
 /// UUIDv7 identifier for a server-side session record.
 pub type SessionId = Id<SessionMarker>;
 
+/// Validated PHC-encoded Argon2id password hash.
+///
+/// Debug output is always redacted. Concrete hashing/verification is delegated
+/// to a reviewed infrastructure adapter.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PasswordHash(String);
+
+impl PasswordHash {
+    /// Accepts only bounded Argon2id PHC strings.
+    pub fn new(value: impl Into<String>) -> Result<Self, CredentialError> {
+        let value = value.into();
+        if !value.starts_with("$argon2id$")
+            || value.len() > 1024
+            || value.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(CredentialError::InvalidPasswordHash);
+        }
+        Ok(Self(value))
+    }
+
+    /// Exposes the PHC string only to authentication/persistence adapters.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PasswordHash {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PasswordHash([REDACTED])")
+    }
+}
+
+/// Opaque high-entropy bearer credential presented in the session cookie.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SessionBearerToken(String);
+
+impl SessionBearerToken {
+    /// Creates a token from the canonical 64-character lowercase hex encoding
+    /// of 32 random bytes.
+    pub fn new(value: impl Into<String>) -> Result<Self, CredentialError> {
+        validate_secret_token(value.into()).map(Self)
+    }
+
+    /// Exposes the token only at HTTP/cryptographic boundaries.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SessionBearerToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionBearerToken([REDACTED])")
+    }
+}
+
+/// Opaque high-entropy CSRF token bound to a server-side session.
+#[derive(Clone, Eq, PartialEq)]
+pub struct CsrfToken(String);
+
+impl CsrfToken {
+    /// Creates a token from the canonical 64-character lowercase hex encoding
+    /// of 32 random bytes.
+    pub fn new(value: impl Into<String>) -> Result<Self, CredentialError> {
+        validate_secret_token(value.into()).map(Self)
+    }
+
+    /// Exposes the token only at HTTP/cryptographic boundaries.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for CsrfToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CsrfToken([REDACTED])")
+    }
+}
+
+fn validate_secret_token(value: String) -> Result<String, CredentialError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        Ok(value)
+    } else {
+        Err(CredentialError::InvalidToken)
+    }
+}
+
+/// Authentication credential validation failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CredentialError {
+    /// Persisted/configured password hash was not a bounded Argon2id PHC string.
+    #[error("invalid password hash")]
+    InvalidPasswordHash,
+    /// Session/CSRF token was not in the canonical high-entropy encoding.
+    #[error("invalid authentication token")]
+    InvalidToken,
+}
+
+/// Fixed-size digest of an opaque session bearer credential.
+///
+/// The raw bearer token is intentionally not part of Forge's persistence
+/// contract. Infrastructure adapters derive this digest with a reviewed
+/// cryptographic hash before calling a SessionStore.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct SessionCredentialDigest([u8; 32]);
+
+impl SessionCredentialDigest {
+    /// Wraps a 256-bit credential digest produced by a cryptographic adapter.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the digest bytes for persistence/query binding.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SessionCredentialDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionCredentialDigest([REDACTED])")
+    }
+}
+
+/// Fixed-size digest of the CSRF token associated with a session.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct CsrfTokenDigest([u8; 32]);
+
+impl CsrfTokenDigest {
+    /// Wraps a 256-bit digest produced by a cryptographic adapter.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns digest bytes for persistence/query binding.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for CsrfTokenDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CsrfTokenDigest([REDACTED])")
+    }
+}
+
 /// UTC Unix timestamp in whole seconds.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct UnixTimestamp(u64);
@@ -69,7 +225,7 @@ impl Session {
         })
     }
 
-    /// Restores a persisted session after validating lifecycle invariants.
+    /// Restores a persisted server-side session while re-validating invariants.
     pub fn restore(
         id: SessionId,
         principal_id: PrincipalId,
@@ -80,7 +236,7 @@ impl Session {
         if expires_at <= issued_at {
             return Err(SessionError::InvalidLifetime);
         }
-        if revoked_at.is_some_and(|revoked_at| revoked_at < issued_at) {
+        if revoked_at.is_some_and(|timestamp| timestamp < issued_at) {
             return Err(SessionError::InvalidRevocationTime);
         }
 
@@ -202,15 +358,166 @@ impl AuthenticatedPrincipal {
     }
 }
 
+/// Password hashing/verification boundary.
+///
+/// Implementations must use a password-specific memory-hard algorithm. The
+/// initial generated adapter uses Argon2id and executes work off the async
+/// executor's core worker threads.
+#[async_trait]
+pub trait PasswordHasher: Send + Sync {
+    /// Hashes one password into a self-describing PHC string.
+    async fn hash(&self, password: &[u8]) -> Result<PasswordHash, PasswordHashError>;
+
+    /// Verifies a password without exposing algorithm-specific errors.
+    async fn verify(
+        &self,
+        password: &[u8],
+        expected: &PasswordHash,
+    ) -> Result<bool, PasswordHashError>;
+}
+
+/// Safe password hashing failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum PasswordHashError {
+    /// Hashing/verification mechanism could not complete.
+    #[error("password hashing unavailable")]
+    Unavailable,
+    /// Stored password hash is malformed or unsupported.
+    #[error("password hash is invalid")]
+    InvalidHash,
+    /// Password input exceeds the authentication mechanism's bounded input.
+    #[error("password input is invalid")]
+    InvalidPassword,
+}
+
+/// Persisted password credential resolved by a login identifier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PasswordCredential {
+    principal_id: PrincipalId,
+    password_hash: PasswordHash,
+    disabled: bool,
+}
+
+impl PasswordCredential {
+    /// Reconstructs a stored credential.
+    #[must_use]
+    pub const fn new(
+        principal_id: PrincipalId,
+        password_hash: PasswordHash,
+        disabled: bool,
+    ) -> Self {
+        Self {
+            principal_id,
+            password_hash,
+            disabled,
+        }
+    }
+
+    /// Principal owning the credential.
+    #[must_use]
+    pub const fn principal_id(&self) -> PrincipalId {
+        self.principal_id
+    }
+
+    /// Stored PHC password hash.
+    #[must_use]
+    pub const fn password_hash(&self) -> &PasswordHash {
+        &self.password_hash
+    }
+
+    /// Whether interactive authentication is disabled.
+    #[must_use]
+    pub const fn disabled(&self) -> bool {
+        self.disabled
+    }
+}
+
+/// Persistence boundary used by password authentication.
+#[async_trait]
+pub trait PasswordCredentialStore: Send + Sync {
+    /// Resolves one case-insensitive login identifier.
+    async fn find_by_login(
+        &self,
+        login: &str,
+    ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError>;
+}
+
+/// Safe password credential persistence error.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum PasswordCredentialStoreError {
+    /// Durable credential storage is unavailable.
+    #[error("credential store unavailable")]
+    Unavailable,
+    /// Stored credential data is malformed or violates framework invariants.
+    #[error("invalid persisted credential")]
+    CorruptRecord,
+}
+
+/// Persistence boundary for opaque server-side sessions.
+///
+/// Implementations store only SessionCredentialDigest, never the bearer token.
+/// rotate must revoke the previous record and insert the replacement atomically.
+#[async_trait]
+pub trait SessionStore: Send + Sync {
+    /// Inserts a newly issued session and its credential digest.
+    async fn insert(
+        &self,
+        session: &Session,
+        credential: &SessionCredentialDigest,
+        csrf: &CsrfTokenDigest,
+    ) -> Result<(), SessionStoreError>;
+
+    /// Resolves a persisted session by credential digest.
+    async fn find_by_credential(
+        &self,
+        credential: &SessionCredentialDigest,
+    ) -> Result<Option<Session>, SessionStoreError>;
+
+    /// Verifies the CSRF digest bound to one persisted session.
+    async fn verify_csrf(
+        &self,
+        session_id: SessionId,
+        csrf: &CsrfTokenDigest,
+    ) -> Result<bool, SessionStoreError>;
+
+    /// Persists session revocation.
+    async fn revoke(
+        &self,
+        session_id: SessionId,
+        revoked_at: UnixTimestamp,
+    ) -> Result<(), SessionStoreError>;
+
+    /// Atomically revokes one session and inserts its replacement.
+    async fn rotate(
+        &self,
+        previous_session_id: SessionId,
+        revoked_at: UnixTimestamp,
+        replacement: &Session,
+        replacement_credential: &SessionCredentialDigest,
+        replacement_csrf: &CsrfTokenDigest,
+    ) -> Result<(), SessionStoreError>;
+}
+
+/// Safe session persistence error.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum SessionStoreError {
+    /// Persistence is temporarily unavailable.
+    #[error("session store unavailable")]
+    Unavailable,
+    /// Uniqueness or optimistic persistence rule was violated.
+    #[error("session store conflict")]
+    Conflict,
+    /// Persisted data violates Session invariants.
+    #[error("invalid persisted session")]
+    CorruptRecord,
+}
+
 /// Session validation failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum SessionError {
     /// Expiry was not strictly later than issuance.
     #[error("invalid session lifetime")]
     InvalidLifetime,
-    /// Revocation time predates session issuance.
-    #[error("invalid session revocation time")]
-    InvalidRevocationTime,
     /// Current time predates issuance.
     #[error("session is not yet valid")]
     NotYetValid,
@@ -220,85 +527,9 @@ pub enum SessionError {
     /// Session was revoked.
     #[error("session revoked")]
     Revoked,
-}
-
-/// Safe persistence error categories for server-side sessions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionStoreErrorKind {
-    /// Session storage is unavailable.
-    Unavailable,
-    /// A concurrent lifecycle transition prevented the requested write.
-    Conflict,
-    /// Persisted data violated Forge session invariants.
-    Corrupt,
-}
-
-/// Session persistence failure with a bounded safe message.
-#[derive(Debug, Error)]
-#[error("{message}")]
-pub struct SessionStoreError {
-    kind: SessionStoreErrorKind,
-    message: &'static str,
-    retryable: bool,
-}
-
-impl SessionStoreError {
-    /// Creates a classified session storage error.
-    #[must_use]
-    pub const fn new(
-        kind: SessionStoreErrorKind,
-        message: &'static str,
-        retryable: bool,
-    ) -> Self {
-        Self {
-            kind,
-            message,
-            retryable,
-        }
-    }
-
-    /// Stable storage error category.
-    #[must_use]
-    pub const fn kind(&self) -> SessionStoreErrorKind {
-        self.kind
-    }
-
-    /// Whether a bounded retry may be reasonable.
-    #[must_use]
-    pub const fn retryable(&self) -> bool {
-        self.retryable
-    }
-}
-
-/// Persistent server-side session lifecycle.
-///
-/// This port stores lifecycle state only. It deliberately has no bearer-token or
-/// password API; credential verification is a later adapter boundary.
-#[async_trait]
-pub trait SessionStore: Send + Sync {
-    /// Inserts a newly created session.
-    async fn insert(&self, session: &Session) -> Result<(), SessionStoreError>;
-
-    /// Loads a persisted session by internal UUIDv7 identifier.
-    async fn find(&self, id: SessionId) -> Result<Option<Session>, SessionStoreError>;
-
-    /// Idempotently records revocation at the earliest persisted revocation time.
-    async fn revoke(
-        &self,
-        id: SessionId,
-        revoked_at: UnixTimestamp,
-    ) -> Result<(), SessionStoreError>;
-
-    /// Atomically revokes the active current session and inserts its replacement.
-    ///
-    /// Implementations must return Conflict when the current session is missing,
-    /// already revoked, not yet valid, or expired at rotated_at.
-    async fn rotate(
-        &self,
-        current_id: SessionId,
-        rotated_at: UnixTimestamp,
-        replacement: &Session,
-    ) -> Result<(), SessionStoreError>;
+    /// Revocation timestamp predates session issuance.
+    #[error("invalid session revocation time")]
+    InvalidRevocationTime,
 }
 
 #[cfg(test)]
@@ -375,41 +606,64 @@ mod tests {
     }
 
     #[test]
-    fn restored_sessions_validate_persisted_lifecycle() {
-        let principal = PrincipalId::new();
-        let id = SessionId::new();
-
-        assert!(Session::restore(id, principal, time(10), time(20), None).is_ok());
-        assert_eq!(
-            Session::restore(id, principal, time(10), time(10), None),
-            Err(SessionError::InvalidLifetime)
-        );
-        assert_eq!(
-            Session::restore(id, principal, time(10), time(20), Some(time(9))),
-            Err(SessionError::InvalidRevocationTime)
-        );
-    }
-
-    #[test]
-    fn revocation_before_issuance_is_rejected() {
-        let principal = PrincipalId::new();
-        let mut session = Session::new(principal, time(10), time(20)).expect("valid session");
-
-        assert_eq!(
-            session.revoke(time(9)),
-            Err(SessionError::InvalidRevocationTime)
-        );
-        assert_eq!(session.revoked_at(), None);
-    }
-
-    #[test]
     fn revocation_keeps_first_timestamp() {
         let principal = PrincipalId::new();
         let mut session = Session::new(principal, time(10), time(40)).expect("valid session");
 
         session.revoke(time(20)).expect("revocation should succeed");
-        session.revoke(time(30)).expect("repeat revocation should succeed");
+        session.revoke(time(30)).expect("repeated revocation should succeed");
 
         assert_eq!(session.revoked_at(), Some(time(20)));
+    }
+
+    #[test]
+    fn persisted_session_is_revalidated() {
+        let principal = PrincipalId::new();
+        let id = SessionId::new();
+
+        assert_eq!(
+            Session::restore(id, principal, time(20), time(20), None),
+            Err(SessionError::InvalidLifetime)
+        );
+        assert_eq!(
+            Session::restore(id, principal, time(20), time(30), Some(time(19))),
+            Err(SessionError::InvalidRevocationTime)
+        );
+
+        let restored = Session::restore(id, principal, time(20), time(30), Some(time(25)))
+            .expect("valid persisted session");
+        assert_eq!(restored.id(), id);
+        assert_eq!(restored.revoked_at(), Some(time(25)));
+    }
+
+    #[test]
+    fn credential_digest_debug_is_redacted() {
+        let digest = SessionCredentialDigest::from_bytes([0xAB; 32]);
+        let debug = format!("{digest:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("AB"));
+    }
+
+    #[test]
+    fn password_hash_and_tokens_are_validated_and_redacted() {
+        let hash = PasswordHash::new("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA")
+            .expect("Argon2id PHC string should be accepted");
+        assert_eq!(
+            hash.expose(),
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA"
+        );
+        assert!(format!("{hash:?}").contains("[REDACTED]"));
+        assert!(PasswordHash::new("$argon2i$v=19$bad").is_err());
+
+        let encoded = "ab".repeat(32);
+        let bearer = SessionBearerToken::new(encoded.clone()).expect("valid bearer");
+        let csrf = CsrfToken::new(encoded).expect("valid csrf token");
+        assert!(format!("{bearer:?}").contains("[REDACTED]"));
+        assert!(format!("{csrf:?}").contains("[REDACTED]"));
+        assert!(SessionBearerToken::new("AB".repeat(32)).is_err());
+        assert!(CsrfToken::new("abc").is_err());
+
+        let csrf_digest = CsrfTokenDigest::from_bytes([0xCD; 32]);
+        assert!(format!("{csrf_digest:?}").contains("[REDACTED]"));
     }
 }
