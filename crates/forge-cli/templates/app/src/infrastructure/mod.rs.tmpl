@@ -1,5 +1,9 @@
 //! Concrete mechanisms that implement application ports.
 
+%%if database%%
+pub mod audit;
+pub mod auth;
+%%end%%
 pub mod cache;
 pub mod database;
 pub mod queue;
