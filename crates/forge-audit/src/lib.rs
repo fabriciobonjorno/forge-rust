@@ -36,6 +36,32 @@ impl AuditAction {
     }
 }
 
+/// Bounded request/correlation identifier attached to an audit event.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AuditRequestId(String);
+
+impl AuditRequestId {
+    /// Creates a request identifier. Forge HTTP request IDs are UUIDv7 strings.
+    pub fn new(value: impl Into<String>) -> Result<Self, AuditValidationError> {
+        let value = value.into();
+        let valid = !value.is_empty()
+            && value.len() <= 96
+            && value.is_ascii()
+            && !value.bytes().any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace());
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(AuditValidationError { kind: "request id" })
+        }
+    }
+
+    /// Returns the request identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Optional resource type affected by an audited action.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ResourceKind(String);
@@ -104,9 +130,8 @@ impl AuditTarget {
     /// Creates a target with an optional bounded opaque identifier.
     pub fn new(
         kind: ResourceKind,
-        id: Option<impl Into<String>>,
+        id: Option<String>,
     ) -> Result<Self, AuditValidationError> {
-        let id = id.map(Into::into);
         if id.as_ref().is_some_and(|value| {
             value.is_empty()
                 || value.len() > 200
@@ -140,6 +165,7 @@ pub struct AuditEvent {
     action: AuditAction,
     outcome: AuditOutcome,
     target: Option<AuditTarget>,
+    request_id: Option<AuditRequestId>,
 }
 
 impl AuditEvent {
@@ -159,6 +185,7 @@ impl AuditEvent {
             action,
             outcome,
             target,
+            request_id: None,
         }
     }
 
@@ -179,6 +206,7 @@ impl AuditEvent {
             action,
             outcome,
             target,
+            request_id: None,
         }
     }
 
@@ -199,6 +227,7 @@ impl AuditEvent {
             action,
             outcome,
             target,
+            request_id: None,
         }
     }
 
@@ -242,6 +271,19 @@ impl AuditEvent {
     #[must_use]
     pub const fn target(&self) -> Option<&AuditTarget> {
         self.target.as_ref()
+    }
+
+    /// Attaches the request/correlation identifier observed at the transport boundary.
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: AuditRequestId) -> Self {
+        self.request_id = Some(request_id);
+        self
+    }
+
+    /// Request/correlation identifier, when available.
+    #[must_use]
+    pub const fn request_id(&self) -> Option<&AuditRequestId> {
+        self.request_id.as_ref()
     }
 }
 
@@ -303,8 +345,24 @@ mod tests {
     #[test]
     fn target_rejects_control_characters_and_large_ids() {
         let kind = ResourceKind::new("session").expect("valid kind");
-        assert!(AuditTarget::new(kind.clone(), Some("id\nsecret")).is_err());
+        assert!(AuditTarget::new(kind.clone(), Some("id\nsecret".to_owned())).is_err());
         assert!(AuditTarget::new(kind, Some("x".repeat(201))).is_err());
+    }
+
+    #[test]
+    fn request_id_is_bounded_and_attached_explicitly() {
+        assert!(AuditRequestId::new("bad request id").is_err());
+        let request_id = AuditRequestId::new("01941f29-7c00-7000-8000-000000000010")
+            .expect("UUID-shaped request id should be accepted");
+        let event = AuditEvent::anonymous(
+            time(1),
+            AuditAction::new("login.denied").expect("valid action"),
+            AuditOutcome::Denied,
+            None,
+        )
+        .with_request_id(request_id.clone());
+
+        assert_eq!(event.request_id(), Some(&request_id));
     }
 
     #[test]
