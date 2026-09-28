@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-27
 - Refines: [ADR 0004](0004-tenancy-and-rls.md)
+- Refined by: [ADR 0012](0012-persistent-sessions-and-append-only-audit.md)
 
 ## Context
 
