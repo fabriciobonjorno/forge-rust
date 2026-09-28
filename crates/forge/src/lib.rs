@@ -26,9 +26,12 @@ mod logging;
 mod probe;
 mod signal;
 
+pub use forge_auth as auth;
 pub use forge_config as config;
 pub use forge_core as core;
 pub use forge_db as db;
 pub use forge_http as http;
+pub use forge_security as security;
+pub use forge_tenancy as tenancy;
 
 pub use app::App;

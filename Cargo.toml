@@ -1,11 +1,14 @@
 [workspace]
 members = [
     "crates/forge",
+    "crates/forge-auth",
     "crates/forge-cli",
     "crates/forge-config",
     "crates/forge-core",
     "crates/forge-db",
     "crates/forge-http",
+    "crates/forge-security",
+    "crates/forge-tenancy",
 ]
 # Examples are standalone applications, exactly as `forge new` generates them.
 exclude = ["examples"]

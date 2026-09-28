@@ -1,6 +1,6 @@
 [package]
-name = "forge-db"
-description = "Database contracts and transaction primitives for Forge applications"
+name = "forge-security"
+description = "Authorization and security policy contracts for Forge applications"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-async-trait.workspace = true
-forge-tenancy = { path = "../forge-tenancy" }
+forge-core = { path = "../forge-core" }
 thiserror.workspace = true
 
 [lints]

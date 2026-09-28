@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-26
+- Refined by: [ADR 0010](0010-session-and-tenant-authorization-context.md)
 
 ## Context
 

@@ -5,6 +5,7 @@
 //! adapters remain in infrastructure.
 
 use async_trait::async_trait;
+use forge_tenancy::TenantContext;
 use thiserror::Error;
 
 /// Stable database failure categories exposed across application boundaries.
@@ -137,7 +138,6 @@ pub trait TransactionManager: Send + Sync {
     async fn begin(&self) -> Result<Self::Transaction<'_>, DatabaseError>;
 }
 
-
 /// Validated maximum number of records requested from a repository page.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PageLimit(u16);
@@ -234,6 +234,60 @@ pub trait Repository: Send + Sync {
     /// created_at plus id) and must not emulate cursors with unbounded OFFSET.
     async fn page(
         &self,
+        after: Option<&Self::Cursor>,
+        limit: PageLimit,
+    ) -> Result<CursorPage<Self::Entity, Self::Cursor>, DatabaseError>;
+}
+
+/// Typed repository contract for tenant-owned aggregates.
+///
+/// Every operation requires an already authenticated and authorized
+/// TenantContext. There is intentionally no overload that accepts only a raw
+/// tenant identifier, so tenant-sensitive application code cannot accidentally
+/// omit the authorization boundary.
+#[async_trait]
+pub trait TenantRepository: Send + Sync {
+    /// Nominal identifier type, typically forge_core::Id<Marker>.
+    type Id: Send + Sync;
+    /// Aggregate/entity returned by the repository.
+    type Entity: Send + Sync;
+    /// Opaque deterministic cursor owned by the application/adapter contract.
+    type Cursor: Send + Sync;
+
+    /// Loads an entity within the authorized tenant.
+    async fn find(
+        &self,
+        context: &TenantContext,
+        id: &Self::Id,
+    ) -> Result<Option<Self::Entity>, DatabaseError>;
+
+    /// Inserts an entity within the authorized tenant.
+    async fn insert(
+        &self,
+        context: &TenantContext,
+        entity: &Self::Entity,
+    ) -> Result<(), DatabaseError>;
+
+    /// Persists an optimistic tenant-scoped update.
+    async fn update(
+        &self,
+        context: &TenantContext,
+        entity: &Self::Entity,
+        expected_version: RecordVersion,
+    ) -> Result<RecordVersion, DatabaseError>;
+
+    /// Deletes within the authorized tenant when the version matches.
+    async fn delete(
+        &self,
+        context: &TenantContext,
+        id: &Self::Id,
+        expected_version: RecordVersion,
+    ) -> Result<(), DatabaseError>;
+
+    /// Reads a bounded deterministic page within the authorized tenant.
+    async fn page(
+        &self,
+        context: &TenantContext,
         after: Option<&Self::Cursor>,
         limit: PageLimit,
     ) -> Result<CursorPage<Self::Entity, Self::Cursor>, DatabaseError>;
