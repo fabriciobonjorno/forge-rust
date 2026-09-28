@@ -508,6 +508,119 @@ pub enum PasswordCredentialStoreError {
     CorruptRecord,
 }
 
+/// Opaque 256-bit key used for credential-attempt throttling.
+///
+/// Concrete security adapters derive keys from canonical login/origin inputs.
+/// The persistence contract never requires raw login names or network addresses.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct LoginThrottleKey([u8; 32]);
+
+impl LoginThrottleKey {
+    /// Wraps a 256-bit throttle key produced by a security adapter.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns bytes for persistence/query binding.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for LoginThrottleKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LoginThrottleKey([REDACTED])")
+    }
+}
+
+/// Validated credential-attempt throttling policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoginThrottlePolicy {
+    max_attempts: u32,
+    window_seconds: u64,
+    block_seconds: u64,
+}
+
+impl LoginThrottlePolicy {
+    /// Creates a positive bounded-attempt policy.
+    #[must_use]
+    pub const fn new(
+        max_attempts: u32,
+        window_seconds: u64,
+        block_seconds: u64,
+    ) -> Option<Self> {
+        if max_attempts == 0 || window_seconds == 0 || block_seconds == 0 {
+            return None;
+        }
+        Some(Self {
+            max_attempts,
+            window_seconds,
+            block_seconds,
+        })
+    }
+
+    /// Number of attempts allowed before the next attempt is denied.
+    #[must_use]
+    pub const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+
+    /// Attempt window duration in seconds.
+    #[must_use]
+    pub const fn window_seconds(self) -> u64 {
+        self.window_seconds
+    }
+
+    /// Lockout duration in seconds after the budget is exhausted.
+    #[must_use]
+    pub const fn block_seconds(self) -> u64 {
+        self.block_seconds
+    }
+}
+
+/// Result of atomically reserving one credential-verification attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoginThrottleDecision {
+    /// The caller may perform one credential verification.
+    Allowed,
+    /// Verification must not run until after the retry interval.
+    Denied {
+        /// Positive retry interval in seconds.
+        retry_after_seconds: u64,
+    },
+}
+
+/// Credential-throttling persistence failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum LoginThrottleStoreError {
+    /// Throttle state could not be safely read/updated.
+    #[error("login throttle store unavailable")]
+    Unavailable,
+    /// Persisted state violated the throttle contract.
+    #[error("invalid persisted login throttle state")]
+    CorruptRecord,
+}
+
+/// Durable atomic credential-attempt throttling.
+///
+/// reserve must serialize concurrent callers for one key so the attempt budget
+/// cannot be bypassed with parallel requests.
+#[async_trait]
+pub trait LoginThrottleStore: Send + Sync {
+    /// Atomically reserves one attempt or returns a denial with retry delay.
+    async fn reserve(
+        &self,
+        key: &LoginThrottleKey,
+        now: UnixTimestamp,
+        policy: LoginThrottlePolicy,
+    ) -> Result<LoginThrottleDecision, LoginThrottleStoreError>;
+
+    /// Removes accumulated state for one key after a successful authentication.
+    async fn clear(&self, key: &LoginThrottleKey) -> Result<(), LoginThrottleStoreError>;
+}
+
 /// Persistence boundary for opaque server-side sessions.
 ///
 /// Implementations store only SessionCredentialDigest, never the bearer token.
@@ -593,6 +706,18 @@ mod tests {
 
     fn time(seconds: u64) -> UnixTimestamp {
         UnixTimestamp::from_secs(seconds)
+    }
+
+    #[test]
+    fn login_throttle_policy_requires_positive_values() {
+        assert!(LoginThrottlePolicy::new(0, 60, 300).is_none());
+        assert!(LoginThrottlePolicy::new(5, 0, 300).is_none());
+        assert!(LoginThrottlePolicy::new(5, 60, 0).is_none());
+
+        let policy = LoginThrottlePolicy::new(5, 60, 300).expect("valid policy");
+        assert_eq!(policy.max_attempts(), 5);
+        assert_eq!(policy.window_seconds(), 60);
+        assert_eq!(policy.block_seconds(), 300);
     }
 
     #[test]
