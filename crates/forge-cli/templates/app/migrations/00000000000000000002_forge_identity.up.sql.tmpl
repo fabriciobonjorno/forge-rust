@@ -94,6 +94,8 @@ BEGIN
         REVOKE ALL ON TABLE forge_tenant_memberships FROM app_runtime;
 
         GRANT SELECT ON TABLE forge_principals TO app_runtime;
+        GRANT UPDATE (password_hash, updated_at, version)
+            ON TABLE forge_principals TO app_runtime;
         GRANT SELECT, INSERT, UPDATE ON TABLE forge_sessions TO app_runtime;
         GRANT SELECT, INSERT, UPDATE ON TABLE forge_tenant_memberships TO app_runtime;
 
