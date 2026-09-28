@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-28
 - Refines: [ADR 0014](0014-argon2-session-cookie-and-csrf.md)
+- Refined by: [ADR 0016](0016-explicit-trusted-proxy-client-addresses.md)
 
 ## Context
 
@@ -31,7 +32,9 @@ Generated applications derive two independent SHA-256 namespaced keys before
 password verification:
 
 1. a canonical case-insensitive login key;
-2. a peer-IP origin key that excludes the ephemeral port.
+2. a client-IP origin key that excludes the ephemeral port. By default the
+   client IP is the TCP peer address; explicit trusted-proxy CIDRs may enable
+   right-to-left `X-Forwarded-For` resolution as described in ADR 0016.
 
 The throttle table stores only opaque keys, counters and timestamps; raw login
 identifiers and addresses are not required by the persistence contract. These
@@ -63,8 +66,8 @@ throttled outcome with a retry interval.
 - Concurrent requests for the same throttle key are serialized.
 - A valid account cannot reset an attacker's origin-wide budget.
 - Throttling adds a PostgreSQL write/lock before every password verification.
-- Forwarded/proxy client-address trust is not inferred automatically; the
-  current key uses the TCP peer address observed by Forge. Trusted proxy
-  extraction requires a separate explicit deployment policy.
+- `authenticate_password` receives the resolved client IP from the HTTP
+  request. Applications that enable proxies must configure only networks that
+  overwrite `X-Forwarded-For`; otherwise clients could spoof origin budgets.
 - Turnkey HTTP login/logout response mapping and Retry-After headers remain a
   later adapter-composition slice.

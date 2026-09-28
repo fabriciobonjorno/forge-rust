@@ -73,6 +73,11 @@ reversible migration.
 
 Configuration uses `FORGE_*` environment variables; unknown `FORGE_*` keys are
 rejected at startup. Run `cargo run -- help` for the full list.
+`FORGE_TRUSTED_PROXIES` is empty by default. Set it only to egress CIDRs of
+reverse proxies that sanitize and append the observed upstream address to
+`X-Forwarded-For`; use `/32` or `/128` for one address. The client IP is
+resolved right-to-left through trusted hops and falls back to the TCP peer
+when no forwarding header is present.
 
 %%if docker%%
 ## Container
