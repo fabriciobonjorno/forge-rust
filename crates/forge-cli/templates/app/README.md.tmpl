@@ -18,6 +18,8 @@ src/bootstrap       composition root and process lifecycle
 %%if database%%
 This application uses PostgreSQL. SQLx stays in the outer
 infrastructure/bootstrap boundary; domain and application code do not depend on it.
+The first embedded migration creates Forge principal/session/membership/audit
+tables. Session credentials are persisted only as 256-bit digests.
 
 %%if docker%%
 Start PostgreSQL with:
@@ -95,5 +97,10 @@ Tenant-sensitive persistence should open transactions through
 authorized tenant/principal as transaction-local PostgreSQL settings; RLS policies
 can read them with `current_setting('forge.tenant_id', true)` and
 `current_setting('forge.principal_id', true)`.
+
+`infrastructure::auth::PostgresSessionStore` persists server-side sessions by
+credential digest. `infrastructure::audit::PostgresAuditSink` appends structured
+audit events; forced RLS prevents the runtime role from reading, updating or
+deleting audit rows through its ordinary path.
 %%end%%
 %%end%%
