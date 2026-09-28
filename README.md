@@ -23,7 +23,7 @@ results.
 | 0 | Architecture, ADRs, threat model, dependency and test policy | Done |
 | 1 | Runtime, CLI, configuration, HTTP, graceful shutdown, health, Docker | Implemented, unreleased |
 | 2 | PostgreSQL, migrations, transaction contracts, repositories | Behavior implemented; CI runner gate still blocked |
-| 3 | Authentication, authorization, tenancy, RLS, audit | Foundation in progress |
+| 3 | Authentication, authorization, tenancy, RLS, audit | Persistence foundation in progress |
 | 4+ | Jobs/events, telemetry, OpenAPI, AI, hardening | Design only |
 
 See the [delivery sequence](docs/architecture.md#delivery-sequence-and-exit-criteria).
@@ -98,8 +98,8 @@ Kubernetes and systemd deployment is covered in
 - PostgreSQL-first generation with SQLx confined to the generated
   infrastructure/bootstrap boundary, reversible embedded migrations, separate
   least-privilege runtime/migration roles, transaction-local tenant/principal
-  RLS context, a health-ordered Compose database, and
-  `forge generate migration <name>`.
+  RLS context, persisted session digests, membership RLS, an append-only audit
+  sink, a health-ordered Compose database, and `forge generate migration <name>`.
 - Typed `FORGE_*` environment configuration. Database URLs are redacted from
   normal debug/serialization output, and unknown `FORGE_*` keys are
   rejected at startup.
@@ -116,6 +116,7 @@ Kubernetes and systemd deployment is covered in
 ```text
 crates/
 ├── forge          # facade: forge::App and framework-owned re-exports
+├── forge-audit    # structured append-only audit event contracts
 ├── forge-auth     # server-side session lifecycle and authenticated identity
 ├── forge-core     # lifecycle, errors, UUIDv7 identifiers
 ├── forge-config   # typed FORGE_* configuration and secret redaction
