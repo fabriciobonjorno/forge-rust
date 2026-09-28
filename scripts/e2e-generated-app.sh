@@ -122,6 +122,126 @@ SQL
   tenant_two="01941f29-7c00-7000-8000-000000000002"
   principal="01941f29-7c00-7000-8000-000000000003"
 
+  session_id="01941f29-7c00-7000-8000-000000000004"
+  audit_anonymous="01941f29-7c00-7000-8000-000000000005"
+  audit_tenant="01941f29-7c00-7000-8000-000000000006"
+
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc \
+      "SELECT to_regclass('public.forge_sessions')")" == "forge_sessions" ]] \
+    || fail "built-in identity/session migration did not run"
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc \
+      "SELECT to_regclass('public.forge_audit_log')")" == "forge_audit_log" ]] \
+    || fail "built-in audit migration did not run"
+
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+    INSERT INTO forge_principals (id, login, password_hash)
+    VALUES ('$principal', 'e2e@example.invalid', 'pending-argon2-adapter');
+
+    INSERT INTO forge_sessions (
+      id, principal_id, credential_digest, issued_at, expires_at
+    )
+    VALUES (
+      '$session_id',
+      '$principal',
+      decode(repeat('ab', 32), 'hex'),
+      now() - interval '1 minute',
+      now() + interval '1 hour'
+    );
+  " >/dev/null
+
+  persisted_sessions="$(docker compose exec -T db psql -Atq -U app_runtime \
+      -d forge_e2e_app -c "
+    SELECT count(*)
+    FROM forge_sessions
+    WHERE credential_digest = decode(repeat('ab', 32), 'hex');
+  ")"
+  [[ "$persisted_sessions" == 1 ]] \
+    || fail "session digest persistence lookup failed"
+
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+    BEGIN;
+    SELECT set_config('forge.tenant_id', '$tenant_one', true);
+    SELECT set_config('forge.principal_id', '$principal', true);
+    INSERT INTO forge_tenant_memberships (tenant_id, principal_id, roles)
+    VALUES ('$tenant_one', '$principal', ARRAY['admin']);
+    COMMIT;
+  " >/dev/null
+
+  membership_without_context="$(docker compose exec -T db psql -Atq -U app_runtime \
+      -d forge_e2e_app -c "SELECT count(*) FROM forge_tenant_memberships;")"
+  [[ "$membership_without_context" == 0 ]] \
+    || fail "membership RLS must fail closed without principal/tenant context"
+
+  membership_as_principal="$(docker compose exec -T db psql -Atq -U app_runtime \
+      -d forge_e2e_app -c "
+    BEGIN;
+    SELECT set_config('forge.principal_id', '$principal', true);
+    SELECT count(*) FROM forge_tenant_memberships;
+    ROLLBACK;
+  " | tail -n 1)"
+  [[ "$membership_as_principal" == 1 ]] \
+    || fail "authenticated principal must be able to resolve its own membership"
+
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+    INSERT INTO forge_audit_log (
+      event_id, occurred_at, action, outcome, target_kind, target_id
+    )
+    VALUES (
+      '$audit_anonymous', now(), 'login.denied', 'denied', 'session', 'anonymous'
+    );
+  " >/dev/null
+
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+    BEGIN;
+    SELECT set_config('forge.tenant_id', '$tenant_one', true);
+    SELECT set_config('forge.principal_id', '$principal', true);
+    INSERT INTO forge_audit_log (
+      event_id, occurred_at, principal_id, tenant_id, action, outcome,
+      target_kind, target_id, request_id
+    )
+    VALUES (
+      '$audit_tenant', now(), '$principal', '$tenant_one',
+      'session.create', 'succeeded', 'session', '$session_id',
+      '01941f29-7c00-7000-8000-000000000007'
+    );
+    COMMIT;
+  " >/dev/null
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+      BEGIN;
+      SELECT set_config('forge.tenant_id', '$tenant_one', true);
+      SELECT set_config('forge.principal_id', '$principal', true);
+      INSERT INTO forge_audit_log (
+        event_id, occurred_at, principal_id, tenant_id, action, outcome
+      )
+      VALUES (
+        '01941f29-7c00-7000-8000-000000000008',
+        now(), '$principal', '$tenant_two', 'session.create', 'succeeded'
+      );
+      COMMIT;
+    " >/dev/null 2>&1; then
+    fail "audit RLS must reject forged tenant attribution"
+  fi
+
+  visible_audit="$(docker compose exec -T db psql -Atq -U app_runtime \
+      -d forge_e2e_app -c "SELECT count(*) FROM forge_audit_log;")"
+  [[ "$visible_audit" == 0 ]] \
+    || fail "runtime role must not be able to read audit records"
+
+  docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -c "UPDATE forge_audit_log SET action = 'tamper'; DELETE FROM forge_audit_log;" \
+      >/dev/null
+
+  audit_count="$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc \
+      "SELECT count(*) FROM forge_audit_log;")"
+  [[ "$audit_count" == 2 ]] \
+    || fail "runtime role must not update/delete append-only audit rows"
+
   docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
       -v ON_ERROR_STOP=1 -c "
     BEGIN;
@@ -171,7 +291,10 @@ SQL
   fi
 
   FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" rollback
-  [[ -z "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" ]]     || fail "rollback did not remove the probe table"
+  [[ -z "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" ]] \
+    || fail "rollback did not remove the probe table"
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_sessions')")" == "forge_sessions" ]] \
+    || fail "rolling back the latest app migration must preserve Forge identity schema"
 
   FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" migrate
 fi
