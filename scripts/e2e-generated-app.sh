@@ -178,6 +178,37 @@ SQL
       "SELECT count(*) FROM forge_principals WHERE id = '$principal'")" == 1 ]] \
     || fail "runtime credential lookup cannot read principal"
 
+  upgraded_version="$(docker compose exec -T db psql -U app_runtime -d forge_e2e_app -Atc "
+    UPDATE forge_principals
+    SET password_hash = password_hash,
+        updated_at = clock_timestamp(),
+        version = version + 1
+    WHERE id = '$principal' AND version = 1 AND disabled_at IS NULL
+    RETURNING version;
+  ")"
+  [[ "$upgraded_version" == 2 ]] \
+    || fail "runtime password rehash update did not advance optimistic version"
+
+  stale_upgrade="$(docker compose exec -T db psql -U app_runtime -d forge_e2e_app -Atc "
+    UPDATE forge_principals
+    SET password_hash = password_hash,
+        updated_at = clock_timestamp(),
+        version = version + 1
+    WHERE id = '$principal' AND version = 1 AND disabled_at IS NULL
+    RETURNING version;
+  ")"
+  [[ -z "$stale_upgrade" ]] \
+    || fail "stale password rehash version must not overwrite a newer credential"
+
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app \
+      -v ON_ERROR_STOP=1 -c "
+        UPDATE forge_principals
+        SET login = 'mutated@example.invalid'
+        WHERE id = '$principal';
+      " >/dev/null 2>&1; then
+    fail "runtime password rehash privilege must not allow login mutation"
+  fi
+
   docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app -v ON_ERROR_STOP=1 -c "
     INSERT INTO forge_sessions (
       id, principal_id, credential_digest, csrf_digest, issued_at, expires_at
