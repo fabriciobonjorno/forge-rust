@@ -78,9 +78,12 @@ tenant/principal settings are installed, and cannot write another tenant's row.
 
 ### Authentication and security
 
-Test password/session lifecycle, cookie flags, revocation, RBAC deny-by-default,
-role changes, brute-force/rate limits, CSRF/CORS, SSRF redirect and address cases,
-path traversal/symlinks, upload limits, security headers, key rotation, webhook
+Test password/session lifecycle, Argon2id parameter selection and malformed PHC
+handling, generic credential denial, bounded password input, bearer/CSRF entropy
+and independence, digest-only persistence, cookie flags, session revocation and
+rotation, CSRF safe/unsafe method behavior, RBAC deny-by-default, role changes,
+brute-force/rate limits, CORS, SSRF redirect and address cases, path
+traversal/symlinks, upload limits, security headers, key rotation, webhook
 signatures, replay windows, idempotency digest mismatch, audit completeness, and
 all fail-closed rules in the [threat model](threat-model.md). Database-enabled
 generated-app tests additionally prove the runtime audit writer can append one
@@ -135,7 +138,11 @@ production configuration. Phase 3 extends the database path with distinct
 migration/runtime credentials and negative RLS checks: migration commands reject
 runtime-only configuration, the serving process receives only the runtime URL,
 the runtime role has no DDL authority, missing tenant settings deny visibility,
-and two-tenant reads/writes remain isolated.
+and two-tenant reads/writes remain isolated. The same generated-app path verifies
+that Forge identity migrations create principal/session/membership storage, bearer
+and CSRF digests are persisted without raw secrets, session mutation is limited to
+monotonic revocation, and membership state persists independently from session
+credentials.
 
 ## Concurrency correctness
 
