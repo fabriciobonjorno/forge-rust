@@ -75,6 +75,14 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Database, "migrations/.gitkeep" => "migrations/gitkeep.tmpl"),
     template!(
         Group::Database,
+        "migrations/00000000000000000001_forge_identity.up.sql" => "migrations/00000000000000000001_forge_identity.up.sql.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "migrations/00000000000000000001_forge_identity.down.sql" => "migrations/00000000000000000001_forge_identity.down.sql.tmpl"
+    ),
+    template!(
+        Group::Database,
         "src/infrastructure/database/mod.rs" => "src/infrastructure/database/mod.rs.tmpl"
     ),
     template!(
@@ -631,7 +639,26 @@ mod tests {
         assert!(manifest.contains("sqlx"));
         assert!(root.join("build.rs").is_file());
         assert!(root.join("migrations/.gitkeep").is_file());
+        assert!(
+            root.join("migrations/00000000000000000001_forge_identity.up.sql")
+                .is_file()
+        );
+        assert!(
+            root.join("migrations/00000000000000000001_forge_identity.down.sql")
+                .is_file()
+        );
         assert!(root.join("docker/postgres/init.sql").is_file());
+
+        let identity_migration = read(
+            &root,
+            "migrations/00000000000000000001_forge_identity.up.sql",
+        );
+        assert!(identity_migration.contains("CREATE TABLE forge_sessions"));
+        assert!(identity_migration.contains("credential_digest bytea"));
+        assert!(identity_migration.contains("CREATE TABLE forge_tenant_memberships"));
+        assert!(identity_migration.contains("FORCE ROW LEVEL SECURITY"));
+        assert!(identity_migration.contains("CREATE TABLE forge_audit_log"));
+        assert!(identity_migration.contains("CREATE POLICY forge_audit_append"));
 
         let database_module = read(&root, "src/infrastructure/database/mod.rs");
         assert!(database_module.contains("begin_tenant_transaction"));
