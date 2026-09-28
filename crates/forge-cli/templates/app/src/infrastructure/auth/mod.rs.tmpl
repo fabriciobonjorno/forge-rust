@@ -149,7 +149,7 @@ impl LoginThrottleStore for PostgresLoginThrottleStore {
         .await
         .map_err(map_throttle_sqlx_error)?;
 
-        let row = sqlx::query_as::<_, (i64, i32, Option<i64>)>(
+        let row = sqlx::query_as::<_, (i64, i64, Option<i64>)>(
             "SELECT
                 EXTRACT(EPOCH FROM window_started_at)::bigint,
                 attempts,
