@@ -17,6 +17,7 @@ does not mean implementation exists.
 | [0009](0009-rails-style-generated-delivery-assets.md) | Rails-style generated delivery assets (distroless, self-probe, CI) | Accepted |
 | [0010](0010-session-and-tenant-authorization-context.md) | Server-side sessions and tenant-scoped authorization context | Accepted |
 | [0011](0011-postgresql-runtime-migration-roles-and-rls-context.md) | Separate PostgreSQL migration/runtime roles and transaction-local RLS context | Accepted |
+| [0012](0012-structured-append-only-audit-evidence.md) | Structured append-only security audit evidence | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to
