@@ -71,7 +71,10 @@ for critical paths.
 
 Every tenant-sensitive repository runs a shared two-tenant isolation suite with
 missing, invalid, and stale context plus pooled-connection reuse. The test role
-must not bypass RLS.
+must not bypass RLS. The generated PostgreSQL E2E additionally proves that the
+runtime role cannot create schema objects, sees zero tenant rows when transaction
+context is absent, sees only the selected tenant after transaction-local
+tenant/principal settings are installed, and cannot write another tenant's row.
 
 ### Authentication and security
 
@@ -79,7 +82,9 @@ Test password/session lifecycle, cookie flags, revocation, RBAC deny-by-default,
 role changes, brute-force/rate limits, CSRF/CORS, SSRF redirect and address cases,
 path traversal/symlinks, upload limits, security headers, key rotation, webhook
 signatures, replay windows, idempotency digest mismatch, audit completeness, and
-all fail-closed rules in the [threat model](threat-model.md).
+all fail-closed rules in the [threat model](threat-model.md). Database-enabled
+generated-app tests additionally prove the runtime audit writer can append one
+event but cannot SELECT, UPDATE, or DELETE audit history.
 
 ### Jobs and events
 
@@ -126,7 +131,11 @@ container E2E, along with the host-binary checks (build, start, health, the
 `FORGE_E2E_SKIP_DOCKER=1` limits it to the host checks. Phase 2 repeats the flow with the generated PostgreSQL
 Compose development profile, validates health-based startup, migrations,
 persistence across application restart, and teardown without treating Compose as a
-production configuration.
+production configuration. Phase 3 extends the database path with distinct
+migration/runtime credentials and negative RLS checks: migration commands reject
+runtime-only configuration, the serving process receives only the runtime URL,
+the runtime role has no DDL authority, missing tenant settings deny visibility,
+and two-tenant reads/writes remain isolated.
 
 ## Concurrency correctness
 

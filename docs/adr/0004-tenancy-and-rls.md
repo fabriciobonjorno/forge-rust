@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-26
-- Refined by: [ADR 0010](0010-session-and-tenant-authorization-context.md)
+- Refined by: [ADR 0010](0010-session-and-tenant-authorization-context.md), [ADR 0011](0011-postgresql-runtime-migration-roles-and-rls-context.md)
 
 ## Context
 

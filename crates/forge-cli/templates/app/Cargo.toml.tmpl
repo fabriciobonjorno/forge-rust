@@ -16,6 +16,7 @@ path = "src/main.rs"
 forge = %%FORGE_DEPENDENCY%%
 serde = { version = "1", features = ["derive"] }
 %%if database%%
+async-trait = "0.1"
 sqlx = { version = "0.9", default-features = false, features = ["chrono", "json", "macros", "migrate", "%%DATABASE_DRIVER%%", "runtime-tokio", "tls-rustls-ring-webpki", "uuid"] }
 %%end%%
 

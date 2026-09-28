@@ -221,8 +221,10 @@ impl App {
             return config_error(&error);
         }
 
-        let Some(url) = config.database.url else {
-            write_stderr("error: FORGE_DATABASE_URL is required for database commands\n");
+        let Some(url) = config.database.migration_url else {
+            write_stderr(
+                "error: FORGE_MIGRATION_DATABASE_URL is required for database commands\n",
+            );
             return ExitCode::from(EXIT_CONFIG);
         };
 

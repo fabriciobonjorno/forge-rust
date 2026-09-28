@@ -26,6 +26,7 @@ mod logging;
 mod probe;
 mod signal;
 
+pub use forge_audit as audit;
 pub use forge_auth as auth;
 pub use forge_config as config;
 pub use forge_core as core;

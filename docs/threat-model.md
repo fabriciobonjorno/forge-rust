@@ -142,6 +142,34 @@ and generated diagnostic bundles. Secret access is capability-scoped and audited
 - Models can produce unsafe content even when system access is denied. Product
   policy and output moderation are application concerns exposed through hooks.
 
+## Phase 3 review: identity and PostgreSQL tenant isolation
+
+Review date: 2026-09-27.
+
+The first Phase 3 slices implement typed authenticated principals, deny-by-default
+RBAC, explicit tenant membership/TenantContext, separate PostgreSQL migration and
+runtime roles, and transaction-local tenant/principal settings for RLS. The
+long-running runtime role is generated without schema ownership or BYPASSRLS, and
+migration commands require a credential that is distinct from the runtime URL.
+
+`scripts/e2e-generated-app.sh` is the linked negative integration test for the
+database boundary. It verifies that the runtime credential cannot be used for
+migration dispatch, the runtime database role cannot create schema objects,
+missing tenant context sees no RLS-protected rows, one tenant cannot see another
+tenant's row, and a cross-tenant write is rejected.
+
+Append-only audit persistence is now implemented as a separate structured
+security-evidence channel. The generated runtime role can INSERT audit events but
+cannot SELECT, UPDATE, or DELETE them, and a database trigger rejects audit-row
+mutation. This satisfies the restricted append-only writer portion of the audit
+control, not tamper-evident cryptographic integrity or immutable external storage.
+
+Remaining Phase 3 threat-model controls are not claimed complete: password
+hashing/credential throttling, secure cookie and CSRF behavior, persistent session
+revocation, membership persistence, audit integrity chaining/retention and
+privileged reader workflows, administrative cross-tenant role separation, and
+HTTP policy integration still require their own implementation and abuse tests.
+
 ## Review cadence
 
 Update this model when adding a trust boundary, privileged capability, protocol,
