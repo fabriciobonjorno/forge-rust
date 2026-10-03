@@ -150,6 +150,16 @@ monotonic revocation, membership state persists independently from session
 credentials, runtime password rehash updates are restricted to hash metadata
 with stale versions rejected, and the PostgreSQL login throttle serializes
 parallel reservations so the attempt ceiling cannot be exceeded.
+The generated `tests/auth_logout.rs` is explicitly run with `--ignored` against
+the same disposable database and both role URLs. It exercises real HTTP logout
+and PostgreSQL transactions: duplicate session cookies/CSRF headers, missing or
+wrong CSRF, expired/revoked sessions, disabled principals, a disable after initial
+authentication, atomic audit-write rejection/rollback, concurrent logout, generic
+unavailable responses, cookie removal, and secret-free audit attribution.
+Framework runtime tests additionally cover asynchronous setup success/failure,
+duplicate registrations, total deadlines, resource drop, shutdown cancellation,
+and informational-command isolation. Host E2E proves missing serving credentials
+abort startup and the composition root registers the logout endpoint.
 
 ## Concurrency correctness
 

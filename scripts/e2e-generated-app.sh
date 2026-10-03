@@ -212,6 +212,10 @@ RS
   FORGE_DATABASE_URL="$runtime_database_url" \
     cargo test --quiet --locked --test forge_login_throttle_e2e
 
+  FORGE_DATABASE_URL="$runtime_database_url" \
+    FORGE_MIGRATION_DATABASE_URL="$migration_database_url" \
+    cargo test --quiet --locked --test auth_logout -- --ignored
+
   audit_id="01941f29-7c00-7000-8000-000000000010"
   docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app -v ON_ERROR_STOP=1 -c "
     INSERT INTO forge_audit_events (
@@ -438,12 +442,23 @@ port="$(free_port)"
 env_args=(FORGE_BIND="127.0.0.1:$port" FORGE_SHUTDOWN_GRACE_SECS=5)
 if [[ -n "$runtime_database_url" ]]; then
   env_args+=(FORGE_DATABASE_URL="$runtime_database_url")
+  if env -u FORGE_DATABASE_URL -u FORGE_MIGRATION_DATABASE_URL \
+    FORGE_BIND="127.0.0.1:$port" "target/debug/$app_name" serve >/dev/null 2>&1; then
+    fail "database-enabled serving must reject missing runtime credentials"
+  fi
+  env -u FORGE_DATABASE_URL -u FORGE_MIGRATION_DATABASE_URL \
+    "target/debug/$app_name" version >/dev/null || fail "version must not run database setup"
 fi
 env "${env_args[@]}" "target/debug/$app_name" &
 server_pid=$!
 wait_for_http "http://127.0.0.1:$port/health/live"
 curl --silent --fail "http://127.0.0.1:$port/health/ready" | grep -q '"ready"' || fail "readiness body"
 curl --silent --fail "http://127.0.0.1:$port/" | grep -q "\"application\":\"$app_name\"" || fail "index route"
+if [[ -n "$runtime_database_url" ]]; then
+  [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    --request POST "http://127.0.0.1:$port/auth/logout")" == 401 ]] \
+    || fail "bootstrap must compose the authenticated logout route"
+fi
 [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:$port/missing")" == 404 ]]   || fail "unknown route must return 404"
 env "${env_args[@]}" "target/debug/$app_name" healthcheck || fail "healthcheck subcommand"
 if FORGE_BIDN="typo" "target/debug/$app_name" healthcheck 2>/dev/null; then

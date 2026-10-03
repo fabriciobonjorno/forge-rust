@@ -30,8 +30,17 @@ const EXIT_CONFIG: u8 = 78;
 /// Upper bound for runtime teardown after the server has already drained.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const UNKNOWN_VERSION: &str = "unknown";
+const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 type RouteRegistration = Box<dyn FnOnce(&mut Router) -> Result<(), RouteError> + Send + 'static>;
+type SetupFuture = Pin<
+    Box<
+        dyn Future<Output = Result<RouteRegistration, Box<dyn Error + Send + Sync>>>
+            + Send
+            + 'static,
+    >,
+>;
+type SetupHandler = Box<dyn FnOnce(AppConfig) -> SetupFuture + Send + 'static>;
 type DatabaseCommandFuture =
     Pin<Box<dyn Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send + 'static>>;
 type DatabaseCommandHandler =
@@ -47,6 +56,8 @@ pub struct App {
     name: &'static str,
     version: &'static str,
     registrations: Vec<RouteRegistration>,
+    setups: Vec<SetupHandler>,
+    startup_timeout: Duration,
     migrate: Option<DatabaseCommandHandler>,
     rollback: Option<DatabaseCommandHandler>,
 }
@@ -58,6 +69,8 @@ impl fmt::Debug for App {
             .field("name", &self.name)
             .field("version", &self.version)
             .field("route_registrations", &self.registrations.len())
+            .field("async_setups", &self.setups.len())
+            .field("startup_timeout", &self.startup_timeout)
             .field("database_migrations", &self.migrate.is_some())
             .finish()
     }
@@ -73,6 +86,8 @@ impl App {
             name,
             version: UNKNOWN_VERSION,
             registrations: Vec::new(),
+            setups: Vec::new(),
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             migrate: None,
             rollback: None,
         }
@@ -98,6 +113,39 @@ impl App {
         register: impl FnOnce(&mut Router) -> Result<(), RouteError> + Send + 'static,
     ) -> Self {
         self.registrations.push(Box::new(register));
+        self
+    }
+
+    /// Initializes application resources inside the owned runtime, then registers
+    /// routes using those resources. Runs only for `serve`, after synchronous
+    /// registrations and before binding the listener. Failure aborts startup.
+    ///
+    /// Setup handlers run sequentially under one deadline and are cancelled on
+    /// shutdown. Resources should be captured by the returned registration so
+    /// their lifetime follows the router and its handlers.
+    #[must_use]
+    pub fn setup<F, Fut, R, E>(mut self, initialize: F) -> Self
+    where
+        F: FnOnce(AppConfig) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<R, E>> + Send + 'static,
+        R: FnOnce(&mut Router) -> Result<(), RouteError> + Send + 'static,
+        E: Error + Send + Sync + 'static,
+    {
+        self.setups.push(Box::new(move |config| {
+            Box::pin(async move {
+                initialize(config)
+                    .await
+                    .map(|register| Box::new(register) as RouteRegistration)
+                    .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+            })
+        }));
+        self
+    }
+
+    /// Sets the total asynchronous setup deadline (default: 30 seconds).
+    #[must_use]
+    pub fn startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = timeout;
         self
     }
 
@@ -167,6 +215,8 @@ impl App {
             name,
             version,
             registrations,
+            setups,
+            startup_timeout,
             migrate: _,
             rollback: _,
         } = self;
@@ -179,14 +229,6 @@ impl App {
             return config_error(&error);
         }
 
-        let router = match build_router(registrations) {
-            Ok(router) => router,
-            Err(error) => {
-                error!(app = name, error = %ErrorChain(&error), "failed to register routes");
-                return ExitCode::FAILURE;
-            }
-        };
-
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -198,7 +240,14 @@ impl App {
             }
         };
 
-        let result = runtime.block_on(serve_until_signal(name, version, config, router));
+        let result = runtime.block_on(serve_until_signal(
+            name,
+            version,
+            config,
+            registrations,
+            setups,
+            startup_timeout,
+        ));
         runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
         match result {
@@ -292,6 +341,12 @@ fn build_router(registrations: Vec<RouteRegistration>) -> Result<Router, RouteEr
 /// Failure while running the `serve` command.
 #[derive(Debug, Error)]
 enum ServeError {
+    #[error("failed to register routes")]
+    Routes(#[from] RouteError),
+    #[error("application setup failed")]
+    Setup(#[source] Box<dyn Error + Send + Sync>),
+    #[error("application setup exceeded its deadline")]
+    SetupTimeout,
     #[error("failed to install shutdown signal handlers")]
     Signal(#[source] io::Error),
     #[error("failed to bind HTTP listener on {address}")]
@@ -304,13 +359,44 @@ enum ServeError {
     Server(#[from] ServerError),
 }
 
+async fn initialize_router(
+    config: AppConfig,
+    registrations: Vec<RouteRegistration>,
+    setups: Vec<SetupHandler>,
+    timeout: Duration,
+) -> Result<Router, ServeError> {
+    tokio::time::timeout(timeout, async move {
+        let mut router = build_router(registrations)?;
+        for initialize in setups {
+            let register = initialize(config.clone())
+                .await
+                .map_err(ServeError::Setup)?;
+            register(&mut router)?;
+        }
+        Ok(router)
+    })
+    .await
+    .map_err(|_| ServeError::SetupTimeout)?
+}
+
 async fn serve_until_signal(
     name: &'static str,
     version: &'static str,
     config: AppConfig,
-    router: Router,
+    registrations: Vec<RouteRegistration>,
+    setups: Vec<SetupHandler>,
+    startup_timeout: Duration,
 ) -> Result<(), ServeError> {
-    let signal = signal::shutdown_signal().map_err(ServeError::Signal)?;
+    let mut signal = Box::pin(signal::shutdown_signal().map_err(ServeError::Signal)?);
+    let Some(router) = initialize_until_shutdown(
+        initialize_router(config.clone(), registrations, setups, startup_timeout),
+        signal.as_mut(),
+    )
+    .await?
+    else {
+        info!(app = name, "shutdown during application setup");
+        return Ok(());
+    };
     let bind = config.server.bind;
     let listener = TcpListener::bind(bind)
         .await
@@ -335,6 +421,17 @@ async fn serve_until_signal(
         .serve(listener, shutdown)
         .await?;
     Ok(())
+}
+
+async fn initialize_until_shutdown(
+    initialization: impl Future<Output = Result<Router, ServeError>>,
+    shutdown: impl Future<Output = &'static str>,
+) -> Result<Option<Router>, ServeError> {
+    tokio::select! {
+        biased;
+        _ = shutdown => Ok(None),
+        result = initialization => result.map(Some),
+    }
 }
 
 fn environment_name(environment: Environment) -> &'static str {
@@ -494,6 +591,121 @@ mod tests {
         let router = build_router(app.registrations).expect("routes must register");
 
         assert!(format!("{router:?}").contains("\"GET /\""));
+    }
+
+    #[tokio::test]
+    async fn setup_runs_in_runtime_and_registers_routes_after_initialization() {
+        let app = App::new("demo").setup(|config| async move {
+            assert_eq!(config.environment, Environment::Development);
+            tokio::task::yield_now().await;
+            Ok::<_, io::Error>(register_index)
+        });
+        let router = initialize_router(
+            AppConfig::default(),
+            app.registrations,
+            app.setups,
+            app.startup_timeout,
+        )
+        .await
+        .expect("setup should succeed");
+        let routes = format!("{router:?}");
+        assert!(routes.contains("GET /health/live"));
+        assert!(routes.contains("\"GET /\""));
+    }
+
+    #[tokio::test]
+    async fn setup_errors_and_duplicate_routes_abort_initialization() {
+        let app = App::new("demo").setup(|_| async {
+            Err::<fn(&mut Router) -> Result<(), RouteError>, _>(io::Error::other("setup failed"))
+        });
+        assert!(matches!(
+            initialize_router(
+                AppConfig::default(),
+                app.registrations,
+                app.setups,
+                app.startup_timeout
+            )
+            .await,
+            Err(ServeError::Setup(_))
+        ));
+        let app = App::new("demo")
+            .routes(register_index)
+            .setup(|_| async { Ok::<_, io::Error>(register_index) });
+        assert!(matches!(
+            initialize_router(
+                AppConfig::default(),
+                app.registrations,
+                app.setups,
+                app.startup_timeout
+            )
+            .await,
+            Err(ServeError::Routes(RouteError::Duplicate { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn setup_deadline_drops_owned_resources() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct OwnedResource(Arc<AtomicBool>);
+        impl Drop for OwnedResource {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let resource = OwnedResource(Arc::clone(&dropped));
+        let app = App::new("demo")
+            .startup_timeout(Duration::from_millis(1))
+            .setup(|_| async move {
+                let _resource = resource;
+                std::future::pending::<
+                        Result<fn(&mut Router) -> Result<(), RouteError>, io::Error>,
+                    >()
+                    .await
+            });
+        assert!(matches!(
+            initialize_router(
+                AppConfig::default(),
+                app.registrations,
+                app.setups,
+                app.startup_timeout
+            )
+            .await,
+            Err(ServeError::SetupTimeout)
+        ));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_setup_before_a_router_can_be_served() {
+        let result = initialize_until_shutdown(
+            std::future::pending::<Result<Router, ServeError>>(),
+            async { "shutdown" },
+        )
+        .await
+        .expect("shutdown should succeed");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn informational_commands_do_not_run_setup() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&called);
+        let code = App::new("demo")
+            .setup(move |_| async move {
+                observed.store(true, Ordering::SeqCst);
+                Ok::<_, io::Error>(register_index)
+            })
+            .run_with_args(args(&["version"]));
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(!called.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -78,6 +78,35 @@ reverse proxies that sanitize and append the observed upstream address to
 `X-Forwarded-For`; use `/32` or `/128` for one address. The client IP is
 resolved right-to-left through trusted hops and falls back to the TCP peer
 when no forwarding header is present.
+%%if database%%
+
+## Authentication: logout
+
+Serving requires `FORGE_DATABASE_URL` and applied identity/audit migrations.
+Bootstrap opens a bounded runtime pool and checks required storage before binding
+the listener. Setup runs only for `serve`; migration and informational commands
+remain independent. The default setup deadline is 30 seconds, configurable in
+bootstrap with `App::startup_timeout`.
+
+`POST /auth/logout` accepts an empty body and requires both the
+`__Host-forge_session` cookie and exactly one `x-csrf-token` header. It returns
+204 with a secure host-only removal cookie after revocation and its success
+audit record commit together. Every logout handler response is `Cache-Control: no-store`.
+Missing/invalid/expired/revoked sessions or disabled principals return 401;
+invalid CSRF returns 403; storage/audit failure returns 503. Rejected audit writes
+roll back revocation. An interrupted commit can have an unknown outcome; a retry
+of an already revoked session returns 401.
+
+The route is composed in `src/bootstrap`, decoded in `src/adapters/http`,
+orchestrated in `src/application/logout.rs` and persisted through its port in
+`src/infrastructure/logout.rs`. Login issuance and tenant selection remain
+application-specific work built from the generated mechanisms.
+
+The ignored `tests/auth_logout.rs` requires a disposable, migrated PostgreSQL
+database. Set both role URLs and run
+`cargo test --test auth_logout -- --ignored`. It is also exercised by the
+framework's generated-app E2E script.
+%%end%%
 
 %%if docker%%
 ## Container

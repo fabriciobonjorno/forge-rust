@@ -6,6 +6,9 @@ pub mod auth;
 %%end%%
 pub mod cache;
 pub mod database;
+%%if database%%
+pub mod logout;
+%%end%%
 pub mod queue;
 pub mod security;
 pub mod telemetry;

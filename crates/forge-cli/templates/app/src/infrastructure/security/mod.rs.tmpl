@@ -479,18 +479,23 @@ pub fn session_remove_cookie() -> String {
 pub fn session_from_cookie_header(
     header_value: &str,
 ) -> Result<Option<SessionBearerToken>, SecurityMechanismError> {
+    let mut bearer = None;
     for parsed in Cookie::split_parse(header_value) {
         let cookie = match parsed {
             Ok(cookie) => cookie,
             Err(_) => continue,
         };
         if cookie.name() == SESSION_COOKIE_NAME {
-            return SessionBearerToken::new(cookie.value().to_owned())
-                .map(Some)
-                .map_err(|_| SecurityMechanismError::InvalidSessionCookie);
+            if bearer.is_some() {
+                return Err(SecurityMechanismError::InvalidSessionCookie);
+            }
+            bearer = Some(
+                SessionBearerToken::new(cookie.value().to_owned())
+                    .map_err(|_| SecurityMechanismError::InvalidSessionCookie)?,
+            );
         }
     }
-    Ok(None)
+    Ok(bearer)
 }
 
 /// Parses a CSRF header into the canonical token type.
@@ -774,5 +779,13 @@ mod tests {
             session_from_cookie_header("__Host-forge_session=short"),
             Err(SecurityMechanismError::InvalidSessionCookie)
         );
+        for second in [token.as_str(), "short"] {
+            let duplicate =
+                format!("{SESSION_COOKIE_NAME}={token}; {SESSION_COOKIE_NAME}={second}");
+            assert_eq!(
+                session_from_cookie_header(&duplicate),
+                Err(SecurityMechanismError::InvalidSessionCookie)
+            );
+        }
     }
 }

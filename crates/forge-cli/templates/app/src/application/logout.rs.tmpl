@@ -1,0 +1,65 @@
+//! Session revocation with mandatory, atomic security evidence.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use forge::audit::{AuditAction, AuditActor, AuditEvent, AuditLink, AuditOutcome};
+use forge::auth::{AuthenticatedPrincipal, UnixTimestamp};
+
+/// Transaction boundary: persist revocation and its audit event together.
+#[async_trait]
+pub trait LogoutStore: Send + Sync {
+    /// Revalidates the enabled principal and active session, then atomically
+    /// revokes it and appends the supplied event. A rejected audit
+    /// write rolls back revocation; an interrupted commit can have an unknown
+    /// outcome, but never persist only one of the two changes.
+    async fn revoke_with_audit(
+        &self,
+        authenticated: AuthenticatedPrincipal,
+        now: UnixTimestamp,
+        event: &AuditEvent,
+    ) -> Result<(), LogoutError>;
+}
+
+/// Application use case; storage mechanisms stay outside this ring.
+pub struct Logout {
+    store: Arc<dyn LogoutStore>,
+}
+
+impl Logout {
+    #[must_use]
+    pub fn new(store: Arc<dyn LogoutStore>) -> Self {
+        Self { store }
+    }
+
+    /// Records only trusted identity and correlation metadata, never credentials.
+    pub async fn execute(
+        &self,
+        authenticated: AuthenticatedPrincipal,
+        now: UnixTimestamp,
+        request_link: AuditLink,
+    ) -> Result<(), LogoutError> {
+        let action = AuditAction::new("session.logout").map_err(|_| LogoutError::Unavailable)?;
+        let event = AuditEvent::new(
+            now,
+            AuditActor::Principal(authenticated.principal_id()),
+            None,
+            action,
+            AuditOutcome::Succeeded,
+        )
+        .with_request_link(request_link);
+
+        self.store
+            .revoke_with_audit(authenticated, now, &event)
+            .await
+    }
+}
+
+/// Safe public failure without persistence or credential details.
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum LogoutError {
+    #[error("invalid session")]
+    InvalidSession,
+    #[error("authentication unavailable")]
+    Unavailable,
+}

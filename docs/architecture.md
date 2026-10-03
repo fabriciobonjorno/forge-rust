@@ -9,8 +9,10 @@ membership and authorized TenantContext contracts, least-privilege PostgreSQL/RL
 digest-only persistent sessions, Argon2id password verification, opaque
 session/CSRF secrets, secure cookie helpers, and append-only audit persistence
 are implemented, including optimistic Argon2id rehash-on-policy-upgrade and
-durable login/origin throttling before password verification. Turnkey HTTP auth
-route composition and stronger audit integrity/retention controls remain open.
+durable login/origin throttling before password verification. Explicit
+trusted-proxy client addresses and an atomic, CSRF-protected HTTP logout route
+are implemented. HTTP login/tenant-selection composition and stronger audit
+integrity/retention controls remain open.
 
 Forge is an opinionated Rust application framework for long-lived services. Its
 value is the integration of explicit application architecture, secure defaults,
@@ -154,6 +156,15 @@ supervisor, stops accepting new work on shutdown, drains work up to a configured
 deadline, and then cancels remaining tasks. Task spawning is exposed through a
 supervisor that requires a name and shutdown behavior. Detached tasks and
 unbounded channels are not part of the public API.
+
+`App::setup` provides the implemented composition hook for asynchronous
+resources. It receives validated `AppConfig`, initializes within the owned
+runtime, and returns a route registration closure that captures those resources.
+Synchronous routes run first; setup handlers then run sequentially before
+listener binding. A total startup deadline and installed shutdown signal bound
+initialization. Database-enabled generated applications use it for the runtime
+pool and their authenticated logout route; errors prevent readiness. See
+[ADR 0017](adr/0017-atomic-http-logout-and-async-composition.md).
 
 ### Typed identifiers and errors
 

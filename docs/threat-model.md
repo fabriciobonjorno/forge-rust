@@ -144,7 +144,7 @@ and generated diagnostic bundles. Secret access is capability-scoped and audited
 
 ## Phase 3 review: identity and PostgreSQL tenant isolation
 
-Review date: 2026-09-27.
+Review date: 2026-09-30.
 
 The implemented Phase 3 slices provide typed authenticated principals,
 deny-by-default RBAC, explicit tenant membership/TenantContext, separate
@@ -168,14 +168,24 @@ upgrades do not overwrite newer state. A dedicated generated-app integration tes
 fires concurrent attempts through the PostgreSQL throttle adapter and verifies
 the configured budget, blocking window, expiry and clear semantics.
 
+Database-enabled generated applications now compose `POST /auth/logout` before
+binding the listener. The route requires an unambiguous session cookie and one
+matching CSRF header, rejects disabled principals, and delegates to an application
+port that commits revocation and its success audit event in one PostgreSQL
+transaction. Session/principal locks and revalidation reject stale proofs after
+revocation or disable. Audit-write failure rolls back revocation. The generated
+`tests/auth_logout.rs` integration test verifies these boundaries, including
+concurrent logout, unavailable storage, and audit rejection. Successful audit
+records contain trusted identity and a server-generated request link, no tokens.
+
 Append-only audit persistence remains a separate structured security-evidence
 channel. The generated runtime role can INSERT audit events but cannot SELECT,
 UPDATE, or DELETE them, and a database trigger rejects audit-row mutation. This
 does not claim tamper-evident cryptographic integrity or immutable external
 storage.
 
-Remaining Phase 3 threat-model controls are not claimed complete: turnkey HTTP
-login/logout/tenant-selection composition, trusted-proxy client-address policy,
+Remaining Phase 3 threat-model controls are not claimed complete: HTTP
+login/tenant-selection composition, exhaustive rejected-request audit coverage,
 audit integrity chaining/retention and privileged reader workflows, and
 administrative cross-tenant role separation still require implementation and
 abuse tests.

@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-27
+- Refined by: [ADR 0017](0017-atomic-http-logout-and-async-composition.md)
 
 ## Context
 

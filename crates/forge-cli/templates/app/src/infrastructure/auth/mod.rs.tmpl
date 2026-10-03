@@ -11,7 +11,7 @@ use forge::auth::{
     SessionCredentialDigest, SessionId, SessionStore, SessionStoreError, UnixTimestamp,
 };
 use forge::security::PrincipalId;
-use sqlx::{PgPool, Postgres, Transaction, types::Uuid};
+use sqlx::{Executor, PgPool, Postgres, Transaction, types::Uuid};
 
 /// SQLx-backed password credential lookup.
 ///
@@ -339,13 +339,14 @@ impl SessionStore for PostgresSessionStore {
     ) -> Result<Option<Session>, SessionStoreError> {
         let row = sqlx::query_as::<_, (Uuid, Uuid, i64, i64, Option<i64>)>(
             "SELECT
-                id,
-                principal_id,
-                EXTRACT(EPOCH FROM issued_at)::bigint,
-                EXTRACT(EPOCH FROM expires_at)::bigint,
-                EXTRACT(EPOCH FROM revoked_at)::bigint
-             FROM forge_sessions
-             WHERE credential_digest = $1
+                s.id,
+                s.principal_id,
+                EXTRACT(EPOCH FROM s.issued_at)::bigint,
+                EXTRACT(EPOCH FROM s.expires_at)::bigint,
+                EXTRACT(EPOCH FROM s.revoked_at)::bigint
+             FROM forge_sessions s
+             JOIN forge_principals p ON p.id = s.principal_id
+             WHERE s.credential_digest = $1 AND p.disabled_at IS NULL
              LIMIT 1",
         )
         .bind(credential.as_bytes().as_slice())
@@ -364,11 +365,14 @@ impl SessionStore for PostgresSessionStore {
         let matched = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (
                 SELECT 1
-                FROM forge_sessions
-                WHERE id = $1
-                  AND csrf_digest = $2
-                  AND revoked_at IS NULL
-                  AND expires_at > now()
+                FROM forge_sessions s
+                JOIN forge_principals p ON p.id = s.principal_id
+                WHERE s.id = $1
+                  AND s.csrf_digest = $2
+                  AND s.revoked_at IS NULL
+                  AND s.issued_at <= now()
+                  AND s.expires_at > now()
+                  AND p.disabled_at IS NULL
              )",
         )
         .bind(session_id.into_uuid())
@@ -385,27 +389,7 @@ impl SessionStore for PostgresSessionStore {
         session_id: SessionId,
         revoked_at: UnixTimestamp,
     ) -> Result<(), SessionStoreError> {
-        let revoked_at = timestamp_to_i64(revoked_at)?;
-        let result = sqlx::query(
-            "UPDATE forge_sessions
-             SET revoked_at = LEAST(
-                 COALESCE(revoked_at, to_timestamp($2::double precision)),
-                 to_timestamp($2::double precision)
-             )
-             WHERE id = $1
-               AND issued_at <= to_timestamp($2::double precision)",
-        )
-        .bind(session_id.into_uuid())
-        .bind(revoked_at)
-        .execute(&self.pool)
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if result.rows_affected() == 1 {
-            Ok(())
-        } else {
-            Err(SessionStoreError::Conflict)
-        }
+        revoke_with(&self.pool, session_id, revoked_at).await
     }
 
     async fn rotate(
@@ -474,7 +458,38 @@ impl SessionStore for PostgresSessionStore {
     }
 }
 
-fn restore_session(
+pub(crate) async fn revoke_with<'e, E>(
+    executor: E,
+    session_id: SessionId,
+    revoked_at: UnixTimestamp,
+) -> Result<(), SessionStoreError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let revoked_at = timestamp_to_i64(revoked_at)?;
+    let result = sqlx::query(
+        "UPDATE forge_sessions
+         SET revoked_at = LEAST(
+             COALESCE(revoked_at, to_timestamp($2::double precision)),
+             to_timestamp($2::double precision)
+         )
+         WHERE id = $1
+           AND issued_at <= to_timestamp($2::double precision)",
+    )
+    .bind(session_id.into_uuid())
+    .bind(revoked_at)
+    .execute(executor)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    if result.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(SessionStoreError::Conflict)
+    }
+}
+
+pub(crate) fn restore_session(
     (id, principal_id, issued_at, expires_at, revoked_at): (Uuid, Uuid, i64, i64, Option<i64>),
 ) -> Result<Session, SessionStoreError> {
     let id = SessionId::from_uuid(id).map_err(|_| SessionStoreError::CorruptRecord)?;
