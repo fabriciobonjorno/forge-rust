@@ -17,6 +17,12 @@ checks, host serving and Docker lifecycle checks. This verifies that slice, not
 Phase 3 or production certification. HTTP login, tenant selection and stronger
 audit controls remain open.
 
+Session rotation now revalidates the enabled principal, preserves identity and
+requires an active replacement under transactional row locks. Before exposing
+HTTP login, retain a version-bound password proof through issuance, atomically
+persist its success audit, define pre-session CSRF protection and bound Argon2
+concurrency. Rotation alone does not solve those login requirements.
+
 Performance numbers are [measurement budgets](performance-targets.md), not results.
 Remote job failures before runner steps execute do not establish code failures or
 successful validation. Retain local command results while the billing-related

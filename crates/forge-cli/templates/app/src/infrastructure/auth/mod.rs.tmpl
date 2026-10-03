@@ -400,12 +400,32 @@ impl SessionStore for PostgresSessionStore {
         replacement_credential: &SessionCredentialDigest,
         replacement_csrf: &CsrfTokenDigest,
     ) -> Result<(), SessionStoreError> {
+        replacement
+            .authenticate(revoked_at)
+            .map_err(|_| SessionStoreError::Conflict)?;
         let revoked_at = timestamp_to_i64(revoked_at)?;
         let issued_at = timestamp_to_i64(replacement.issued_at())?;
         let expires_at = timestamp_to_i64(replacement.expires_at())?;
         let replacement_revoked_at = replacement.revoked_at().map(timestamp_to_i64).transpose()?;
 
         let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
+
+        // Rotation cannot transfer identity or revive a disabled principal.
+        // Lock both records so disable, logout and competing rotations serialize.
+        let principal = sqlx::query_scalar::<_, Uuid>(
+            "SELECT s.principal_id
+             FROM forge_sessions s
+             JOIN forge_principals p ON p.id = s.principal_id
+             WHERE s.id = $1 AND p.disabled_at IS NULL
+             FOR UPDATE OF s, p",
+        )
+        .bind(previous_session_id.into_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(map_sqlx_error)?;
+        if principal != Some(replacement.principal_id().into_uuid()) {
+            return Err(SessionStoreError::Conflict);
+        }
 
         let updated = sqlx::query(
             "UPDATE forge_sessions

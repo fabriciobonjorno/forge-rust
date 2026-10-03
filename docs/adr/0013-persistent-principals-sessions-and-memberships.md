@@ -30,6 +30,13 @@ The framework `SessionStore` resolves sessions by bearer digest, records
 revocation, validates persisted lifecycle invariants, and rotates sessions
 atomically. The generated SQLx adapter never accepts or persists the raw bearer.
 
+Rotation locks the previous session and its principal in one transaction. It
+requires an enabled principal, an active previous session, the same principal
+on the replacement, and a replacement active at the rotation timestamp.
+Rejection or an insert failure leaves the previous record unchanged; competing
+rotations cannot commit multiple replacements. This does not establish a fresh
+password-verification proof and must not be used as a login issuance shortcut.
+
 The generated membership adapter resolves current roles independently from the
 session. Authorization still requires an `AuthenticatedPrincipal`, matching
 membership, and explicit RBAC decision before a `TenantContext` exists.
