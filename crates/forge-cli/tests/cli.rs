@@ -43,6 +43,8 @@ fn new_generates_a_dockerized_application() {
     assert!(root.join("src/application/logout.rs").is_file());
     assert!(root.join("tests/auth_logout.rs").is_file());
     assert!(root.join("tests/session_rotation.rs").is_file());
+    assert!(root.join("tests/auth_login_session.rs").is_file());
+    assert!(root.join("src/application/login.rs").is_file());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Created Forge application `shop`"));
@@ -97,6 +99,8 @@ fn skip_database_omits_postgres_and_migration_assets() {
     assert!(!root.join("src/adapters/http/auth.rs").exists());
     assert!(!root.join("tests/auth_logout.rs").exists());
     assert!(!root.join("tests/session_rotation.rs").exists());
+    assert!(!root.join("tests/auth_login_session.rs").exists());
+    assert!(!root.join("src/application/login.rs").exists());
 }
 
 #[test]

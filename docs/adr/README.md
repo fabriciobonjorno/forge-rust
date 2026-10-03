@@ -23,6 +23,7 @@ does not mean implementation exists.
 | [0015](0015-login-and-origin-credential-throttling.md) | Durable login and origin credential throttling | Accepted |
 | [0016](0016-explicit-trusted-proxy-client-addresses.md) | Explicit trusted-proxy client address resolution | Accepted |
 | [0017](0017-atomic-http-logout-and-async-composition.md) | Atomic HTTP logout and asynchronous composition | Accepted |
+| [0018](0018-version-bound-login-session-issuance.md) | Version-bound atomic login session issuance | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to

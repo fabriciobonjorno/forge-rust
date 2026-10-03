@@ -163,6 +163,11 @@ abort startup and the composition root registers the logout endpoint.
 
 ## Concurrency correctness
 
+Generated `tests/auth_login_session.rs` runs explicitly in the PostgreSQL E2E:
+real password verification followed by disable or hash/version mutation must
+persist no session or success audit. It also checks current/rehash issuance,
+digest-only storage and rollback on audit-write rejection.
+
 Rust prevents data races in safe code but not deadlocks, lost wakeups, task leaks,
 bad cancellation, or semantic races. Tests use controlled schedulers/models for
 small synchronization components where appropriate, randomized stress tests,

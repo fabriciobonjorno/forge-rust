@@ -183,7 +183,16 @@ principal. Replacement identity must match and its lifecycle must be active at
 the rotation timestamp. Generated PostgreSQL tests reject identity substitution,
 disable and inactive replacements, verify insertion-failure rollback, and require
 exactly one winner for competing rotations. These controls do not replace a
-version-bound password proof or atomic success audit for future login issuance.
+version-bound password proof or atomic success audit for login issuance.
+
+The generated login issuance path now retains the verified credential version
+and hash, including the replacement after a policy rehash. It revalidates both
+under an enabled-principal row lock and atomically inserts the session and its
+success audit. Hash changes without a version increment are also rejected.
+The proof is trusted in-process data, not a client credential or sandbox against
+malicious application code. HTTP login remains unexposed until pre-session CSRF
+policy and bounded Argon2 work are implemented. Password changes do not yet
+automatically revoke previously issued sessions.
 
 Append-only audit persistence remains a separate structured security-evidence
 channel. The generated runtime role can INSERT audit events but cannot SELECT,

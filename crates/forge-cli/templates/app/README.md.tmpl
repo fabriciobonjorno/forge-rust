@@ -92,6 +92,14 @@ bootstrap with `App::startup_timeout`.
 `__Host-forge_session` cookie and exactly one `x-csrf-token` header. It returns
 204 with a secure host-only removal cookie after revocation and its success
 audit record commit together. Every logout handler response is `Cache-Control: no-store`.
+
+Password-login composition uses `authenticate_password` to obtain a non-cloneable
+verified credential proof, then `issue_authenticated_session` with `LoginSession`
+and `PostgresLoginSessionStore`. The store revalidates enabled state, hash and
+version under a row lock and persists session digests and success audit together.
+Do not substitute `issue_persisted_session`: it is a low-level provisioning/test
+helper without password proof or success audit. HTTP login is not registered yet;
+pre-session CSRF and bounded password concurrency remain pending.
 Missing/invalid/expired/revoked sessions or disabled principals return 401;
 invalid CSRF returns 403; storage/audit failure returns 503. Rejected audit writes
 roll back revocation. An interrupted commit can have an unknown outcome; a retry

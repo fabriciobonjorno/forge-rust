@@ -4,12 +4,15 @@
 //! algorithm parameters, random credential generation, digesting, and HTTP
 //! cookie serialization/parsing.
 
+use crate::application::login::{LoginSession, LoginSessionError, VerifiedPassword};
 use argon2::{
     Algorithm, Argon2, Params, Version,
     password_hash::{PasswordHasher as _, PasswordVerifier as _},
 };
 use async_trait::async_trait;
 use cookie::{Cookie, SameSite};
+use forge::audit::AuditLink;
+use forge::auth::PasswordCredentialVersion;
 use forge::auth::{
     AuthenticatedPrincipal, CsrfToken, CsrfTokenDigest, LoginThrottleDecision, LoginThrottleKey,
     LoginThrottlePolicy, LoginThrottleStore, LoginThrottleStoreError, PasswordCredentialStore,
@@ -169,7 +172,7 @@ pub async fn authenticate_password(
     password: &[u8],
     client_addr: IpAddr,
     now: UnixTimestamp,
-) -> Result<PrincipalId, LoginError> {
+) -> Result<VerifiedPassword, LoginError> {
     let origin_key = origin_throttle_key(client_addr);
     reserve_login_attempt(throttle, &origin_key, now, origin_policy()?).await?;
 
@@ -207,6 +210,8 @@ pub async fn authenticate_password(
         return Err(LoginError::InvalidCredentials);
     }
 
+    let mut proof_version = credential.version();
+    let mut proof_hash = credential.password_hash().clone();
     if hasher
         .needs_rehash(credential.password_hash())
         .map_err(map_password_hash_error)?
@@ -223,6 +228,13 @@ pub async fn authenticate_password(
             )
             .await
             .map_err(map_credential_store_error)?;
+        proof_version = credential
+            .version()
+            .get()
+            .checked_add(1)
+            .and_then(PasswordCredentialVersion::new)
+            .ok_or(LoginError::AuthenticationUnavailable)?;
+        proof_hash = replacement;
     }
 
     throttle
@@ -230,7 +242,11 @@ pub async fn authenticate_password(
         .await
         .map_err(map_throttle_store_error)?;
 
-    Ok(credential.principal_id())
+    Ok(VerifiedPassword::new(
+        credential.principal_id(),
+        proof_version,
+        proof_hash,
+    ))
 }
 
 fn canonical_login(login: &str) -> Option<String> {
@@ -380,6 +396,9 @@ pub struct IssuedSession {
 
 /// Creates and persists a new server-side session.
 ///
+/// Low-level trusted provisioning/test helper, not a password-login API.
+/// Login callers must use issue_authenticated_session with a verified proof.
+///
 /// The database receives only bearer/CSRF digests. The returned bearer should be
 /// sent only through session_set_cookie(); the CSRF token is returned separately
 /// to trusted same-origin client code and must not be put in an HttpOnly cookie.
@@ -401,9 +420,36 @@ pub async fn issue_persisted_session(
     Ok(IssuedSession { session, secrets })
 }
 
+/// Issues a session only after version-bound verification and atomic success audit.
+pub async fn issue_authenticated_session(
+    login: &LoginSession,
+    proof: VerifiedPassword,
+    issued_at: UnixTimestamp,
+    expires_at: UnixTimestamp,
+    link: AuditLink,
+) -> Result<IssuedSession, SessionIssueError> {
+    let session = Session::new(proof.principal_id(), issued_at, expires_at)
+        .map_err(SessionIssueError::Session)?;
+    let secrets = issue_session_secrets().map_err(SessionIssueError::Mechanism)?;
+    login
+        .execute(
+            proof,
+            &session,
+            &secrets.bearer_digest,
+            &secrets.csrf_digest,
+            link,
+        )
+        .await
+        .map_err(SessionIssueError::Login)?;
+    Ok(IssuedSession { session, secrets })
+}
+
 /// Failure while issuing/persisting a session.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionIssueError {
+    /// Verified credential became stale or atomic issuance failed.
+    #[error("authentication could not issue a session")]
+    Login(#[source] LoginSessionError),
     /// Requested lifetime violates session invariants.
     #[error("invalid session")]
     Session(#[source] SessionError),
