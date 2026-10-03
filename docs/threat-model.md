@@ -178,6 +178,13 @@ revocation or disable. Audit-write failure rolls back revocation. The generated
 concurrent logout, unavailable storage, and audit rejection. Successful audit
 records contain trusted identity and a server-generated request link, no tokens.
 
+Session rotation locks and revalidates the previous session and its enabled
+principal. Replacement identity must match and its lifecycle must be active at
+the rotation timestamp. Generated PostgreSQL tests reject identity substitution,
+disable and inactive replacements, verify insertion-failure rollback, and require
+exactly one winner for competing rotations. These controls do not replace a
+version-bound password proof or atomic success audit for future login issuance.
+
 Append-only audit persistence remains a separate structured security-evidence
 channel. The generated runtime role can INSERT audit events but cannot SELECT,
 UPDATE, or DELETE them, and a database trigger rejects audit-row mutation. This

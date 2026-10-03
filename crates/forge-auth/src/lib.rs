@@ -653,7 +653,10 @@ pub trait SessionStore: Send + Sync {
         revoked_at: UnixTimestamp,
     ) -> Result<(), SessionStoreError>;
 
-    /// Atomically revokes one session and inserts its replacement.
+    /// Atomically revokes one active session and inserts its replacement.
+    /// The principal must still be enabled, both sessions must belong to that
+    /// same principal, and the replacement must be active at `revoked_at`.
+    /// A rejected rotation leaves the original session unchanged.
     async fn rotate(
         &self,
         previous_session_id: SessionId,

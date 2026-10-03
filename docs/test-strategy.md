@@ -184,6 +184,11 @@ concurrency tests.
 
 ## Quality gates by change
 
+Generated `tests/session_rotation.rs` runs explicitly with a disposable migrated
+PostgreSQL database in `scripts/e2e-generated-app.sh`. It checks identity
+substitution, disabled principals, inactive replacements, insertion-failure
+rollback and competing rotations, using separate runtime and migration roles.
+
 The canonical commands will be wrapped by `forge` but remain directly runnable:
 
 1. Every change: `cargo fmt --check`, workspace compile/check, targeted tests,
