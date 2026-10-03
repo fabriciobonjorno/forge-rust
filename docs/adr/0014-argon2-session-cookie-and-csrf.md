@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-27
 - Refines: [ADR 0010](0010-session-and-tenant-authorization-context.md), [ADR 0013](0013-persistent-principals-sessions-and-memberships.md)
-- Refined by: [ADR 0015](0015-login-and-origin-credential-throttling.md), [ADR 0017](0017-atomic-http-logout-and-async-composition.md), [ADR 0018](0018-version-bound-login-session-issuance.md)
+- Refined by: [ADR 0015](0015-login-and-origin-credential-throttling.md), [ADR 0017](0017-atomic-http-logout-and-async-composition.md), [ADR 0018](0018-version-bound-login-session-issuance.md), [ADR 0019](0019-bounded-password-work.md)
 
 ## Context
 

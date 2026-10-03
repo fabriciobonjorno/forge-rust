@@ -84,7 +84,9 @@ tenant/principal settings are installed, and cannot write another tenant's row.
 Test password/session lifecycle, Argon2id parameter selection and malformed PHC
 handling, policy-upgrade detection and optimistic rehash conflicts, generic
 credential denial, durable login/origin throttling under concurrent attempts,
-bounded password input, bearer/CSRF entropy
+bounded password input
+and process-wide Argon2 admission (overload, cancellation, panic/recovery and
+stored-parameter ceilings), bearer/CSRF entropy
 and independence, digest-only persistence, cookie flags, session revocation and
 rotation, CSRF safe/unsafe method behavior, RBAC deny-by-default, role changes,
 brute-force/rate limits, CORS, SSRF redirect and address cases, path
