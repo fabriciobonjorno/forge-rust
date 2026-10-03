@@ -1,0 +1,103 @@
+//! Version-bound password proof and atomic session issuance.
+
+use async_trait::async_trait;
+use forge::audit::{AuditAction, AuditActor, AuditEvent, AuditLink, AuditOutcome};
+use forge::auth::{
+    CsrfTokenDigest, PasswordCredentialVersion, PasswordHash, Session, SessionCredentialDigest,
+};
+use forge::security::PrincipalId;
+use std::sync::Arc;
+
+/// In-process evidence produced by the trusted password verifier, not wire input.
+/// Not Clone or Serialize: normal callers consume it during issuance.
+#[derive(Debug)]
+pub struct VerifiedPassword {
+    principal: PrincipalId,
+    version: PasswordCredentialVersion,
+    hash: PasswordHash,
+}
+
+impl VerifiedPassword {
+    pub(crate) fn new(
+        principal: PrincipalId,
+        version: PasswordCredentialVersion,
+        hash: PasswordHash,
+    ) -> Self {
+        Self {
+            principal,
+            version,
+            hash,
+        }
+    }
+    #[must_use]
+    pub fn principal_id(&self) -> PrincipalId {
+        self.principal
+    }
+    pub(crate) fn version(&self) -> PasswordCredentialVersion {
+        self.version
+    }
+    pub(crate) fn hash(&self) -> &PasswordHash {
+        &self.hash
+    }
+}
+
+#[async_trait]
+pub trait LoginSessionStore: Send + Sync {
+    /// Lock and revalidate enabled state, version and hash before atomically
+    /// inserting the session and its success audit. Credential/audit rejection
+    /// persists neither; an interrupted commit can have an unknown outcome,
+    /// but cannot persist only one of the two records.
+    async fn issue_with_audit(
+        &self,
+        proof: &VerifiedPassword,
+        session: &Session,
+        bearer: &SessionCredentialDigest,
+        csrf: &CsrfTokenDigest,
+        event: &AuditEvent,
+    ) -> Result<(), LoginSessionError>;
+}
+
+pub struct LoginSession {
+    store: Arc<dyn LoginSessionStore>,
+}
+
+impl LoginSession {
+    #[must_use]
+    pub fn new(store: Arc<dyn LoginSessionStore>) -> Self {
+        Self { store }
+    }
+
+    pub async fn execute(
+        &self,
+        proof: VerifiedPassword,
+        session: &Session,
+        bearer: &SessionCredentialDigest,
+        csrf: &CsrfTokenDigest,
+        link: AuditLink,
+    ) -> Result<(), LoginSessionError> {
+        if session.principal_id() != proof.principal_id()
+            || session.authenticate(session.issued_at()).is_err()
+        {
+            return Err(LoginSessionError::InvalidCredentials);
+        }
+        let event = AuditEvent::new(
+            session.issued_at(),
+            AuditActor::Principal(proof.principal_id()),
+            None,
+            AuditAction::new("session.login").map_err(|_| LoginSessionError::Unavailable)?,
+            AuditOutcome::Succeeded,
+        )
+        .with_request_link(link);
+        self.store
+            .issue_with_audit(&proof, session, bearer, csrf, &event)
+            .await
+    }
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum LoginSessionError {
+    #[error("invalid credentials")]
+    InvalidCredentials,
+    #[error("authentication unavailable")]
+    Unavailable,
+}

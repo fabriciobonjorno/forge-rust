@@ -19,9 +19,11 @@ audit controls remain open.
 
 Session rotation now revalidates the enabled principal, preserves identity and
 requires an active replacement under transactional row locks. Before exposing
-HTTP login, retain a version-bound password proof through issuance, atomically
-persist its success audit, define pre-session CSRF protection and bound Argon2
-concurrency. Rotation alone does not solve those login requirements.
+HTTP login, define pre-session CSRF protection and bound Argon2 concurrency.
+Version-bound proof and atomic session/success-audit issuance are implemented
+as described in [ADR 0018](adr/0018-version-bound-login-session-issuance.md),
+but do not revoke existing sessions after password changes or expose an HTTP
+login endpoint. Rotation alone does not solve those login requirements.
 
 Performance numbers are [measurement budgets](performance-targets.md), not results.
 Remote job failures before runner steps execute do not establish code failures or

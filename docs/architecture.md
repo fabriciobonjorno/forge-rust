@@ -11,7 +11,8 @@ session/CSRF secrets, secure cookie helpers, and append-only audit persistence
 are implemented, including optimistic Argon2id rehash-on-policy-upgrade and
 durable login/origin throttling before password verification. Explicit
 trusted-proxy client addresses and an atomic, CSRF-protected HTTP logout route
-are implemented. HTTP login/tenant-selection composition and stronger audit
+are implemented, along with version-bound atomic login session/audit issuance
+behind application ports. HTTP login/tenant-selection composition and stronger audit
 integrity/retention controls remain open.
 
 Forge is an opinionated Rust application framework for long-lived services. Its

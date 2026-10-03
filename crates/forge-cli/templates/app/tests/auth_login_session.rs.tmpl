@@ -1,0 +1,213 @@
+//! Requires a disposable migrated PostgreSQL database and separate role URLs.
+//! Run explicitly with --ignored or through the framework E2E script.
+
+use std::{error::Error, sync::Arc};
+
+use app::application::login::{LoginSession, VerifiedPassword};
+use app::infrastructure::{
+    auth::{PostgresLoginThrottleStore, PostgresPasswordCredentialStore},
+    login::PostgresLoginSessionStore,
+    security::{Argon2idPasswordHasher, authenticate_password, issue_authenticated_session},
+};
+use argon2::{Algorithm, Argon2, Params, Version, password_hash::PasswordHasher as _};
+use forge::audit::AuditLink;
+use forge::auth::{PasswordHasher, UnixTimestamp};
+use forge::security::PrincipalId;
+use sqlx::PgPool;
+
+const PASSWORD: &[u8] = b"integration-only-login-password";
+
+#[test]
+#[ignore = "requires a disposable migrated PostgreSQL database"]
+fn login_issuance_revalidates_credentials_and_commits_audit_atomically()
+-> Result<(), Box<dyn Error>> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(exercise())
+}
+
+async fn exercise() -> Result<(), Box<dyn Error>> {
+    let runtime = PgPool::connect(&std::env::var("FORGE_DATABASE_URL")?).await?;
+    let owner = PgPool::connect(&std::env::var("FORGE_MIGRATION_DATABASE_URL")?).await?;
+    let use_case = LoginSession::new(Arc::new(PostgresLoginSessionStore::new(runtime.clone())));
+    let now = UnixTimestamp::from_secs(1_800_000_000);
+    let expiry = UnixTimestamp::from_secs(1_800_003_600);
+    let hash = Argon2idPasswordHasher.hash(PASSWORD).await?;
+
+    let (principal, login) = fixture(&owner, hash.expose()).await?;
+    let verified = verify(&runtime, &login, PASSWORD, now).await?;
+    assert_eq!(verified.principal_id(), principal);
+    let issued = issue_authenticated_session(
+        &use_case,
+        verified,
+        now,
+        expiry,
+        AuditLink::new("login-current-credential")?,
+    )
+    .await?;
+    let (bearer_digest, csrf_digest): (Vec<u8>, Vec<u8>) =
+        sqlx::query_as("SELECT credential_digest, csrf_digest FROM forge_sessions WHERE id = $1")
+            .bind(issued.session.id().into_uuid())
+            .fetch_one(&owner)
+            .await?;
+    // Boolean assertions deliberately avoid printing secrets on failure.
+    assert!(bearer_digest.as_slice() == issued.secrets.bearer_digest.as_bytes());
+    assert!(csrf_digest.as_slice() == issued.secrets.csrf_digest.as_bytes());
+    assert!(bearer_digest.as_slice() != issued.secrets.bearer.expose().as_bytes());
+    assert!(csrf_digest.as_slice() != issued.secrets.csrf.expose().as_bytes());
+    let evidence: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM forge_audit_events WHERE principal_id = $1
+         AND actor_kind = 'principal' AND tenant_id IS NULL
+         AND action = 'session.login' AND outcome = 'succeeded'
+         AND request_link = 'login-current-credential'",
+    )
+    .bind(principal.into_uuid())
+    .fetch_one(&owner)
+    .await?;
+    assert_eq!(evidence, 1);
+
+    let (wrong, login) = fixture(&owner, hash.expose()).await?;
+    assert!(
+        verify(&runtime, &login, b"incorrect-password", now)
+            .await
+            .is_err()
+    );
+    assert_no_issuance(&owner, wrong).await?;
+
+    // Each mutation happens after real password verification, before issuance.
+    let replacement = Argon2idPasswordHasher.hash(b"changed-password").await?;
+    for (mutation, replaces_hash) in [
+        (
+            "UPDATE forge_principals SET disabled_at = clock_timestamp() WHERE id = $1",
+            false,
+        ),
+        (
+            "UPDATE forge_principals SET password_hash = $2, version = version + 1 WHERE id = $1",
+            true,
+        ),
+        (
+            "UPDATE forge_principals SET password_hash = $2 WHERE id = $1",
+            true,
+        ),
+    ] {
+        let (principal, login) = fixture(&owner, hash.expose()).await?;
+        let verified = verify(&runtime, &login, PASSWORD, now).await?;
+        let query = sqlx::query(mutation).bind(principal.into_uuid());
+        let query = if replaces_hash {
+            query.bind(replacement.expose())
+        } else {
+            query
+        };
+        query.execute(&owner).await?;
+        assert!(
+            issue_authenticated_session(
+                &use_case,
+                verified,
+                now,
+                expiry,
+                AuditLink::new("login-stale-credential")?,
+            )
+            .await
+            .is_err()
+        );
+        assert_no_issuance(&owner, principal).await?;
+    }
+
+    // Generate a genuine older-policy PHC hash, not a mutated invalid digest.
+    let older = Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        Params::new(8_192, 1, 1, Some(32))?,
+    )
+    .hash_password(PASSWORD)?
+    .to_string();
+    let (principal, login) = fixture(&owner, &older).await?;
+    let verified = verify(&runtime, &login, PASSWORD, now).await?;
+    let (version, changed): (i64, bool) =
+        sqlx::query_as("SELECT version, password_hash <> $2 FROM forge_principals WHERE id = $1")
+            .bind(principal.into_uuid())
+            .bind(&older)
+            .fetch_one(&owner)
+            .await?;
+    assert_eq!(version, 2);
+    assert!(changed);
+    assert!(
+        issue_authenticated_session(
+            &use_case,
+            verified,
+            now,
+            expiry,
+            AuditLink::new("login-upgraded-credential")?,
+        )
+        .await
+        .is_ok()
+    );
+
+    let (principal, login) = fixture(&owner, hash.expose()).await?;
+    let verified = verify(&runtime, &login, PASSWORD, now).await?;
+    sqlx::query("ALTER TABLE forge_audit_events ADD CONSTRAINT e2e_reject_login CHECK (action <> 'session.login') NOT VALID")
+        .execute(&owner).await?;
+    let rejected = issue_authenticated_session(
+        &use_case,
+        verified,
+        now,
+        expiry,
+        AuditLink::new("login-audit-rollback")?,
+    )
+    .await;
+    // Remove the fault before asserting so a failed assertion cannot leave it installed.
+    sqlx::query("ALTER TABLE forge_audit_events DROP CONSTRAINT e2e_reject_login")
+        .execute(&owner)
+        .await?;
+    assert!(rejected.is_err());
+    assert_no_issuance(&owner, principal).await?;
+    runtime.close().await;
+    owner.close().await;
+    Ok(())
+}
+
+async fn fixture(owner: &PgPool, hash: &str) -> Result<(PrincipalId, String), Box<dyn Error>> {
+    let principal = PrincipalId::new();
+    let login = format!("login-session-{principal}");
+    sqlx::query("INSERT INTO forge_principals (id, login, password_hash) VALUES ($1, $2, $3)")
+        .bind(principal.into_uuid())
+        .bind(&login)
+        .bind(hash)
+        .execute(owner)
+        .await?;
+    Ok((principal, login))
+}
+
+async fn verify(
+    runtime: &PgPool,
+    login: &str,
+    password: &[u8],
+    now: UnixTimestamp,
+) -> Result<VerifiedPassword, Box<dyn Error>> {
+    Ok(authenticate_password(
+        &PostgresPasswordCredentialStore::new(runtime.clone()),
+        &Argon2idPasswordHasher,
+        &PostgresLoginThrottleStore::new(runtime.clone()),
+        login,
+        password,
+        "192.0.2.43".parse()?,
+        now,
+    )
+    .await?)
+}
+
+async fn assert_no_issuance(owner: &PgPool, principal: PrincipalId) -> Result<(), Box<dyn Error>> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM forge_sessions WHERE principal_id = $1)
+         + (SELECT count(*) FROM forge_audit_events WHERE principal_id = $1 AND action = 'session.login')",
+    )
+    .bind(principal.into_uuid())
+    .fetch_one(owner)
+    .await?;
+    assert_eq!(
+        count, 0,
+        "denied issuance persists neither session nor success evidence"
+    );
+    Ok(())
+}
