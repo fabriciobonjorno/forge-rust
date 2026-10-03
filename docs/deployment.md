@@ -142,6 +142,22 @@ observed upstream peer. Forge ignores forwarding headers from all other peers.
 With a trusted peer, malformed or oversized chains are rejected before route
 dispatch; absent headers use the observed TCP peer address.
 
+Database-enabled applications require the runtime database URL for `serve`.
+Their asynchronous setup connects a bounded pool (10 connections, 5-second
+acquisition timeout), verifies identity storage and required audit/mutation
+privileges, and registers `POST /auth/logout` before binding the listener.
+Setup has a total 30-second deadline, configurable with `App::startup_timeout`,
+and is cancelled by shutdown. Missing configuration, unavailable storage or
+missing migrations abort startup. Migration and informational commands do not
+initialize the serving pool.
+
+Logout requires the session cookie, exactly one matching `x-csrf-token`, and an
+empty body. Revocation and `session.logout` success evidence commit together;
+audit-write rejection rolls back revocation. HTTP 204 clears the Secure/HttpOnly
+host-only cookie; 401 denies invalid identity, 403 denies CSRF, and 503 reports
+dependency failure. All logout handler responses prohibit caching. TLS is required for
+browser use of the secure session cookie.
+
 Do not put secrets in the image or in build arguments. Both database URLs contain
 credentials and must come from the deployment platform's secret mechanism.
 Forge's typed configuration redacts them from normal Debug/serialization output,

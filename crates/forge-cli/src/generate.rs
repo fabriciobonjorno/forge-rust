@@ -65,11 +65,14 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Always, "src/lib.rs" => "src/lib.rs.tmpl"),
     template!(Group::Always, "src/domain/mod.rs" => "src/domain/mod.rs.tmpl"),
     template!(Group::Always, "src/application/mod.rs" => "src/application/mod.rs.tmpl"),
+    template!(Group::Database, "src/application/logout.rs" => "src/application/logout.rs.tmpl"),
     template!(Group::Always, "src/adapters/mod.rs" => "src/adapters/mod.rs.tmpl"),
     template!(Group::Always, "src/adapters/http/mod.rs" => "src/adapters/http/mod.rs.tmpl"),
+    template!(Group::Database, "src/adapters/http/auth.rs" => "src/adapters/http/auth.rs.tmpl"),
     template!(Group::Always, "src/infrastructure/mod.rs" => "src/infrastructure/mod.rs.tmpl"),
     template!(Group::Always, "src/bootstrap/mod.rs" => "src/bootstrap/mod.rs.tmpl"),
     template!(Group::Always, "tests/architecture.rs" => "tests/architecture.rs.tmpl"),
+    template!(Group::Database, "tests/auth_logout.rs" => "tests/auth_logout.rs.tmpl"),
     template!(Group::Database, "build.rs" => "build.rs.tmpl"),
     template!(Group::Database, ".gitattributes" => "gitattributes.tmpl"),
     template!(Group::Database, "migrations/.gitkeep" => "migrations/gitkeep.tmpl"),
@@ -105,6 +108,7 @@ const TEMPLATES: &[Template] = &[
         Group::Database,
         "src/infrastructure/auth/mod.rs" => "src/infrastructure/auth/mod.rs.tmpl"
     ),
+    template!(Group::Database, "src/infrastructure/logout.rs" => "src/infrastructure/logout.rs.tmpl"),
     template!(
         Group::Database,
         "src/infrastructure/tenancy/mod.rs" => "src/infrastructure/tenancy/mod.rs.tmpl"

@@ -127,8 +127,13 @@ digests, emits a Secure/HttpOnly/SameSite=Lax `__Host-forge_session` cookie,
 and enforces `x-csrf-token` on unsafe cookie-authenticated methods. Password
 verification also reserves durable login/origin attempt budgets before Argon2id;
 the generated PostgreSQL adapter serializes same-key attempts with advisory
-transaction locks. These mechanisms are infrastructure helpers; Forge does not
-yet impose universal login or logout routes.
+transaction locks. Database-enabled generated applications compose a
+CSRF-protected `POST /auth/logout` route from these helpers. Revocation and its
+success audit commit atomically; HTTP 204 clears the secure cookie. Invalid
+sessions return 401, CSRF denial 403, and persistence/audit failure 503. Serving
+requires the runtime URL and applied migrations; asynchronous setup validates
+storage before the listener opens. Login and tenant selection remain separate
+application adapters. See [ADR 0017](adr/0017-atomic-http-logout-and-async-composition.md).
 
 ### Generated tree
 

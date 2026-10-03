@@ -1,0 +1,283 @@
+//! Uses a disposable migrated PostgreSQL database with separate role URLs.
+//! Run through the framework E2E script or explicitly with --ignored.
+
+use std::{
+    error::Error,
+    net::SocketAddr,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use app::adapters::http::auth::{self, LogoutState};
+use app::application::logout::{Logout, LogoutError};
+use app::infrastructure::{
+    auth::PostgresSessionStore,
+    logout::PostgresLogoutStore,
+    security::{IssuedSession, SESSION_COOKIE_NAME, issue_persisted_session},
+};
+use forge::audit::AuditLink;
+use forge::auth::{SessionStore, UnixTimestamp};
+use forge::config::ServerConfig;
+use forge::http::{Router, Server};
+use forge::security::PrincipalId;
+use sqlx::PgPool;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::oneshot,
+    task::JoinSet,
+};
+
+#[test]
+#[ignore = "requires a disposable migrated PostgreSQL database"]
+fn logout_protocol_and_atomic_audit() -> Result<(), Box<dyn Error>> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(exercise())
+}
+
+async fn exercise() -> Result<(), Box<dyn Error>> {
+    let runtime_pool = PgPool::connect(&std::env::var("FORGE_DATABASE_URL")?).await?;
+    let owner_pool = PgPool::connect(&std::env::var("FORGE_MIGRATION_DATABASE_URL")?).await?;
+    let principal = PrincipalId::new();
+    sqlx::query("INSERT INTO forge_principals (id, login) VALUES ($1, $2)")
+        .bind(principal.into_uuid())
+        .bind(format!("logout-{principal}"))
+        .execute(&owner_pool)
+        .await?;
+    let sessions = Arc::new(PostgresSessionStore::new(runtime_pool.clone()));
+    let state = Arc::new(LogoutState {
+        sessions: sessions.clone(),
+        logout: Logout::new(Arc::new(PostgresLogoutStore::new(runtime_pool.clone()))),
+    });
+    let mut router = Router::new();
+    auth::routes(&mut router, state.clone())?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (stop, stopped) = oneshot::channel();
+    let mut tasks = JoinSet::new();
+    tasks.spawn(async move {
+        Server::new(ServerConfig::default(), router)
+            .serve(listener, async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let now = UnixTimestamp::from_secs(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
+    let active = issue(sessions.as_ref(), principal, now).await?;
+    let cookie = format!(
+        "Cookie: {SESSION_COOKIE_NAME}={}\r\n",
+        active.secrets.bearer.expose()
+    );
+    let csrf = format!("x-csrf-token: {}\r\n", active.secrets.csrf.expose());
+    let valid_headers = format!("{cookie}{csrf}");
+
+    assert_status(&exchange(address, "POST", "", "").await?, 401);
+    assert_status(&exchange(address, "GET", "", "").await?, 405);
+    assert_status(&exchange(address, "POST", &cookie, "").await?, 403);
+    assert_status(
+        &exchange(
+            address,
+            "POST",
+            &format!("{cookie}x-csrf-token: {}\r\n", "00".repeat(32)),
+            "",
+        )
+        .await?,
+        403,
+    );
+    assert_status(
+        &exchange(address, "POST", &format!("{valid_headers}{csrf}"), "").await?,
+        403,
+    );
+    assert_status(
+        &exchange(address, "POST", &format!("{cookie}{cookie}{csrf}"), "").await?,
+        401,
+    );
+    let duplicate_cookie = format!(
+        "Cookie: {SESSION_COOKIE_NAME}={0}; {SESSION_COOKIE_NAME}={0}\r\n{csrf}",
+        active.secrets.bearer.expose()
+    );
+    assert_status(
+        &exchange(address, "POST", &duplicate_cookie, "").await?,
+        401,
+    );
+    assert_status(&exchange(address, "POST", &valid_headers, "{}").await?, 400);
+
+    let expired = issue_persisted_session(
+        sessions.as_ref(),
+        principal,
+        UnixTimestamp::from_secs(now.as_secs() - 20),
+        UnixTimestamp::from_secs(now.as_secs() - 10),
+    )
+    .await?;
+    assert_status(
+        &exchange(address, "POST", &headers(&expired), "").await?,
+        401,
+    );
+    let revoked = issue(sessions.as_ref(), principal, now).await?;
+    sessions.revoke(revoked.session.id(), now).await?;
+    assert_status(
+        &exchange(address, "POST", &headers(&revoked), "").await?,
+        401,
+    );
+
+    // A disable after initial authentication must still prevent mutation.
+    let authenticated = active.session.authenticate(now)?;
+    sqlx::query("UPDATE forge_principals SET disabled_at = clock_timestamp() WHERE id = $1")
+        .bind(principal.into_uuid())
+        .execute(&owner_pool)
+        .await?;
+    assert_status(&exchange(address, "POST", &valid_headers, "").await?, 401);
+    assert!(
+        !sessions
+            .verify_csrf(active.session.id(), &active.secrets.csrf_digest)
+            .await?
+    );
+    assert_eq!(
+        state
+            .logout
+            .execute(authenticated, now, AuditLink::new("disable-race")?)
+            .await,
+        Err(LogoutError::InvalidSession)
+    );
+    sqlx::query("UPDATE forge_principals SET disabled_at = NULL WHERE id = $1")
+        .bind(principal.into_uuid())
+        .execute(&owner_pool)
+        .await?;
+
+    // Successful revocation and success audit are one durable transaction.
+    let response = exchange(address, "POST", &valid_headers, "").await?;
+    assert_status(&response, 204);
+    let lower = response.to_ascii_lowercase();
+    assert!(lower.contains("cache-control: no-store"));
+    assert!(lower.contains("set-cookie: __host-forge_session="));
+    for attribute in ["secure", "httponly", "samesite=lax", "path=/", "max-age=0"] {
+        assert!(
+            lower.contains(attribute),
+            "missing removal cookie attribute {attribute}"
+        );
+    }
+    assert!(!response.contains(active.secrets.bearer.expose()));
+    assert!(!response.contains(active.secrets.csrf.expose()));
+    let link = lower
+        .lines()
+        .find_map(|line| line.strip_prefix("x-request-id: "))
+        .ok_or("missing request ID")?;
+    let evidence: (String, String, String, Option<sqlx::types::Uuid>) = sqlx::query_as(
+        "SELECT action, outcome, actor_kind, principal_id FROM forge_audit_events WHERE request_link = $1",
+    ).bind(link).fetch_one(&owner_pool).await?;
+    assert_eq!(
+        evidence,
+        (
+            "session.logout".into(),
+            "succeeded".into(),
+            "principal".into(),
+            Some(principal.into_uuid())
+        )
+    );
+    assert_status(&exchange(address, "POST", &valid_headers, "").await?, 401);
+
+    // Audit failure must roll the revocation back; retry then succeeds.
+    let rollback = issue(sessions.as_ref(), principal, now).await?;
+    sqlx::query("ALTER TABLE forge_audit_events ADD CONSTRAINT e2e_reject_logout CHECK (action <> 'session.logout') NOT VALID")
+        .execute(&owner_pool).await?;
+    let rejected = exchange(address, "POST", &headers(&rollback), "").await?;
+    assert_status(&rejected, 503);
+    assert!(!rejected.to_ascii_lowercase().contains("set-cookie:"));
+    let remains_active: bool =
+        sqlx::query_scalar("SELECT revoked_at IS NULL FROM forge_sessions WHERE id = $1")
+            .bind(rollback.session.id().into_uuid())
+            .fetch_one(&owner_pool)
+            .await?;
+    assert!(remains_active, "audit failure must not commit revocation");
+    sqlx::query("ALTER TABLE forge_audit_events DROP CONSTRAINT e2e_reject_logout")
+        .execute(&owner_pool)
+        .await?;
+    assert_status(
+        &exchange(address, "POST", &headers(&rollback), "").await?,
+        204,
+    );
+
+    // Concurrent requests cannot record two successful logouts for one session.
+    let concurrent = issue(sessions.as_ref(), principal, now).await?;
+    let concurrent_headers = headers(&concurrent);
+    let (first, second) = tokio::join!(
+        exchange(address, "POST", &concurrent_headers, ""),
+        exchange(address, "POST", &concurrent_headers, ""),
+    );
+    let first = first?;
+    let second = second?;
+    let successes = [first.as_str(), second.as_str()]
+        .iter()
+        .filter(|r| r.starts_with("HTTP/1.1 204"))
+        .count();
+    assert_eq!(successes, 1);
+    assert!(
+        [first, second]
+            .iter()
+            .any(|r| r.starts_with("HTTP/1.1 401"))
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM forge_audit_events WHERE principal_id = $1 AND action = 'session.logout'")
+        .bind(principal.into_uuid()).fetch_one(&owner_pool).await?;
+    assert_eq!(count, 3, "exactly three successfully committed revocations");
+
+    runtime_pool.close().await;
+    assert_status(
+        &exchange(address, "POST", &headers(&concurrent), "").await?,
+        503,
+    );
+    let _ = stop.send(());
+    match tasks.join_next().await {
+        Some(result) => result??,
+        None => return Err("server task disappeared".into()),
+    }
+    owner_pool.close().await;
+    Ok(())
+}
+
+async fn issue(
+    store: &dyn SessionStore,
+    principal: PrincipalId,
+    now: UnixTimestamp,
+) -> Result<IssuedSession, Box<dyn Error>> {
+    Ok(issue_persisted_session(
+        store,
+        principal,
+        now,
+        UnixTimestamp::from_secs(now.as_secs() + 300),
+    )
+    .await?)
+}
+
+fn headers(session: &IssuedSession) -> String {
+    format!(
+        "Cookie: {SESSION_COOKIE_NAME}={}\r\nx-csrf-token: {}\r\n",
+        session.secrets.bearer.expose(),
+        session.secrets.csrf.expose()
+    )
+}
+
+async fn exchange(
+    address: SocketAddr,
+    method: &str,
+    headers: &str,
+    body: &str,
+) -> Result<String, Box<dyn Error>> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut stream = TcpStream::connect(address).await?;
+        let request = format!("{method} /auth/logout HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n{body}", body.len());
+        stream.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok::<_, Box<dyn Error>>(String::from_utf8(response)?)
+    }).await?
+}
+
+fn assert_status(response: &str, status: u16) {
+    // Avoid including credential-bearing raw traffic in assertion diagnostics.
+    assert!(
+        response.starts_with(&format!("HTTP/1.1 {status}")),
+        "expected HTTP {status}"
+    );
+}

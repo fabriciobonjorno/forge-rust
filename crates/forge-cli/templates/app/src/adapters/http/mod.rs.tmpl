@@ -3,6 +3,10 @@
 
 use forge::http::{Method, Request, Response, RouteError, Router, StatusCode};
 use serde::Serialize;
+%%if database%%
+
+pub mod auth;
+%%end%%
 
 /// Registers the application's routes. Forge adds `/health`, `/health/live`
 /// and `/health/ready` itself.

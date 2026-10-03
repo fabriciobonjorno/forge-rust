@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use forge::audit::{
     AuditActor, AuditError, AuditErrorKind, AuditEvent, AuditOutcome, AuditReceipt, AuditSink,
 };
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool, Postgres};
 
 /// PostgreSQL-backed append-only audit writer.
 #[derive(Clone, Debug)]
@@ -23,50 +23,61 @@ impl PgAuditSink {
 #[async_trait]
 impl AuditSink for PgAuditSink {
     async fn append(&self, event: &AuditEvent) -> Result<AuditReceipt, AuditError> {
-        let occurred_at = i64::try_from(event.occurred_at().as_secs()).map_err(|_| {
-            AuditError::new(
-                AuditErrorKind::Rejected,
-                "audit event timestamp is out of range",
-                false,
-            )
-        })?;
+        append_with(&self.pool, event).await
+    }
+}
 
-        let (actor_kind, principal_id) = match event.actor() {
-            AuditActor::Anonymous => ("anonymous", None),
-            AuditActor::Principal(principal_id) => ("principal", Some(principal_id.into_uuid())),
-            AuditActor::System => ("system", None),
-        };
-        let tenant_id = event.tenant_id().map(|tenant_id| tenant_id.into_uuid());
-        let outcome = match event.outcome() {
-            AuditOutcome::Allowed => "allowed",
-            AuditOutcome::Denied => "denied",
-            AuditOutcome::Succeeded => "succeeded",
-            AuditOutcome::Failed => "failed",
-        };
-        let request_link = event.request_link().map(|link| link.as_str());
+/// Shares the append operation with callers that own a larger transaction.
+pub(crate) async fn append_with<'e, E>(
+    executor: E,
+    event: &AuditEvent,
+) -> Result<AuditReceipt, AuditError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let occurred_at = i64::try_from(event.occurred_at().as_secs()).map_err(|_| {
+        AuditError::new(
+            AuditErrorKind::Rejected,
+            "audit event timestamp is out of range",
+            false,
+        )
+    })?;
 
-        sqlx::query(
-            "INSERT INTO forge_audit_events (
+    let (actor_kind, principal_id) = match event.actor() {
+        AuditActor::Anonymous => ("anonymous", None),
+        AuditActor::Principal(principal_id) => ("principal", Some(principal_id.into_uuid())),
+        AuditActor::System => ("system", None),
+    };
+    let tenant_id = event.tenant_id().map(|tenant_id| tenant_id.into_uuid());
+    let outcome = match event.outcome() {
+        AuditOutcome::Allowed => "allowed",
+        AuditOutcome::Denied => "denied",
+        AuditOutcome::Succeeded => "succeeded",
+        AuditOutcome::Failed => "failed",
+    };
+    let request_link = event.request_link().map(|link| link.as_str());
+
+    sqlx::query(
+        "INSERT INTO forge_audit_events (
                 id, occurred_at_unix, actor_kind, principal_id, tenant_id,
                 action, outcome, request_link
              ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8
              )",
-        )
-        .bind(event.id().into_uuid())
-        .bind(occurred_at)
-        .bind(actor_kind)
-        .bind(principal_id)
-        .bind(tenant_id)
-        .bind(event.action().as_str())
-        .bind(outcome)
-        .bind(request_link)
-        .execute(&self.pool)
-        .await
-        .map_err(classify_sqlx_error)?;
+    )
+    .bind(event.id().into_uuid())
+    .bind(occurred_at)
+    .bind(actor_kind)
+    .bind(principal_id)
+    .bind(tenant_id)
+    .bind(event.action().as_str())
+    .bind(outcome)
+    .bind(request_link)
+    .execute(executor)
+    .await
+    .map_err(classify_sqlx_error)?;
 
-        Ok(AuditReceipt::stored(event.id()))
-    }
+    Ok(AuditReceipt::stored(event.id()))
 }
 
 fn classify_sqlx_error(error: sqlx::Error) -> AuditError {

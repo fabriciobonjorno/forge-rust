@@ -1,0 +1,90 @@
+//! Cookie-authenticated logout protocol. Identity and CSRF precede mutation.
+
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use forge::audit::AuditLink;
+use forge::auth::{SessionStore, UnixTimestamp};
+use forge::http::{HeaderValue, Method, Request, Response, RouteError, Router, StatusCode, header};
+
+use crate::application::logout::{Logout, LogoutError};
+use crate::infrastructure::security::{
+    RequestAuthError, authenticate_request, enforce_csrf, session_remove_cookie,
+};
+
+/// Dependencies selected by bootstrap; concrete stores are hidden behind ports.
+pub struct LogoutState {
+    pub sessions: Arc<dyn SessionStore>,
+    pub logout: Logout,
+}
+
+pub fn routes(router: &mut Router, state: Arc<LogoutState>) -> Result<(), RouteError> {
+    router.route(Method::POST, "/auth/logout", move |request| {
+        let state = Arc::clone(&state);
+        async move { logout(request, &state).await }
+    })?;
+    Ok(())
+}
+
+async fn logout(request: Request, state: &LogoutState) -> Response {
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(elapsed) => UnixTimestamp::from_secs(elapsed.as_secs()),
+        Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let authenticated = match authenticate_request(state.sessions.as_ref(), &request, now).await {
+        Ok(principal) => principal,
+        Err(error) => return auth_failure(error),
+    };
+    if let Err(error) = enforce_csrf(state.sessions.as_ref(), &request, authenticated).await {
+        return auth_failure(error);
+    }
+    // Logout takes no caller-supplied identity or other payload.
+    if !request.body().is_empty() {
+        return failure(StatusCode::BAD_REQUEST);
+    }
+    let request_link = match AuditLink::new(request.request_id().to_string()) {
+        Ok(link) => link,
+        Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    match state.logout.execute(authenticated, now, request_link).await {
+        Ok(()) => {
+            let cookie = match HeaderValue::from_str(&session_remove_cookie()) {
+                Ok(cookie) => cookie,
+                Err(_) => return failure(StatusCode::INTERNAL_SERVER_ERROR),
+            };
+            let mut response = Response::empty(StatusCode::NO_CONTENT);
+            response.headers_mut().insert(header::SET_COOKIE, cookie);
+            no_store(response)
+        }
+        Err(LogoutError::InvalidSession) => failure(StatusCode::UNAUTHORIZED),
+        Err(LogoutError::Unavailable) => failure(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+fn auth_failure(error: RequestAuthError) -> Response {
+    let status = match error {
+        RequestAuthError::MissingSession | RequestAuthError::InvalidSession => {
+            StatusCode::UNAUTHORIZED
+        }
+        RequestAuthError::MissingCsrf | RequestAuthError::InvalidCsrf => StatusCode::FORBIDDEN,
+        RequestAuthError::AuthenticationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    failure(status)
+}
+
+fn failure(status: StatusCode) -> Response {
+    let message = match status {
+        StatusCode::UNAUTHORIZED => "authentication required",
+        StatusCode::FORBIDDEN => "request denied",
+        StatusCode::BAD_REQUEST => "invalid request",
+        _ => "authentication unavailable",
+    };
+    no_store(Response::new(status, message))
+}
+
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}

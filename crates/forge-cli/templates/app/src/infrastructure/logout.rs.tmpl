@@ -1,0 +1,74 @@
+//! PostgreSQL transaction for revocation and its success audit record.
+
+use async_trait::async_trait;
+use forge::audit::AuditEvent;
+use forge::auth::{AuthenticatedPrincipal, UnixTimestamp};
+use sqlx::{PgPool, types::Uuid};
+
+use crate::application::logout::{LogoutError, LogoutStore};
+use crate::infrastructure::{
+    audit::append_with,
+    auth::{restore_session, revoke_with},
+};
+
+pub struct PostgresLogoutStore {
+    pool: PgPool,
+}
+
+impl PostgresLogoutStore {
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LogoutStore for PostgresLogoutStore {
+    async fn revoke_with_audit(
+        &self,
+        authenticated: AuthenticatedPrincipal,
+        now: UnixTimestamp,
+        event: &AuditEvent,
+    ) -> Result<(), LogoutError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| LogoutError::Unavailable)?;
+        // Locks serialize revocation/rotation and principal disable against this
+        // operation. Authority is checked again inside the mutation transaction.
+        let row = sqlx::query_as::<_, (Uuid, Uuid, i64, i64, Option<i64>)>(
+            "SELECT s.id, s.principal_id,
+                    EXTRACT(EPOCH FROM s.issued_at)::bigint,
+                    EXTRACT(EPOCH FROM s.expires_at)::bigint,
+                    EXTRACT(EPOCH FROM s.revoked_at)::bigint
+             FROM forge_sessions s
+             JOIN forge_principals p ON p.id = s.principal_id
+             WHERE s.id = $1 AND p.disabled_at IS NULL
+             FOR UPDATE OF s, p",
+        )
+        .bind(authenticated.session_id().into_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| LogoutError::Unavailable)?
+        .ok_or(LogoutError::InvalidSession)?;
+        let session = restore_session(row).map_err(|_| LogoutError::InvalidSession)?;
+        if session.principal_id() != authenticated.principal_id() {
+            return Err(LogoutError::InvalidSession);
+        }
+        session
+            .authenticate(now)
+            .map_err(|_| LogoutError::InvalidSession)?;
+
+        revoke_with(&mut *transaction, session.id(), now)
+            .await
+            .map_err(|_| LogoutError::Unavailable)?;
+        append_with(&mut *transaction, event)
+            .await
+            .map_err(|_| LogoutError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| LogoutError::Unavailable)
+    }
+}

@@ -57,8 +57,11 @@ non-root user, with a built-in health check:
 
 ```sh
 docker build -t shop .
-docker run --rm -p 3000:3000 shop
+docker run --rm --env FORGE_DATABASE_URL -p 3000:3000 shop
 ```
+
+The runtime URL must point to a migrated PostgreSQL database reachable from the
+container. Serving initializes authentication storage before binding the listener.
 
 Or use the generated Compose file as a local convenience. It publishes the port
 on `127.0.0.1:3000` only:
@@ -101,6 +104,7 @@ Kubernetes and systemd deployment is covered in
   RLS context, Argon2id password authentication with optimistic policy upgrades
   and durable login/origin throttling, independent 256-bit session/CSRF secrets,
   secure host-only cookie helpers,
+  a CSRF-protected HTTP logout route with atomic revocation/audit persistence,
   digest-only persisted
   sessions, tenant membership persistence, append-only PostgreSQL audit storage,
   a health-ordered Compose database, and `forge generate migration <name>`.
@@ -110,6 +114,8 @@ Kubernetes and systemd deployment is covered in
 - HTTP defaults: request and header-read timeouts, a body size limit, bounded
   connections, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   and UUIDv7 `x-request-id`.
+- `App::setup` for asynchronous resource composition before listener binding,
+  with a bounded startup deadline and shutdown cancellation.
 - A multi-stage `Dockerfile`, `.dockerignore`, `compose.yaml` and a
   `tests/container.rs` test that keeps the Dockerfile's Rust version in sync
   with `rust-toolchain.toml` (skip all four with `--skip-docker`), plus `.github/workflows/ci.yml` and `.github/dependabot.yml`
@@ -182,6 +188,7 @@ Contribution rules:
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Production delivery roadmap](docs/production-roadmap.md)
 - [Architecture Decision Records](docs/adr/README.md)
 - [CLI reference](docs/cli.md)
 - [Deployment](docs/deployment.md)

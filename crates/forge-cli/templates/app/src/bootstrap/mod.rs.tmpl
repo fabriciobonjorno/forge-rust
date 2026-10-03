@@ -10,10 +10,57 @@
 use std::process::ExitCode;
 
 %%if database%%
-use forge::config::SecretString;
-use sqlx::{PgPool, migrate::Migrator};
+use forge::config::{AppConfig, SecretString};
+use forge::http::{RouteError, Router};
+use sqlx::{PgPool, migrate::Migrator, postgres::PgPoolOptions};
+use std::{io, sync::Arc, time::Duration};
+
+use crate::adapters::http::auth::LogoutState;
+use crate::application::logout::Logout;
+use crate::infrastructure::{auth::PostgresSessionStore, logout::PostgresLogoutStore};
 
 static MIGRATOR: Migrator = sqlx::migrate!();
+
+async fn prepare_auth_routes(
+    config: AppConfig,
+) -> Result<impl FnOnce(&mut Router) -> Result<(), RouteError> + Send, io::Error> {
+    let url = config
+        .database
+        .url
+        .ok_or_else(|| io::Error::other("FORGE_DATABASE_URL is required for authentication"))?;
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(url.expose())
+        .await
+        .map_err(|_| io::Error::other("authentication database unavailable"))?;
+    sqlx::query(
+        "SELECT s.id FROM forge_sessions s
+         JOIN forge_principals p ON p.id = s.principal_id
+         WHERE p.disabled_at IS NULL AND false",
+    )
+    .execute(&pool)
+    .await
+    .map_err(|_| io::Error::other("authentication schema unavailable; run migrations first"))?;
+    let authorized: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege(current_user, 'forge_audit_events', 'INSERT')
+            AND has_column_privilege(current_user, 'forge_sessions', 'revoked_at', 'UPDATE')
+            AND has_column_privilege(current_user, 'forge_principals', 'version', 'UPDATE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|_| io::Error::other("authentication storage privileges unavailable"))?;
+    if !authorized {
+        return Err(io::Error::other(
+            "authentication storage privileges are required",
+        ));
+    }
+    let state = Arc::new(LogoutState {
+        sessions: Arc::new(PostgresSessionStore::new(pool.clone())),
+        logout: Logout::new(Arc::new(PostgresLogoutStore::new(pool))),
+    });
+    Ok(move |router: &mut Router| crate::adapters::http::auth::routes(router, state))
+}
 
 async fn migrate_database(url: SecretString) -> Result<(), sqlx::Error> {
     let pool = PgPool::connect(url.expose()).await?;
@@ -41,6 +88,7 @@ pub fn run() -> ExitCode {
         .version(env!("CARGO_PKG_VERSION"))
 %%if database%%
         .migrations(migrate_database, rollback_database)
+        .setup(prepare_auth_routes)
 %%end%%
         .routes(crate::adapters::http::routes)
         .run()
