@@ -19,7 +19,9 @@ audit controls remain open.
 
 Session rotation now revalidates the enabled principal, preserves identity and
 requires an active replacement under transactional row locks. Before exposing
-HTTP login, define pre-session CSRF protection and bound Argon2 concurrency.
+HTTP login, define pre-session CSRF protection. Argon2 adapter work now has a
+shared process-wide admission budget and stored-parameter ceilings, as described
+in [ADR 0019](adr/0019-bounded-password-work.md); capacity benchmarking is pending.
 Version-bound proof and atomic session/success-audit issuance are implemented
 as described in [ADR 0018](adr/0018-version-bound-login-session-issuance.md),
 but do not revoke existing sessions after password changes or expose an HTTP

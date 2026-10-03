@@ -99,7 +99,11 @@ and `PostgresLoginSessionStore`. The store revalidates enabled state, hash and
 version under a row lock and persists session digests and success audit together.
 Do not substitute `issue_persisted_session`: it is a low-level provisioning/test
 helper without password proof or success audit. HTTP login is not registered yet;
-pre-session CSRF and bounded password concurrency remain pending.
+pre-session CSRF remains pending. Argon2 adapter work shares two process-wide
+slots with immediate overload rejection; cancellation retains the slot until
+started blocking work exits. Imported PHC costs above m=65,536 KiB, t=6 or p=4
+are rejected before verification and require a reviewed migration policy. These
+are resource ceilings, not measured production capacity or total RSS limits.
 Missing/invalid/expired/revoked sessions or disabled principals return 401;
 invalid CSRF returns 403; storage/audit failure returns 503. Rejected audit writes
 roll back revocation. An interrupted commit can have an unknown outcome; a retry
