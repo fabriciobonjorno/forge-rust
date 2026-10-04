@@ -24,6 +24,10 @@ use forge::http::{Method, Request, header};
 use forge::security::PrincipalId;
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 /// Name of the host-only session cookie.
 ///
@@ -45,6 +49,58 @@ const LOGIN_BLOCK_SECONDS: u64 = 900;
 const ORIGIN_MAX_ATTEMPTS: u32 = 50;
 const ORIGIN_WINDOW_SECONDS: u64 = 300;
 const ORIGIN_BLOCK_SECONDS: u64 = 900;
+const MAX_PASSWORD_WORKERS: usize = 2;
+const MAX_VERIFY_MEMORY_KIB: u32 = 65_536;
+const MAX_VERIFY_ITERATIONS: u32 = 6;
+const MAX_VERIFY_PARALLELISM: u32 = 4;
+static PASSWORD_WORK: LazyLock<Arc<PasswordWorkBudget>> =
+    LazyLock::new(|| Arc::new(PasswordWorkBudget::new(MAX_PASSWORD_WORKERS)));
+
+struct PasswordWorkBudget {
+    active: AtomicUsize,
+    limit: usize,
+}
+impl PasswordWorkBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            limit,
+        }
+    }
+    fn acquire(self: &Arc<Self>) -> Result<PasswordWorkPermit, PasswordHashError> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.limit).then_some(active + 1)
+            })
+            .map_err(|_| PasswordHashError::Unavailable)?;
+        Ok(PasswordWorkPermit(Arc::clone(self)))
+    }
+}
+struct PasswordWorkPermit(Arc<PasswordWorkBudget>);
+impl Drop for PasswordWorkPermit {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+async fn password_work<T, F>(
+    budget: &Arc<PasswordWorkBudget>,
+    work: F,
+) -> Result<T, PasswordHashError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, PasswordHashError> + Send + 'static,
+{
+    let permit = budget.acquire()?;
+    tokio::task::spawn_blocking(move || {
+        // A started blocking job cannot be aborted. It owns capacity until it
+        // actually exits, even when its awaiting request is cancelled.
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|_| PasswordHashError::Unavailable)?
+}
 
 /// Password hashing adapter using Argon2id v19 with the project policy.
 #[derive(Clone, Copy, Debug, Default)]
@@ -57,9 +113,7 @@ impl PasswordHasher for Argon2idPasswordHasher {
             return Err(PasswordHashError::InvalidPassword);
         }
         let password = password.to_vec();
-        tokio::task::spawn_blocking(move || hash_password_blocking(&password))
-            .await
-            .map_err(|_| PasswordHashError::Unavailable)?
+        password_work(&PASSWORD_WORK, move || hash_password_blocking(&password)).await
     }
 
     async fn verify(
@@ -72,9 +126,10 @@ impl PasswordHasher for Argon2idPasswordHasher {
         }
         let password = password.to_vec();
         let expected = expected.expose().to_owned();
-        tokio::task::spawn_blocking(move || verify_password_blocking(&password, &expected))
-            .await
-            .map_err(|_| PasswordHashError::Unavailable)?
+        password_work(&PASSWORD_WORK, move || {
+            verify_password_blocking(&password, &expected)
+        })
+        .await
     }
 
     fn needs_rehash(&self, expected: &PasswordHash) -> Result<bool, PasswordHashError> {
@@ -109,6 +164,13 @@ fn verify_password_blocking(password: &[u8], expected: &str) -> Result<bool, Pas
     // Verification intentionally uses the parameters encoded in the stored PHC
     // string, while restricting the accepted algorithm to Argon2id.
     if parsed.algorithm.as_str() != "argon2id" {
+        return Err(PasswordHashError::InvalidHash);
+    }
+    let params = Params::try_from(&parsed).map_err(|_| PasswordHashError::InvalidHash)?;
+    if params.m_cost() > MAX_VERIFY_MEMORY_KIB
+        || params.t_cost() > MAX_VERIFY_ITERATIONS
+        || params.p_cost() > MAX_VERIFY_PARALLELISM
+    {
         return Err(PasswordHashError::InvalidHash);
     }
 
@@ -701,6 +763,108 @@ pub enum SecurityMechanismError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_password_budget_rejects_overload_and_recovers() {
+        let runtime = result_ok(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build(),
+            "runtime",
+        );
+        let hash = result_ok(hash_password_blocking(b"budget-test"), "hash fixture");
+        let first = result_ok(PASSWORD_WORK.acquire(), "first permit");
+        let second = result_ok(PASSWORD_WORK.acquire(), "second permit");
+        assert_eq!(
+            runtime.block_on(Argon2idPasswordHasher.hash(b"budget-test")),
+            Err(PasswordHashError::Unavailable)
+        );
+        assert_eq!(
+            runtime.block_on(Argon2idPasswordHasher.verify(b"budget-test", &hash)),
+            Err(PasswordHashError::Unavailable)
+        );
+        drop(first);
+        drop(second);
+        assert!(result_ok(
+            runtime.block_on(Argon2idPasswordHasher.verify(b"budget-test", &hash)),
+            "capacity recovery"
+        ));
+    }
+
+    #[test]
+    fn cancelled_waiter_keeps_capacity_until_blocking_work_exits() {
+        use std::{
+            future::Future,
+            sync::mpsc,
+            task::{Context, Waker},
+            time::Duration,
+        };
+        let runtime = result_ok(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build(),
+            "runtime",
+        );
+        let budget = Arc::new(PasswordWorkBudget::new(1));
+        let (started, observed) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let entered = runtime.enter();
+        let mut waiting = Box::pin(password_work(&budget, move || {
+            started
+                .send(())
+                .map_err(|_| PasswordHashError::Unavailable)?;
+            released
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| PasswordHashError::Unavailable)?;
+            Ok(())
+        }));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        result_ok(
+            observed.recv_timeout(Duration::from_secs(5)),
+            "worker started",
+        );
+        drop(waiting);
+        assert!(budget.acquire().is_err());
+        result_ok(release.send(()), "release worker");
+        drop(entered);
+        // Runtime teardown joins the bounded blocking job before checking recovery.
+        drop(runtime);
+        assert!(budget.acquire().is_ok());
+    }
+
+    #[test]
+    fn worker_panic_releases_its_capacity() {
+        let runtime = result_ok(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build(),
+            "runtime",
+        );
+        let budget = Arc::new(PasswordWorkBudget::new(1));
+        let result = runtime.block_on(password_work(
+            &budget,
+            || -> Result<(), PasswordHashError> { panic!("test worker failure") },
+        ));
+        assert_eq!(result, Err(PasswordHashError::Unavailable));
+        assert!(budget.acquire().is_ok());
+    }
+
+    #[test]
+    fn verifier_rejects_excessive_stored_work_parameters() {
+        let hash = result_ok(hash_password_blocking(b"cost-test"), "hash fixture");
+        for parameters in ["m=65537,t=2,p=1", "m=19456,t=7,p=1", "m=19456,t=2,p=5"] {
+            let excessive = hash.expose().replacen("m=19456,t=2,p=1", parameters, 1);
+            assert_eq!(
+                verify_password_blocking(b"cost-test", &excessive),
+                Err(PasswordHashError::InvalidHash)
+            );
+        }
+    }
 
     fn result_ok<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) -> T {
         match result {

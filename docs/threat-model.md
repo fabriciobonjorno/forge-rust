@@ -191,7 +191,12 @@ under an enabled-principal row lock and atomically inserts the session and its
 success audit. Hash changes without a version increment are also rejected.
 The proof is trusted in-process data, not a client credential or sandbox against
 malicious application code. HTTP login remains unexposed until pre-session CSRF
-policy and bounded Argon2 work are implemented. Password changes do not yet
+policy is implemented. Argon2 hash/verify work now shares two process-wide slots
+with immediate overload rejection and permits retained by started blocking jobs
+after request cancellation. Stored verification costs are capped at m=65,536 KiB,
+t=6, p=4 before costly work. This bounds admitted hashing, not total service RSS,
+and does not replace deployment sizing or distributed throttling.
+Password changes do not yet
 automatically revoke previously issued sessions.
 
 Append-only audit persistence remains a separate structured security-evidence
