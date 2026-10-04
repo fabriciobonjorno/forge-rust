@@ -5,13 +5,19 @@
 //! internals. This keeps the adapter replaceable and application code stable.
 
 use std::{
-    collections::HashMap, convert::Infallible, fmt, future::Future, net::SocketAddr, pin::Pin,
-    sync::Arc, time::Duration,
+    collections::HashMap,
+    convert::Infallible,
+    fmt,
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
 };
 
 use bytes::Bytes;
-use forge_config::ServerConfig;
-pub use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
+use forge_config::{ServerConfig, TrustedProxyPolicy};
+pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::{
     body::{Body as _, Incoming},
@@ -33,6 +39,9 @@ use uuid::Uuid;
 /// turn the accept loop into a busy loop.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const JSON_CONTENT_TYPE: &str = "application/json";
+const MAX_FORWARDED_FOR_BYTES: usize = 4096;
+const MAX_FORWARDED_FOR_HOPS: usize = 32;
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 
 type BoxHandlerFuture = Pin<Box<dyn Future<Output = Response> + Send + 'static>>;
 
@@ -44,6 +53,7 @@ pub struct Request {
     headers: HeaderMap,
     body: Bytes,
     remote_addr: SocketAddr,
+    client_addr: IpAddr,
     request_id: Uuid,
 }
 
@@ -76,6 +86,13 @@ impl Request {
     #[must_use]
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
+    }
+
+    /// Client IP resolved from `X-Forwarded-For` only when the TCP peer is a
+    /// configured trusted proxy; otherwise this is the observed TCP peer IP.
+    #[must_use]
+    pub fn client_addr(&self) -> IpAddr {
+        self.client_addr
     }
 
     /// Server-generated UUIDv7 correlation identifier.
@@ -401,6 +418,7 @@ impl Server {
         let router = Arc::clone(&self.router);
         let max_body_bytes = self.config.max_body_bytes;
         let request_timeout = self.config.request_timeout;
+        let trusted_proxies = self.config.trusted_proxies.clone();
         connections.spawn(async move {
             serve_connection(
                 stream,
@@ -408,6 +426,7 @@ impl Server {
                 router,
                 max_body_bytes,
                 request_timeout,
+                trusted_proxies,
                 cancellation,
             )
             .await;
@@ -429,8 +448,10 @@ async fn serve_connection(
     router: Arc<Router>,
     max_body_bytes: usize,
     request_timeout: Duration,
+    trusted_proxies: TrustedProxyPolicy,
     cancellation: CancellationToken,
 ) {
+    let trusted_proxies = Arc::new(trusted_proxies);
     let service = service_fn(move |request| {
         handle_request(
             request,
@@ -438,6 +459,7 @@ async fn serve_connection(
             Arc::clone(&router),
             max_body_bytes,
             request_timeout,
+            Arc::clone(&trusted_proxies),
         )
     });
     let connection = hyper::server::conn::http1::Builder::new()
@@ -467,6 +489,7 @@ async fn handle_request(
     router: Arc<Router>,
     max_body_bytes: usize,
     request_timeout: Duration,
+    trusted_proxies: Arc<TrustedProxyPolicy>,
 ) -> Result<hyper::Response<Full<Bytes>>, Infallible> {
     let request_id = Uuid::now_v7();
     let method = request.method().clone();
@@ -474,6 +497,17 @@ async fn handle_request(
     let span = info_span!("http.request", %request_id, %method, %path, %remote_addr);
     let response = async move {
         let (parts, body) = request.into_parts();
+        let client_addr =
+            match resolve_client_addr(remote_addr.ip(), &parts.headers, &trusted_proxies) {
+                Ok(address) => address,
+                Err(error) => {
+                    warn!(%remote_addr, %error, "rejected invalid forwarded client address");
+                    return to_hyper_response(
+                        Response::new(StatusCode::BAD_REQUEST, "invalid forwarded client address"),
+                        request_id,
+                    );
+                }
+            };
         // The deadline covers reading the body as well as the handler, so a
         // client trickling body bytes cannot hold a connection indefinitely.
         let exchange = async {
@@ -487,6 +521,7 @@ async fn handle_request(
                 headers: parts.headers,
                 body,
                 remote_addr,
+                client_addr,
                 request_id,
             };
             router.dispatch(request).await
@@ -501,6 +536,58 @@ async fn handle_request(
     .await;
 
     Ok(response)
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+enum ForwardedAddressError {
+    #[error("forwarded client address is malformed")]
+    Malformed,
+    #[error("forwarded client address exceeds the configured parsing bounds")]
+    TooLarge,
+}
+
+fn resolve_client_addr(
+    remote_addr: IpAddr,
+    headers: &HeaderMap,
+    trusted_proxies: &TrustedProxyPolicy,
+) -> Result<IpAddr, ForwardedAddressError> {
+    if !trusted_proxies.contains(remote_addr) {
+        return Ok(remote_addr);
+    }
+
+    let values = headers.get_all(&X_FORWARDED_FOR);
+    if values.iter().next().is_none() {
+        return Ok(remote_addr);
+    }
+
+    let mut total_bytes = 0;
+    let mut hops = Vec::new();
+    for value in values.iter() {
+        total_bytes += value.as_bytes().len();
+        if total_bytes > MAX_FORWARDED_FOR_BYTES {
+            return Err(ForwardedAddressError::TooLarge);
+        }
+        for hop in value.as_bytes().split(|byte| *byte == b',') {
+            if hops.len() == MAX_FORWARDED_FOR_HOPS {
+                return Err(ForwardedAddressError::TooLarge);
+            }
+            hops.push(hop);
+        }
+    }
+
+    let mut client_addr = remote_addr;
+    for hop in hops.into_iter().rev() {
+        if !trusted_proxies.contains(client_addr) {
+            break;
+        }
+        let hop = std::str::from_utf8(hop).map_err(|_| ForwardedAddressError::Malformed)?;
+        client_addr = hop
+            .trim()
+            .parse::<IpAddr>()
+            .map_err(|_| ForwardedAddressError::Malformed)?;
+    }
+
+    Ok(client_addr)
 }
 
 /// Reason a request body was rejected before dispatch.
@@ -588,6 +675,7 @@ mod tests {
             headers: HeaderMap::new(),
             body: Bytes::new(),
             remote_addr: "127.0.0.1:4000".parse().expect("valid test address"),
+            client_addr: "127.0.0.1".parse().expect("valid test address"),
             request_id: Uuid::now_v7(),
         }
     }
@@ -621,6 +709,71 @@ mod tests {
 
         assert_eq!(wrong_method.status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn ignores_forwarding_headers_from_untrusted_peers() {
+        let trusted: TrustedProxyPolicy = "127.0.0.1/32".parse().expect("valid policy");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            &X_FORWARDED_FOR,
+            "198.51.100.7".parse().expect("valid header"),
+        );
+
+        let client = resolve_client_addr("192.0.2.8".parse().unwrap(), &headers, &trusted)
+            .expect("untrusted peer must remain authoritative");
+
+        assert_eq!(client, "192.0.2.8".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn walks_forwarded_chain_from_the_right_until_the_first_untrusted_hop() {
+        let trusted: TrustedProxyPolicy = "127.0.0.1/32,10.0.0.0/8".parse().expect("valid policy");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            &X_FORWARDED_FOR,
+            "203.0.113.200, 198.51.100.9, 10.4.0.2"
+                .parse()
+                .expect("valid header"),
+        );
+
+        let client = resolve_client_addr("127.0.0.1".parse().unwrap(), &headers, &trusted)
+            .expect("valid trusted proxy chain");
+
+        assert_eq!(client, "198.51.100.9".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn falls_back_to_peer_and_rejects_malformed_or_oversized_chains() {
+        let trusted: TrustedProxyPolicy = "127.0.0.1/32".parse().expect("valid policy");
+        let peer = "127.0.0.1".parse().unwrap();
+
+        assert_eq!(
+            resolve_client_addr(peer, &HeaderMap::new(), &trusted),
+            Ok(peer)
+        );
+
+        let mut malformed = HeaderMap::new();
+        malformed.insert(&X_FORWARDED_FOR, "not-an-ip".parse().unwrap());
+        assert_eq!(
+            resolve_client_addr(peer, &malformed, &trusted),
+            Err(ForwardedAddressError::Malformed)
+        );
+
+        let mut oversized = HeaderMap::new();
+        oversized.insert(
+            &X_FORWARDED_FOR,
+            (0..=MAX_FORWARDED_FOR_HOPS)
+                .map(|_| "10.0.0.1")
+                .collect::<Vec<_>>()
+                .join(",")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            resolve_client_addr(peer, &oversized, &trusted),
+            Err(ForwardedAddressError::TooLarge)
+        );
     }
 
     #[test]
@@ -721,6 +874,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn trusted_proxy_chain_is_resolved_at_the_http_boundary() {
+        let mut config = test_config(Duration::from_secs(1));
+        config.trusted_proxies = "127.0.0.1/32,10.0.0.0/8"
+            .parse()
+            .expect("valid trusted proxy policy");
+        let server = TestServer::start(config, test_router()).await;
+
+        let response = exchange(
+            server.addr,
+            "GET /client-ip HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 198.51.100.9, 10.4.0.2\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("198.51.100.9"), "{response}");
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_peer_without_a_forwarded_chain_uses_the_observed_peer() {
+        let mut config = test_config(Duration::from_secs(1));
+        config.trusted_proxies = "127.0.0.1/32".parse().expect("valid trusted proxy policy");
+        let server = TestServer::start(config, test_router()).await;
+
+        let response = exchange(
+            server.addr,
+            "GET /client-ip HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("127.0.0.1"), "{response}");
+        server.stop().await;
+    }
+
     fn test_config(request_timeout: Duration) -> ServerConfig {
         ServerConfig {
             bind: "127.0.0.1:0".parse().expect("valid address"),
@@ -728,6 +917,7 @@ mod tests {
             shutdown_grace: Duration::from_secs(30),
             max_body_bytes: 64,
             max_connections: 16,
+            trusted_proxies: TrustedProxyPolicy::default(),
         }
     }
 
@@ -736,6 +926,11 @@ mod tests {
         router
             .standard_health_routes()
             .expect("health routes must register");
+        router
+            .route(Method::GET, "/client-ip", |request: Request| async move {
+                Response::new(StatusCode::OK, request.client_addr().to_string())
+            })
+            .expect("client address route must register");
         router
             .route(Method::POST, "/echo", |request: Request| async move {
                 Response::new(StatusCode::OK, request.body().clone())

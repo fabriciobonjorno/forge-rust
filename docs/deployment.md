@@ -124,6 +124,7 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_SHUTDOWN_GRACE_SECS` | `15` | Drain deadline for in-flight requests after SIGTERM/SIGINT. |
 | `FORGE_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes. |
 | `FORGE_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. Extra connections wait for a slot (backpressure) instead of being served without bound. |
+| `FORGE_TRUSTED_PROXIES` | empty | Comma-separated CIDRs allowed to supply `X-Forwarded-For` (for example `10.20.0.0/16,2001:db8:1::/48`; use `/32` or `/128` for one address). Empty means no forwarded address is trusted. |
 | `FORGE_LOG` | `info` | `tracing` filter directive, for example `info,shop=debug`. |
 | `FORGE_LOG_FORMAT` | `json` in production, `text` otherwise | `json` or `text`. |
 | `FORGE_DATABASE_URL` | none | Least-privilege PostgreSQL runtime connection URL. Treated as a secret and redacted from ordinary diagnostics. |
@@ -134,6 +135,12 @@ collects them. The HTTP layer also enforces a header-read timeout and adds
 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and a UUIDv7
 `x-request-id` to responses. Transient `accept` errors, such as running out of
 file descriptors, do not stop the server.
+
+Configure `FORGE_TRUSTED_PROXIES` only with reverse-proxy egress networks. Each
+trusted proxy must sanitize the forwarding chain and append the address of its
+observed upstream peer. Forge ignores forwarding headers from all other peers.
+With a trusted peer, malformed or oversized chains are rejected before route
+dispatch; absent headers use the observed TCP peer address.
 
 Do not put secrets in the image or in build arguments. Both database URLs contain
 credentials and must come from the deployment platform's secret mechanism.

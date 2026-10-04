@@ -66,7 +66,7 @@ alone.
 
 | Threat | Required controls | Verification |
 | --- | --- | --- |
-| Credential stuffing and session theft | Argon2id password hashing with parameter policy, generic login errors, per-account and per-origin throttles, rotation on privilege change, secure/HttpOnly/SameSite cookies, short-lived credentials, revocation | authentication integration and abuse tests |
+| Credential stuffing and session theft | Argon2id password hashing with parameter policy, generic login errors, per-account and per-origin throttles, explicit trusted-proxy CIDRs with right-to-left `X-Forwarded-For` resolution, rotation on privilege change, secure/HttpOnly/SameSite cookies, short-lived credentials, revocation | authentication integration and abuse tests |
 | CSRF and cross-origin abuse | SameSite defaults, unpredictable CSRF token for cookie-authenticated mutations, exact-origin CORS allowlist, reject credentialed wildcard origins | browser-protocol integration tests |
 | Broken object authorization | authorization at use-case boundary, typed principal and tenant context, deny by default, no authorization based on object-ID secrecy | policy matrix and negative integration tests |
 | Cross-tenant data access | mandatory `TenantContext`, transaction-local PostgreSQL setting, RLS, non-bypass application role, pooled-connection reset, audited separate admin path | two-tenant tests for every repository plus RLS tests |
