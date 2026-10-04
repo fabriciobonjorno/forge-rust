@@ -5,8 +5,8 @@
 
 use async_trait::async_trait;
 use forge::auth::{
-    CsrfTokenDigest, PasswordCredential, PasswordCredentialStore,
-    PasswordCredentialStoreError, PasswordHash, Session, SessionCredentialDigest, SessionId,
+    CsrfTokenDigest, PasswordCredential, PasswordCredentialStore, PasswordCredentialStoreError,
+    PasswordCredentialVersion, PasswordHash, Session, SessionCredentialDigest, SessionId,
     SessionStore, SessionStoreError, UnixTimestamp,
 };
 use forge::security::PrincipalId;
@@ -36,8 +36,8 @@ impl PasswordCredentialStore for PostgresPasswordCredentialStore {
         &self,
         login: &str,
     ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError> {
-        let row = sqlx::query_as::<_, (Uuid, String, bool)>(
-            "SELECT id, password_hash, disabled_at IS NOT NULL
+        let row = sqlx::query_as::<_, (Uuid, String, bool, i64)>(
+            "SELECT id, password_hash, disabled_at IS NOT NULL, version
              FROM forge_principals
              WHERE lower(login) = lower($1)
                AND password_hash IS NOT NULL
@@ -48,18 +48,54 @@ impl PasswordCredentialStore for PostgresPasswordCredentialStore {
         .await
         .map_err(|_| PasswordCredentialStoreError::Unavailable)?;
 
-        row.map(|(principal_id, password_hash, disabled)| {
+        row.map(|(principal_id, password_hash, disabled, version)| {
             let principal_id = PrincipalId::from_uuid(principal_id)
                 .map_err(|_| PasswordCredentialStoreError::CorruptRecord)?;
             let password_hash = PasswordHash::new(password_hash)
                 .map_err(|_| PasswordCredentialStoreError::CorruptRecord)?;
+            let version = u64::try_from(version)
+                .ok()
+                .and_then(PasswordCredentialVersion::new)
+                .ok_or(PasswordCredentialStoreError::CorruptRecord)?;
             Ok(PasswordCredential::new(
                 principal_id,
                 password_hash,
                 disabled,
+                version,
             ))
         })
         .transpose()
+    }
+
+    async fn replace_password_hash(
+        &self,
+        principal_id: PrincipalId,
+        expected_version: PasswordCredentialVersion,
+        password_hash: &PasswordHash,
+    ) -> Result<(), PasswordCredentialStoreError> {
+        let expected_version = i64::try_from(expected_version.get())
+            .map_err(|_| PasswordCredentialStoreError::CorruptRecord)?;
+
+        let result = sqlx::query(
+            "UPDATE forge_principals
+             SET password_hash = $3,
+                 updated_at = clock_timestamp(),
+                 version = version + 1
+             WHERE id = $1
+               AND version = $2
+               AND disabled_at IS NULL",
+        )
+        .bind(principal_id.into_uuid())
+        .bind(expected_version)
+        .bind(password_hash.expose())
+        .execute(&self.pool)
+        .await
+        .map_err(|_| PasswordCredentialStoreError::Unavailable)?;
+
+        match result.rows_affected() {
+            1 => Ok(()),
+            _ => Err(PasswordCredentialStoreError::Conflict),
+        }
     }
 }
 
@@ -87,10 +123,7 @@ impl SessionStore for PostgresSessionStore {
     ) -> Result<(), SessionStoreError> {
         let issued_at = timestamp_to_i64(session.issued_at())?;
         let expires_at = timestamp_to_i64(session.expires_at())?;
-        let revoked_at = session
-            .revoked_at()
-            .map(timestamp_to_i64)
-            .transpose()?;
+        let revoked_at = session.revoked_at().map(timestamp_to_i64).transpose()?;
 
         sqlx::query(
             "INSERT INTO forge_sessions (
@@ -207,10 +240,7 @@ impl SessionStore for PostgresSessionStore {
         let revoked_at = timestamp_to_i64(revoked_at)?;
         let issued_at = timestamp_to_i64(replacement.issued_at())?;
         let expires_at = timestamp_to_i64(replacement.expires_at())?;
-        let replacement_revoked_at = replacement
-            .revoked_at()
-            .map(timestamp_to_i64)
-            .transpose()?;
+        let replacement_revoked_at = replacement.revoked_at().map(timestamp_to_i64).transpose()?;
 
         let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
 
@@ -266,13 +296,7 @@ impl SessionStore for PostgresSessionStore {
 }
 
 fn restore_session(
-    (id, principal_id, issued_at, expires_at, revoked_at): (
-        Uuid,
-        Uuid,
-        i64,
-        i64,
-        Option<i64>,
-    ),
+    (id, principal_id, issued_at, expires_at, revoked_at): (Uuid, Uuid, i64, i64, Option<i64>),
 ) -> Result<Session, SessionStoreError> {
     let id = SessionId::from_uuid(id).map_err(|_| SessionStoreError::CorruptRecord)?;
     let principal_id =

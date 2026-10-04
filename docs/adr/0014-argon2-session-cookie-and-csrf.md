@@ -28,8 +28,15 @@ outer infrastructure boundary:
 Argon2id uses version 19 with an initial policy of m=19456 KiB, t=2, p=1 and a
 32-byte output. Work runs through Tokio `spawn_blocking` instead of occupying
 the async executor's core worker threads. Stored PHC strings remain
-self-describing so parameters can be raised later and hashes can be upgraded on
-successful authentication.
+self-describing so parameters can be raised later. After a successful password
+verification, the generated hasher compares the stored Argon2id version and
+m/t/p parameters with the current policy. A weaker/outdated hash is rehashed
+immediately and persisted through an optimistic credential version update.
+
+The rehash update is deliberately fail-closed on races: the credential store
+updates only when the principal is still enabled and its version matches the
+version that was verified. A concurrent password change or disable therefore
+produces a generic authentication denial instead of overwriting newer state.
 
 Interactive password authentication returns one public denial for unknown login,
 disabled account, or wrong password. An unknown/invalid login still performs one
@@ -57,6 +64,9 @@ custom cookie grammar.
 - Browser JavaScript cannot read the bearer cookie.
 - CSRF enforcement remains server-side and survives application restarts.
 - Password hashing has a measurable memory/CPU cost and requires capacity tests.
+- Successful authentication upgrades outdated Argon2id parameters without
+  exposing infrastructure types to application code.
+- Concurrent password changes/disables cannot be overwritten by a stale rehash.
 - Applications need rate limiting/throttling in addition to expensive hashing.
 - HTTP login/logout/tenant-selection endpoints remain application adapters built
   from these mechanisms rather than universal routes imposed by the framework.

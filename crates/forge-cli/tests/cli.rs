@@ -102,12 +102,26 @@ fn generate_migration_creates_reversible_pair() {
     assert!(output.status.success(), "{output:?}");
     let migrations = std::fs::read_dir(directory.path().join("migrations"))
         .expect("migrations directory")
-        .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect::<Vec<_>>();
 
     assert_eq!(migrations.len(), 2);
-    assert!(migrations.iter().any(|name| name.ends_with("_create_customers.up.sql")));
-    assert!(migrations.iter().any(|name| name.ends_with("_create_customers.down.sql")));
+    assert!(
+        migrations
+            .iter()
+            .any(|name| name.ends_with("_create_customers.up.sql"))
+    );
+    assert!(
+        migrations
+            .iter()
+            .any(|name| name.ends_with("_create_customers.down.sql"))
+    );
 }
 
 #[test]

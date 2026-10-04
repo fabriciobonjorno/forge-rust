@@ -41,11 +41,7 @@ pub struct DatabaseError {
 impl DatabaseError {
     /// Creates a classified database error with a safe public message.
     #[must_use]
-    pub const fn new(
-        kind: DatabaseErrorKind,
-        message: &'static str,
-        retryable: bool,
-    ) -> Self {
+    pub const fn new(kind: DatabaseErrorKind, message: &'static str, retryable: bool) -> Self {
         Self {
             kind,
             message,
@@ -309,10 +305,12 @@ mod tests {
                 .get(),
             2
         );
-        assert!(RecordVersion::new(i64::MAX)
-            .expect("max positive version is valid")
-            .next()
-            .is_err());
+        assert!(
+            RecordVersion::new(i64::MAX)
+                .expect("max positive version is valid")
+                .next()
+                .is_err()
+        );
     }
 
     #[test]
@@ -338,11 +336,8 @@ mod tests {
 
     #[test]
     fn error_classification_is_explicit() {
-        let error = DatabaseError::new(
-            DatabaseErrorKind::Unavailable,
-            "database unavailable",
-            true,
-        );
+        let error =
+            DatabaseError::new(DatabaseErrorKind::Unavailable, "database unavailable", true);
         assert_eq!(error.kind(), DatabaseErrorKind::Unavailable);
         assert!(error.retryable());
         assert_eq!(error.to_string(), "database unavailable");

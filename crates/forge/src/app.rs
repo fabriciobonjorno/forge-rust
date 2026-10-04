@@ -222,9 +222,7 @@ impl App {
         }
 
         let Some(url) = config.database.migration_url else {
-            write_stderr(
-                "error: FORGE_MIGRATION_DATABASE_URL is required for database commands\n",
-            );
+            write_stderr("error: FORGE_MIGRATION_DATABASE_URL is required for database commands\n");
             return ExitCode::from(EXIT_CONFIG);
         };
 
@@ -279,7 +277,6 @@ impl DatabaseCommand {
         }
     }
 }
-
 
 /// Builds the route table: framework health routes first, then the
 /// application's registrations in order.
