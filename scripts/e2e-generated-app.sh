@@ -216,6 +216,10 @@ RS
     FORGE_MIGRATION_DATABASE_URL="$migration_database_url" \
     cargo test --quiet --locked --test auth_logout -- --ignored
 
+  FORGE_DATABASE_URL="$runtime_database_url" \
+    FORGE_MIGRATION_DATABASE_URL="$migration_database_url" \
+    cargo test --quiet --locked --test session_rotation -- --ignored
+
   audit_id="01941f29-7c00-7000-8000-000000000010"
   docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app -v ON_ERROR_STOP=1 -c "
     INSERT INTO forge_audit_events (

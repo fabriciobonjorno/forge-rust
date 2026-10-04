@@ -1,0 +1,174 @@
+//! Real PostgreSQL session rotation contracts using separate runtime/owner roles.
+
+use std::error::Error;
+
+use app::infrastructure::{auth::PostgresSessionStore, security::issue_session_secrets};
+use forge::auth::{Session, SessionStore, SessionStoreError, UnixTimestamp};
+use forge::security::PrincipalId;
+use sqlx::PgPool;
+
+#[test]
+#[ignore = "requires a disposable migrated PostgreSQL database"]
+fn rotation_preserves_identity_and_atomicity() -> Result<(), Box<dyn Error>> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(exercise())
+}
+
+async fn exercise() -> Result<(), Box<dyn Error>> {
+    let pool = PgPool::connect(&std::env::var("FORGE_DATABASE_URL")?).await?;
+    let owner = PgPool::connect(&std::env::var("FORGE_MIGRATION_DATABASE_URL")?).await?;
+    let store = PostgresSessionStore::new(pool.clone());
+    let principal = PrincipalId::new();
+    let other = PrincipalId::new();
+    for id in [principal, other] {
+        sqlx::query("INSERT INTO forge_principals (id, login) VALUES ($1, $2)")
+            .bind(id.into_uuid())
+            .bind(format!("rotation-{id}"))
+            .execute(&owner)
+            .await?;
+    }
+    let now = UnixTimestamp::from_secs(100);
+    let expiry = UnixTimestamp::from_secs(200);
+    let previous = Session::new(principal, now, expiry)?;
+    let secrets = issue_session_secrets()?;
+    store
+        .insert(&previous, &secrets.bearer_digest, &secrets.csrf_digest)
+        .await?;
+    let replacement_secrets = issue_session_secrets()?;
+
+    // A substitution must neither revoke the old identity nor issue the new one.
+    let wrong_identity = Session::new(other, now, expiry)?;
+    assert_eq!(
+        store
+            .rotate(
+                previous.id(),
+                now,
+                &wrong_identity,
+                &replacement_secrets.bearer_digest,
+                &replacement_secrets.csrf_digest
+            )
+            .await,
+        Err(SessionStoreError::Conflict)
+    );
+    assert_unrevoked(&store, &secrets.bearer_digest).await?;
+    assert!(
+        store
+            .find_by_credential(&replacement_secrets.bearer_digest)
+            .await?
+            .is_none()
+    );
+
+    let future = Session::new(principal, UnixTimestamp::from_secs(101), expiry)?;
+    let expired = Session::new(principal, UnixTimestamp::from_secs(90), now)?;
+    let mut revoked = Session::new(principal, now, expiry)?;
+    revoked.revoke(now)?;
+    for invalid in [future, expired, revoked] {
+        assert_eq!(
+            store
+                .rotate(
+                    previous.id(),
+                    now,
+                    &invalid,
+                    &replacement_secrets.bearer_digest,
+                    &replacement_secrets.csrf_digest
+                )
+                .await,
+            Err(SessionStoreError::Conflict)
+        );
+        assert_unrevoked(&store, &secrets.bearer_digest).await?;
+    }
+
+    let replacement = Session::new(principal, now, expiry)?;
+    sqlx::query("UPDATE forge_principals SET disabled_at = clock_timestamp() WHERE id = $1")
+        .bind(principal.into_uuid())
+        .execute(&owner)
+        .await?;
+    assert_eq!(
+        store
+            .rotate(
+                previous.id(),
+                now,
+                &replacement,
+                &replacement_secrets.bearer_digest,
+                &replacement_secrets.csrf_digest
+            )
+            .await,
+        Err(SessionStoreError::Conflict)
+    );
+    sqlx::query("UPDATE forge_principals SET disabled_at = NULL WHERE id = $1")
+        .bind(principal.into_uuid())
+        .execute(&owner)
+        .await?;
+    assert_unrevoked(&store, &secrets.bearer_digest).await?;
+
+    // An insert uniqueness failure must roll back the preceding revocation.
+    assert!(
+        store
+            .rotate(
+                previous.id(),
+                now,
+                &replacement,
+                &secrets.bearer_digest,
+                &replacement_secrets.csrf_digest
+            )
+            .await
+            .is_err()
+    );
+    assert_unrevoked(&store, &secrets.bearer_digest).await?;
+
+    // Competing rotations have exactly one winner, with no orphan replacement.
+    let second = Session::new(principal, now, expiry)?;
+    let second_secrets = issue_session_secrets()?;
+    let (first_result, second_result) = tokio::join!(
+        store.rotate(
+            previous.id(),
+            now,
+            &replacement,
+            &replacement_secrets.bearer_digest,
+            &replacement_secrets.csrf_digest
+        ),
+        store.rotate(
+            previous.id(),
+            now,
+            &second,
+            &second_secrets.bearer_digest,
+            &second_secrets.csrf_digest
+        ),
+    );
+    assert!(matches!(
+        (first_result, second_result),
+        (Ok(()), Err(SessionStoreError::Conflict)) | (Err(SessionStoreError::Conflict), Ok(()))
+    ));
+    let old = store
+        .find_by_credential(&secrets.bearer_digest)
+        .await?
+        .ok_or("missing old session")?;
+    assert_eq!(old.revoked_at(), Some(now));
+    let first = store
+        .find_by_credential(&replacement_secrets.bearer_digest)
+        .await?;
+    let second = store
+        .find_by_credential(&second_secrets.bearer_digest)
+        .await?;
+    assert_eq!(
+        usize::from(first.is_some()) + usize::from(second.is_some()),
+        1
+    );
+    pool.close().await;
+    owner.close().await;
+    Ok(())
+}
+
+async fn assert_unrevoked(
+    store: &PostgresSessionStore,
+    digest: &forge::auth::SessionCredentialDigest,
+) -> Result<(), Box<dyn Error>> {
+    let session = store
+        .find_by_credential(digest)
+        .await?
+        .ok_or("missing original session")?;
+    assert_eq!(session.revoked_at(), None);
+    Ok(())
+}

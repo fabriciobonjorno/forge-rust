@@ -73,6 +73,7 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Always, "src/bootstrap/mod.rs" => "src/bootstrap/mod.rs.tmpl"),
     template!(Group::Always, "tests/architecture.rs" => "tests/architecture.rs.tmpl"),
     template!(Group::Database, "tests/auth_logout.rs" => "tests/auth_logout.rs.tmpl"),
+    template!(Group::Database, "tests/session_rotation.rs" => "tests/session_rotation.rs.tmpl"),
     template!(Group::Database, "build.rs" => "build.rs.tmpl"),
     template!(Group::Database, ".gitattributes" => "gitattributes.tmpl"),
     template!(Group::Database, "migrations/.gitkeep" => "migrations/gitkeep.tmpl"),
