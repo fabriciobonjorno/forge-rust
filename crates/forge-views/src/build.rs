@@ -1,13 +1,14 @@
 //! Build-time asset embedding for an application's `build.rs`.
 //!
 //! ```no_run
-//! // build.rs
-//! fn main() {
-//!     if let Err(failure) = forge_views::build::embed_assets("assets") {
-//!         eprintln!("asset embedding failed: {failure}");
-//!         std::process::exit(1);
-//!     }
+//! use forge_views::build::{BuildError, embed_assets};
+//!
+//! // Called from `fn main` in the application's build.rs; exit non-zero on
+//! // failure so the build stops with the message.
+//! fn build_script() -> Result<(), BuildError> {
+//!     embed_assets("assets")
 //! }
+//! # let _ = build_script;
 //! ```
 //!
 //! The helper walks the directory, computes a SHA-256 content digest per file

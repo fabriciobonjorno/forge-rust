@@ -11,8 +11,9 @@ repository.workspace = true
 [features]
 # `runtime` is what handlers use. An application's `build.rs` depends on this
 # crate with `default-features = false, features = ["build"]` to get only the
-# asset embedding helper, without the HTTP/template graph.
-default = ["runtime"]
+# asset embedding helper, without the HTTP/template graph. Both are on by
+# default so the workspace test run covers the build helper too.
+default = ["runtime", "build"]
 runtime = [
     "dep:askama",
     "dep:bytes",

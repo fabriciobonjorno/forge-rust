@@ -21,8 +21,9 @@
 //! # Features
 //!
 //! - `runtime` (default): everything except the build helper.
-//! - `build`: only [`build::embed_assets`], for an application's `build.rs`,
-//!   with no HTTP or template dependencies.
+//! - `build` (default): [`build::embed_assets`]. A `build.rs` should depend
+//!   on this crate with `default-features = false, features = ["build"]` to
+//!   avoid the HTTP and template dependencies.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

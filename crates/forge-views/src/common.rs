@@ -45,6 +45,7 @@ pub(crate) fn valid_component(component: &str) -> bool {
 }
 
 /// Whether `logical` is a relative, `/`-separated path of legal segments.
+#[cfg(feature = "runtime")]
 pub(crate) fn valid_logical(logical: &str) -> bool {
     logical.split('/').all(valid_component)
 }
@@ -88,6 +89,7 @@ mod tests {
         assert_eq!(digested_name("app.css", "abc"), None);
     }
 
+    #[cfg(feature = "runtime")]
     #[test]
     fn components_reject_dotfiles_and_unsafe_characters() {
         for good in ["app.css", "a-b_c.js", "css/app.css"] {
