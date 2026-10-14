@@ -64,7 +64,11 @@ Do not introduce a custom ORM that hides SQL. SQLx/vendor types must not leak in
 
 Required persistence capabilities include migrations, transactions, pooling, advisory locks, optimistic locking, cursor pagination, JSONB, constraints, indexes, PostgreSQL RLS, and checked queries where practical.
 
-Multi-database support is not a Phase 2 goal. Another primary database requires a separate capability and architecture review.
+PostgreSQL is the default backend. The owner decided (2026-10-14) that, like `rails new -d`, `forge new -d postgresql|mysql|sqlite3` selects the backend; ADR 0021 is the capability and architecture review. PostgreSQL-only capabilities (RLS, runtime/migrator roles, `LISTEN/NOTIFY`) are refused explicitly on other backends, never emulated silently. Generated SQL never uses database UUID generators; IDs are UUIDv7 generated in Rust.
+
+## Views
+
+Forge is full-stack like Rails (ADR 0022): `forge new` generates server-rendered views by default and `--api` opts out. Views are compile-time checked, HTML auto-escaping templates in the HTTP adapter ring; generated forms carry CSRF tokens; Hotwire is served through an import map; assets are digested and embedded in the binary.
 
 ## Tenancy and security
 

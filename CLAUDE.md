@@ -59,7 +59,14 @@ Do not weaken architecture tests to make an implementation convenient.
 
 ## Database rules
 
-Phase 2 is PostgreSQL-first. Do not expand to MySQL/SQLite merely because SQLx supports them.
+PostgreSQL is the default and primary backend. Owner decision (2026-10-14): like
+`rails new -d`, `forge new -d postgresql|mysql|sqlite3` selects the backend
+(ADR 0021). PostgreSQL-only capabilities (RLS, runtime/migrator roles,
+`LISTEN/NOTIFY`) stay first-class; on other backends they are refused explicitly,
+never emulated silently, and tenant isolation is enforced by mandatory
+`TenantContext` predicates plus the shared isolation suite on every backend.
+IDs are UUIDv7 generated in Rust on every backend; generated SQL never uses
+database UUID generators (`gen_random_uuid()` is v4).
 
 Persistence must evolve toward:
 
@@ -75,6 +82,15 @@ Persistence must evolve toward:
 - compile-time/offline query checking where practical.
 
 Stable Forge domain/application APIs should use Forge-owned contracts instead of exposing SQLx types.
+
+## View rules
+
+Owner decision (2026-10-14): Forge is full-stack like Rails (ADR 0022).
+`forge new` generates server-rendered views by default; `--api` opts out.
+Views are compile-time checked templates with HTML auto-escaping, live in the
+HTTP adapter ring, and never leak into domain/application. Generated forms carry
+CSRF tokens; Hotwire (Turbo/Stimulus) is served through an import map without a
+mandatory Node toolchain; assets are digested and embedded in the binary.
 
 ## Security rules
 

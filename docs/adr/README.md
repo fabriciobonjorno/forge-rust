@@ -20,6 +20,8 @@ does not mean implementation exists.
 | [0012](0012-structured-append-only-audit-evidence.md) | Structured append-only security audit evidence | Accepted |
 | [0013](0013-persistent-principals-sessions-and-memberships.md) | Persistent principals, credential-digest sessions, and memberships | Accepted |
 | [0014](0014-argon2-session-cookie-and-csrf.md) | Argon2id password authentication, opaque session cookies, and CSRF | Accepted |
+| [0021](0021-selectable-database-backends.md) | Selectable database backends with `forge new -d` | Accepted |
+| [0022](0022-server-rendered-views.md) | Server-rendered views, Hotwire-compatible, full-stack by default | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to
