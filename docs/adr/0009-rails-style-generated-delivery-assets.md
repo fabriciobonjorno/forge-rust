@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-26
+- Refined by: [ADR 0022](0022-server-rendered-views.md)
 - Refines: [ADR 0008](0008-docker-by-default.md) (which remains Accepted)
 
 ## Context
