@@ -82,8 +82,8 @@ Environment:
   FORGE_MAX_CONNECTIONS       maximum concurrent connections (default: 10000)
   FORGE_LOG                   log filter directives (default: info)
   FORGE_LOG_FORMAT            json | text (default: json in production, text otherwise)
-  FORGE_DATABASE_URL           least-privilege PostgreSQL runtime connection URL
-  FORGE_MIGRATION_DATABASE_URL PostgreSQL migration connection URL (required for migrate/rollback)
+  FORGE_DATABASE_URL           least-privilege runtime URL: postgres://, mysql://, mariadb:// or sqlite:
+  FORGE_MIGRATION_DATABASE_URL migration URL, same schemes (required for migrate/rollback)
 
 Unknown FORGE_* variables are rejected at startup.
 "

@@ -8,10 +8,17 @@ description = "Foundational types and lifecycle contracts for Forge applications
 
 [dependencies]
 serde = { workspace = true }
+sqlx = { workspace = true, optional = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
+
+[features]
+# Driver-agnostic SQLx `Type`/`Encode`/`Decode` for `Id<T>` and `Version`.
+sqlx = ["dep:sqlx"]
+# Adds the PostgreSQL array types (`PgHasArrayType`).
+postgres = ["sqlx", "sqlx/postgres"]
 
 [dev-dependencies]
 tokio = { workspace = true }

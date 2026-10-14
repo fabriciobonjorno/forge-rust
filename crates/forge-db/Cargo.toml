@@ -1,7 +1,7 @@
 [package]
 name = "forge-db"
 publish = false
-description = "Database contracts and transaction primitives for Forge applications"
+description = "Database contracts and PostgreSQL, MySQL and SQLite adapters for Forge applications"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,29 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+forge-config = { path = "../forge-config" }
+forge-core = { path = "../forge-core", features = ["sqlx"] }
 forge-tenancy = { path = "../forge-tenancy" }
+sqlx.workspace = true
 thiserror.workspace = true
+tempfile = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# The test suites exercise every backend, so enable them all for this crate's
+# own tests (plain `cargo test` then needs no feature flags).
+forge-db = { path = ".", features = ["postgres", "mysql", "sqlite", "testing"] }
+sqlx = { workspace = true, features = ["macros"] }
+tokio.workspace = true
+
+[features]
+postgres = ["forge-core/postgres", "sqlx/postgres"]
+mysql = ["sqlx/mysql"]
+sqlite = ["sqlx/sqlite"]
+# Isolated, self-cleaning databases for integration tests.
+testing = ["dep:tempfile", "dep:tokio"]
 
 [lints]
 workspace = true

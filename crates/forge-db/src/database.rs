@@ -1,0 +1,300 @@
+//! The generic database handle: pool, transactions, migrations and readiness.
+
+use std::{fmt, str::FromStr, time::Duration};
+
+use async_trait::async_trait;
+use forge_config::{DatabaseScheme, SecretString};
+use sqlx::{Connection, Pool, migrate::Migrator, pool::PoolOptions};
+
+use crate::{
+    Backend, DatabaseError, DbError, RowsAffected, Transaction, TransactionManager,
+    backend::ConnectOptions, migrate,
+};
+
+/// PostgreSQL database handle.
+#[cfg(feature = "postgres")]
+pub type PgDatabase = Database<sqlx::Postgres>;
+/// MySQL 8.4+ / MariaDB 11.4+ database handle.
+#[cfg(feature = "mysql")]
+pub type MySqlDatabase = Database<sqlx::MySql>;
+/// SQLite database handle.
+#[cfg(feature = "sqlite")]
+pub type SqliteDatabase = Database<sqlx::Sqlite>;
+
+/// Pool sizing shared by every backend.
+///
+/// The defaults suit a small service: 10 connections and a 5 second wait for
+/// one. A request that cannot get a connection in time fails with the
+/// retryable [`DbError::PoolTimeout`] instead of queueing indefinitely.
+///
+/// ```
+/// use std::time::Duration;
+/// use forge_db::PoolSettings;
+///
+/// let settings = PoolSettings::default()
+///     .with_max_connections(20)
+///     .with_acquire_timeout(Duration::from_secs(2));
+/// assert_eq!(settings.max_connections(), 20);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct PoolSettings {
+    max_connections: u32,
+    acquire_timeout: Duration,
+}
+
+impl PoolSettings {
+    /// Maximum number of pooled connections (at least 1).
+    #[must_use]
+    pub const fn max_connections(&self) -> u32 {
+        self.max_connections
+    }
+
+    /// How long to wait for a free connection.
+    #[must_use]
+    pub const fn acquire_timeout(&self) -> Duration {
+        self.acquire_timeout
+    }
+
+    /// Sets the maximum number of pooled connections; zero becomes one.
+    #[must_use]
+    pub const fn with_max_connections(mut self, max_connections: u32) -> Self {
+        self.max_connections = if max_connections == 0 {
+            1
+        } else {
+            max_connections
+        };
+        self
+    }
+
+    /// Sets how long to wait for a free connection.
+    #[must_use]
+    pub const fn with_acquire_timeout(mut self, acquire_timeout: Duration) -> Self {
+        self.acquire_timeout = acquire_timeout;
+        self
+    }
+}
+
+impl Default for PoolSettings {
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            acquire_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+/// A connection pool for one backend with Forge's error, migration and
+/// transaction semantics.
+///
+/// `Database` is cheap to clone (the pool is reference counted) and its
+/// `Debug` output never contains the connection URL.
+pub struct Database<B: Backend> {
+    pool: Pool<B>,
+}
+
+impl<B: Backend> Clone for Database<B> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+        }
+    }
+}
+
+impl<B: Backend> fmt::Debug for Database<B> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Database")
+            .field("backend", &<B as Backend>::SCHEME)
+            .field("connections", &self.pool.size())
+            .field("closed", &self.pool.is_closed())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<B: Backend> Database<B> {
+    /// Connects eagerly with the default [`PoolSettings`], failing with the
+    /// retryable [`DbError::Unavailable`] if the database stays unreachable
+    /// for the acquire timeout.
+    ///
+    /// Fails with [`DbError::Configuration`] when the URL scheme does not
+    /// belong to this backend.
+    pub async fn connect(url: &SecretString) -> Result<Self, DbError> {
+        Self::connect_with(url, PoolSettings::default()).await
+    }
+
+    /// Like [`Database::connect`] with explicit pool sizing.
+    pub async fn connect_with(url: &SecretString, settings: PoolSettings) -> Result<Self, DbError> {
+        let (options, pool_options) = Self::prepare(url, settings)?;
+        let pool = pool_options
+            .connect_with(options)
+            .await
+            .map_err(|error| match error {
+                // The pool keeps retrying a refused connection until the acquire
+                // timeout, so a timeout here means the server cannot be reached.
+                sqlx::Error::PoolTimedOut => DbError::Unavailable(error),
+                other => DbError::from(other),
+            })?;
+        Ok(Self { pool })
+    }
+
+    /// Creates a pool that connects on first use, so it succeeds while the
+    /// database is down (queries then fail with a retryable error). Must be
+    /// called inside a Tokio runtime.
+    pub fn connect_lazy(url: &SecretString) -> Result<Self, DbError> {
+        Self::connect_lazy_with(url, PoolSettings::default())
+    }
+
+    /// Like [`Database::connect_lazy`] with explicit pool sizing.
+    pub fn connect_lazy_with(url: &SecretString, settings: PoolSettings) -> Result<Self, DbError> {
+        let (options, pool_options) = Self::prepare(url, settings)?;
+        Ok(Self {
+            pool: pool_options.connect_lazy_with(options),
+        })
+    }
+
+    fn prepare(
+        url: &SecretString,
+        settings: PoolSettings,
+    ) -> Result<(ConnectOptions<B>, PoolOptions<B>), DbError> {
+        let raw = url.expose();
+        if DatabaseScheme::of_url(raw) != Some(<B as Backend>::SCHEME) {
+            return Err(DbError::configuration(format!(
+                "{} requires a {} URL",
+                <B as Backend>::SCHEME.name(),
+                <B as Backend>::SCHEME.accepted_schemes()
+            )));
+        }
+        let options = <ConnectOptions<B> as FromStr>::from_str(raw)
+            .map_err(|_| DbError::configuration("the database URL could not be parsed"))?;
+        let options = <B as crate::backend::sealed::Hooks>::configure(raw, options);
+        let pool_options = PoolOptions::<B>::new()
+            .max_connections(settings.max_connections())
+            .acquire_timeout(settings.acquire_timeout());
+        let pool_options = <B as crate::backend::sealed::Hooks>::pool_options(raw, pool_options);
+        Ok((options, pool_options))
+    }
+
+    /// The underlying SQLx pool, for adapters that run queries.
+    #[must_use]
+    pub fn pool(&self) -> &Pool<B> {
+        &self.pool
+    }
+
+    /// The engine this handle talks to.
+    #[must_use]
+    pub fn scheme(&self) -> DatabaseScheme {
+        <B as Backend>::SCHEME
+    }
+
+    /// Checks that a connection can be acquired and answers a ping. Used by
+    /// readiness probes.
+    pub async fn ping(&self) -> Result<(), DbError> {
+        let mut connection = self.pool.acquire().await?;
+        connection.ping().await?;
+        Ok(())
+    }
+
+    /// Starts a transaction. Dropping it without committing rolls it back.
+    pub async fn begin(&self) -> Result<DbTransaction<B>, DbError> {
+        Ok(DbTransaction {
+            inner: self.pool.begin().await?,
+        })
+    }
+
+    /// Applies every pending migration and returns the versions applied, in
+    /// ascending order (empty when the schema is current).
+    ///
+    /// Concurrent callers are serialized by the backend's migration lock
+    /// (PostgreSQL advisory lock, MySQL/MariaDB named lock; SQLite has a
+    /// single writer). Applied migrations are checksum-verified and a
+    /// previously failed (dirty) migration is rejected.
+    pub async fn migrate(&self, migrator: &Migrator) -> Result<Vec<i64>, DbError> {
+        migrate::apply_pending(&self.pool, migrator).await
+    }
+
+    /// Reverts the most recently applied migration with its down migration
+    /// and returns its version, or `None` when nothing is applied.
+    ///
+    /// Fails with [`DbError::IrreversibleMigration`] when that migration has
+    /// no down migration.
+    pub async fn rollback(&self, migrator: &Migrator) -> Result<Option<i64>, DbError> {
+        migrate::revert_latest(&self.pool, migrator).await
+    }
+
+    /// Closes the pool, waiting for checked-out connections to return.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+}
+
+/// A database transaction. Dropping it without [`commit`](Self::commit) rolls
+/// it back.
+///
+/// Run queries with `query.execute(tx.connection())`.
+pub struct DbTransaction<B: Backend> {
+    inner: sqlx::Transaction<'static, B>,
+}
+
+impl<B: Backend> fmt::Debug for DbTransaction<B> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DbTransaction")
+            .field("backend", &<B as Backend>::SCHEME)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<B: Backend> DbTransaction<B> {
+    /// The transaction's connection, to pass to SQLx queries.
+    pub fn connection(&mut self) -> &mut B::Connection {
+        &mut self.inner
+    }
+
+    /// Commits the transaction.
+    pub async fn commit(self) -> Result<(), DbError> {
+        self.inner.commit().await.map_err(DbError::from)
+    }
+
+    /// Explicitly rolls the transaction back.
+    pub async fn rollback(self) -> Result<(), DbError> {
+        self.inner.rollback().await.map_err(DbError::from)
+    }
+}
+
+#[async_trait]
+impl<B: Backend> Transaction for DbTransaction<B> {
+    async fn commit(self) -> Result<(), DatabaseError> {
+        Self::commit(self).await.map_err(DatabaseError::from)
+    }
+
+    async fn rollback(self) -> Result<(), DatabaseError> {
+        Self::rollback(self).await.map_err(DatabaseError::from)
+    }
+}
+
+#[async_trait]
+impl<B: Backend> TransactionManager for Database<B> {
+    type Transaction<'a>
+        = DbTransaction<B>
+    where
+        Self: 'a;
+
+    async fn begin(&self) -> Result<Self::Transaction<'_>, DatabaseError> {
+        Self::begin(self).await.map_err(DatabaseError::from)
+    }
+}
+
+/// Fails with [`DbError::Conflict`] unless `result` affected exactly
+/// `expected` rows.
+///
+/// The usual use is optimistic locking: `UPDATE ... WHERE id = ? AND version =
+/// ?` matches zero rows when another writer got there first. Works with the
+/// query result of every enabled backend.
+pub fn expect_rows(result: impl RowsAffected, expected: u64) -> Result<(), DbError> {
+    if result.rows_affected() == expected {
+        Ok(())
+    } else {
+        Err(DbError::Conflict)
+    }
+}

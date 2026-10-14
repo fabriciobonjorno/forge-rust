@@ -1,12 +1,72 @@
-//! Database contracts owned by Forge.
+//! Database contracts and backends owned by Forge.
 //!
-//! This crate deliberately contains no SQLx or PostgreSQL types. Application
-//! ports can depend on these transaction/error contracts while concrete SQLx
-//! adapters remain in infrastructure.
+//! # Contracts
+//!
+//! [`DatabaseError`], [`RecordVersion`], [`Transaction`],
+//! [`TransactionManager`], [`PageLimit`], [`CursorPage`], [`Repository`] and
+//! [`TenantRepository`] contain no SQLx types. Application ports depend on
+//! them while concrete adapters stay in infrastructure.
+//!
+//! # Backends
+//!
+//! [`Database<B>`] is the connection handle for a [`Backend`]: PostgreSQL
+//! ([`PgDatabase`], feature `postgres`), MySQL 8.4+ / MariaDB 11.4+
+//! ([`MySqlDatabase`], feature `mysql`) or SQLite ([`SqliteDatabase`], feature
+//! `sqlite`). The features are additive and none is enabled by this crate; the
+//! `forge` facade enables `postgres` by default. Every backend shares the same
+//! pooling, [`DbError`] classification, migration runner and transactions.
+//!
+//! PostgreSQL-only capabilities (transaction-scoped advisory locks, row-level
+//! security through `set_config`) are not emulated elsewhere: see
+//! [`advisory_key`] and `DbTransaction::advisory_xact_lock`.
+//!
+//! The `testing` feature adds [`testing::TestDatabase`], an isolated migrated
+//! database per test that is removed even when the test panics.
 
 use async_trait::async_trait;
+use forge_core::Version;
 use forge_tenancy::TenantContext;
 use thiserror::Error;
+
+mod backend;
+mod database;
+mod error;
+mod migrate;
+
+pub use backend::{Backend, RowsAffected};
+#[cfg(feature = "mysql")]
+pub use database::MySqlDatabase;
+#[cfg(feature = "postgres")]
+pub use database::PgDatabase;
+#[cfg(feature = "sqlite")]
+pub use database::SqliteDatabase;
+pub use database::{Database, DbTransaction, PoolSettings, expect_rows};
+pub use error::DbError;
+#[cfg(feature = "postgres")]
+pub use postgres::advisory_key;
+/// The SQLx version Forge builds on, for macros such as `sqlx::migrate!`.
+pub use sqlx;
+/// Embedded or filesystem migrations, produced by `sqlx::migrate!()`.
+pub use sqlx::migrate::Migrator;
+
+#[cfg(feature = "mysql")]
+mod mysql;
+#[cfg(feature = "postgres")]
+mod postgres;
+#[cfg(feature = "sqlite")]
+mod sqlite;
+
+#[cfg(feature = "testing")]
+pub mod testing;
+
+#[cfg(all(
+    test,
+    feature = "testing",
+    feature = "postgres",
+    feature = "mysql",
+    feature = "sqlite"
+))]
+mod suite;
 
 /// Stable database failure categories exposed across application boundaries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,8 +123,12 @@ impl DatabaseError {
 }
 
 /// Monotonic optimistic-lock value stored with mutable records.
+///
+/// A thin contract-level wrapper over [`forge_core::Version`], which owns the
+/// validation and the SQLx column encoding; convert with `From` when a
+/// repository stores the value.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct RecordVersion(i64);
+pub struct RecordVersion(Version);
 
 impl Default for RecordVersion {
     fn default() -> Self {
@@ -74,35 +138,46 @@ impl Default for RecordVersion {
 
 impl RecordVersion {
     /// Initial version for a newly persisted record.
-    pub const INITIAL: Self = Self(1);
+    pub const INITIAL: Self = Self(Version::INITIAL);
 
     /// Builds a version from a persisted positive value.
     pub fn new(value: i64) -> Result<Self, DatabaseError> {
-        if value < 1 {
-            return Err(DatabaseError::new(
+        Version::new(value).map(Self).map_err(|_| {
+            DatabaseError::new(
                 DatabaseErrorKind::Infrastructure,
                 "invalid persisted record version",
                 false,
-            ));
-        }
-        Ok(Self(value))
+            )
+        })
     }
 
     /// Raw value used by a persistence adapter.
     #[must_use]
     pub const fn get(self) -> i64 {
-        self.0
+        self.0.get()
     }
 
     /// Next value for an optimistic update.
     pub fn next(self) -> Result<Self, DatabaseError> {
-        self.0.checked_add(1).map(Self).ok_or_else(|| {
+        self.0.next().map(Self).map_err(|_| {
             DatabaseError::new(
                 DatabaseErrorKind::Infrastructure,
                 "record version overflow",
                 false,
             )
         })
+    }
+}
+
+impl From<Version> for RecordVersion {
+    fn from(version: Version) -> Self {
+        Self(version)
+    }
+}
+
+impl From<RecordVersion> for Version {
+    fn from(version: RecordVersion) -> Self {
+        version.0
     }
 }
 

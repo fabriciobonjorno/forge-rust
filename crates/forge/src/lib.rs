@@ -22,6 +22,8 @@
 
 mod app;
 mod cli;
+mod compose;
+mod database;
 mod logging;
 mod probe;
 mod signal;
@@ -37,3 +39,4 @@ pub use forge_security as security;
 pub use forge_tenancy as tenancy;
 
 pub use app::App;
+pub use compose::{ComposeError, Composition};
