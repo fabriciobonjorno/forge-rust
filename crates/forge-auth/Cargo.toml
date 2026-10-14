@@ -1,5 +1,6 @@
 [package]
 name = "forge-auth"
+publish = false
 description = "Authentication and server-side session contracts for Forge applications"
 version.workspace = true
 edition.workspace = true

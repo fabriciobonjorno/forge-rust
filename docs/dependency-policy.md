@@ -111,9 +111,8 @@ memory concurrency before raising parameters.
 The RustSec review recorded during admission found historical advisories in old
 `cookie` and `sha2` releases (RUSTSEC-2017-0005 and RUSTSEC-2021-0100);
 the selected versions are above the published patched ranges. This manual review
-does not replace the repository's `cargo deny`/RustSec gate. CI runners were
-not executing at admission time, so automated advisory/license/source validation
-remains an unresolved merge/release gate.
+does not replace the repository's `cargo deny`/RustSec gate, which is now
+configured in `deny.toml` (see [Supply-chain gates](#supply-chain-gates)).
 
 The cookie crate's optional signed/private jar feature is intentionally disabled:
 the cookie carries a 256-bit opaque server-side bearer value, not trusted claims.
@@ -150,6 +149,23 @@ Release builds use `--locked`. Yanked or unmaintained packages require replaceme
 or a time-bounded exception.
 
 ## Supply-chain gates
+
+Gates 1–3 are configured: [`deny.toml`](../deny.toml) encodes the advisory,
+license, ban and source rules below, and
+[`.github/workflows/supply-chain.yml`](../.github/workflows/supply-chain.yml)
+runs `cargo metadata --locked` and `cargo deny check` on every push and pull
+request and daily (RustSec advisories appear without code changes). The gate was
+verified locally with cargo-deny 0.20.2, including negative checks (removing an
+allowed license and banning an in-use crate both fail). It cannot be reported as
+a passing CI gate until GitHub-hosted runners execute for this repository. Run it
+locally with `cargo install --locked cargo-deny && cargo deny check`.
+
+Workspace crates are `publish = false` until a release process exists: their
+internal dependencies are path-only, which crates.io rejects. Publishing requires
+versioned internal dependencies, and `cargo deny` refuses wildcard dependencies on
+any crate that becomes publishable. Reviewed duplicate: `syn` 2 and 3 are both
+present because the `async-trait` proc macro moved to `syn` 3; both are
+build-time only.
 
 CI and release automation will enforce:
 

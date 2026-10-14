@@ -1,5 +1,6 @@
 [package]
 name = "forge-tenancy"
+publish = false
 description = "Explicit tenant membership and authorization context for Forge applications"
 version.workspace = true
 edition.workspace = true

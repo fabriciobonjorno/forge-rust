@@ -1,0 +1,58 @@
+# Supply-chain policy enforced by `cargo deny check`.
+# Rationale and admission rules: docs/dependency-policy.md.
+#
+# Exceptions are reviewed records, not silences. Every `ignore`/`skip` entry must
+# name the affected reachability, the compensating control, an owner and an
+# expiry date in its `reason`, e.g.
+#   { id = "RUSTSEC-0000-0000", reason = "not reachable: <why>; control: <what>; owner: <who>; expires: 2026-12-31" }
+
+[graph]
+# Evaluate every optional backend and feature a generated application can enable.
+all-features = true
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Yanked releases must be replaced, never silently kept.
+yanked = "deny"
+# Unmaintained or unsound crates anywhere in the graph need a recorded decision.
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses compatible with MIT OR Apache-2.0 distribution. Copyleft,
+# source-available, unknown or unlicensed code needs legal review first.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+# The list states policy; a license need not be in use to be acceptable.
+unused-allowed-license = "allow"
+
+[bans]
+# Duplicate versions are reviewed (docs/dependency-policy.md), not auto-failed.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates are `publish = false` until a release process exists; their
+# internal path dependencies are pinned by the lockfile and reviewed in-repo.
+# Publishing requires versioned internal dependencies, which this gate enforces.
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+# crates.io only. Git dependencies are prohibited in releases unless an incident
+# exception pins an immutable commit with provenance and expiry.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

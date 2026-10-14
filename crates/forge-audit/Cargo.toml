@@ -1,5 +1,6 @@
 [package]
 name = "forge-audit"
+publish = false
 description = "Immutable security audit event and append-only sink contracts for Forge applications"
 version.workspace = true
 edition.workspace = true

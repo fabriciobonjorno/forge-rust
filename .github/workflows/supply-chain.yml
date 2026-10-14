@@ -1,0 +1,52 @@
+name: Supply chain
+
+# Enforces docs/dependency-policy.md: locked graph, RustSec advisories,
+# licenses, bans and sources. Advisories are published independently of code
+# changes, so the gate also runs daily against the committed lockfile.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+# Actions are referenced by major-version tag during early development; pin them
+# to full commit SHAs before the first release (docs/dependency-policy.md).
+jobs:
+  locked-graph:
+    name: locked dependency graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: cargo --version
+      - name: Cargo.lock matches every manifest
+        run: cargo metadata --locked --all-features --format-version 1 > /dev/null
+
+  cargo-deny:
+    name: cargo deny (${{ matrix.check }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Advisories are separate so a new RustSec entry never hides a license
+        # or source violation in the same run.
+        check: [advisories, "bans licenses sources"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.check }}
