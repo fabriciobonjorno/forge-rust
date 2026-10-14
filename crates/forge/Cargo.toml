@@ -17,10 +17,16 @@ forge-db = { path = "../forge-db" }
 forge-http = { path = "../forge-http" }
 forge-security = { path = "../forge-security" }
 forge-tenancy = { path = "../forge-tenancy" }
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true
