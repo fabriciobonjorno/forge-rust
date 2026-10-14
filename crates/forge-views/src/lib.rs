@@ -50,6 +50,8 @@ mod render;
 mod test_support;
 #[cfg(feature = "runtime")]
 mod turbo;
+#[cfg(feature = "runtime")]
+pub mod vendor;
 
 #[cfg(feature = "runtime")]
 pub use assets::{AssetEntry, AssetError, AssetSet, DEFAULT_PREFIX};
