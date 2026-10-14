@@ -1,0 +1,3 @@
+{
+    // <forge:page-route-registrations>
+}

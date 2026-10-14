@@ -1,11 +1,3 @@
-use std::process::ExitCode;
-
-fn main() -> ExitCode {
-    match forge_cli::run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("error: {error}");
-            ExitCode::FAILURE
-        }
-    }
+fn main() -> std::process::ExitCode {
+    forge_cli::run()
 }

@@ -97,6 +97,8 @@ Admitted direct dependencies:
 | `cookie` | `0.18.2` | RFC cookie parsing/building and security attributes | defaults disabled; signed/private cookie crypto is not enabled |
 | `tokio` | `1.53.1` | `spawn_blocking` isolation for memory-hard hashing | `rt` only in the generated app |
 | `thiserror` | `2.0.21` | bounded infrastructure errors | existing project dependency family |
+| `rpassword` | `7.5.4` | no-echo terminal input for one-time account bootstrap | pinned release; prompt errors fail closed; no password arguments or environment variables |
+| `zeroize` | `1.8.2` | clear temporary plaintext password buffers after hashing and command completion | pinned release; no derive feature required |
 
 Argon2 and SHA-2 are RustCrypto implementations; token entropy comes directly
 from the operating-system source through getrandom. Forge does not implement

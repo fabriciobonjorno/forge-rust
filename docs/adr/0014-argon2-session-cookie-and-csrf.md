@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-27
 - Refines: [ADR 0010](0010-session-and-tenant-authorization-context.md), [ADR 0013](0013-persistent-principals-sessions-and-memberships.md)
+- Refined by: [ADR 0015](0015-persistent-login-throttling.md), [ADR 0017](0017-version-bound-login-session-issuance.md), [ADR 0018](0018-pre-session-login-csrf.md)
 
 ## Context
 
@@ -17,13 +18,20 @@ correctness risk.
 
 ## Decision
 
-Database-enabled generated applications use maintained ecosystem crates at the
-outer infrastructure boundary:
+Database-enabled generated applications use maintained ecosystem crates and keep
+each mechanism in the ring that owns it:
 
 - `argon2 0.6.0` from RustCrypto for Argon2id password hashing;
 - `getrandom 0.4.3` for 256-bit secrets from the operating-system CSPRNG;
-- `sha2 0.11.0` from RustCrypto for fixed-size SHA-256 bearer/CSRF digests;
-- `cookie 0.18.2` for RFC cookie parsing/building.
+- `sha2 0.11.0` from RustCrypto for fixed-size SHA-256 token digests in
+  `forge-auth` and login-throttle keys in infrastructure;
+- `cookie 0.18.2` in the HTTP adapter for RFC cookie parsing/building.
+
+The framework-owned `SessionBearerToken` and `CsrfToken` types expose only a
+typed digest operation for persistence lookup. The raw token remains an opaque,
+redacted value. HTTP cookie/header parsing, HTTP method policy, and HTTP error
+mapping belong to `adapters/http`; Argon2 policy, OS-random secret issuance, and
+SQL-backed session operations belong to `infrastructure`.
 
 Argon2id uses version 19 with an initial policy of m=19456 KiB, t=2, p=1 and a
 32-byte output. Work runs through Tokio `spawn_blocking` instead of occupying
@@ -66,10 +74,13 @@ custom cookie grammar.
 - Password hashing has a measurable memory/CPU cost and requires capacity tests.
 - Successful authentication upgrades outdated Argon2id parameters without
   exposing infrastructure types to application code.
+- Infrastructure modules do not depend on HTTP request, response, cookie, or
+  routing types; the generated architecture check enforces this boundary.
 - Concurrent password changes/disables cannot be overwritten by a stale rehash.
 - Applications need rate limiting/throttling in addition to expensive hashing.
-- HTTP login/logout/tenant-selection endpoints remain application adapters built
-  from these mechanisms rather than universal routes imposed by the framework.
+- The generated PostgreSQL scaffold composes login and logout adapter routes
+  only when the operator configures a trusted public origin. Tenant selection
+  and authorization remain application-specific routes.
 
 Historical RustSec advisories for old cookie and sha2 releases are outside the
 selected version ranges. Automated advisory/license/source checks remain release

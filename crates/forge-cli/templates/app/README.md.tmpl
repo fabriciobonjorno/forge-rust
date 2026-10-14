@@ -37,6 +37,10 @@ role for the application:
 export FORGE_MIGRATION_DATABASE_URL='%%DATABASE_MIGRATION_URL_LOCAL%%'
 forge migrate                 # or: cargo run -- migrate
 
+# Run once after migrations; the password is read from the terminal without echo.
+cargo run -- bootstrap-account admin@example.com 'Acme Hospital'
+unset FORGE_MIGRATION_DATABASE_URL
+
 export FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'
 cargo run
 ```
@@ -46,6 +50,14 @@ Database-enabled applications include `infrastructure::audit::PgAuditSink`,
 `infrastructure::tenancy::PgMembershipStore`. The runtime role can append
 structured security-audit events but cannot read, update, or delete audit
 history.
+
+The one-shot `bootstrap-account` command requires
+`FORGE_MIGRATION_DATABASE_URL`, refuses to run after any principal exists, and
+atomically creates the initial tenant, login, active `owner` membership and
+`principal.bootstrap` / `tenant.bootstrap` audit evidence. The generated
+application's deny-by-default RBAC policy must explicitly grant permissions to
+`owner` before protected operations are allowed. Keep the migration credential
+out of the serving process.
 
 Create a reversible application migration with:
 
@@ -73,6 +85,10 @@ reversible migration.
 
 Configuration uses `FORGE_*` environment variables; unknown `FORGE_*` keys are
 rejected at startup. Run `cargo run -- help` for the full list.
+Forwarded client addresses are ignored by default. Behind a reverse proxy, set
+`FORGE_TRUSTED_PROXIES` to the proxy's exact IP or narrow CIDR only when it
+sanitizes/appends `X-Forwarded-For`; never trust a client-controlled forwarding
+header by itself.
 
 %%if docker%%
 ## Container
@@ -109,11 +125,29 @@ can read them with `current_setting('forge.tenant_id', true)` and
 Argon2id password hashing (m=19456 KiB, t=2, p=1) on Tokio blocking workers,
 independent 256-bit session/CSRF tokens from the OS CSPRNG, SHA-256 persistence
 digests, a Secure/HttpOnly/SameSite=Lax `__Host-forge_session` cookie, generic
-login denials, automatic Argon2id policy upgrades after successful verification,
-request session lookup and CSRF enforcement for unsafe methods. Password rehashes
-use optimistic credential versions so a concurrent password change or disable
-cannot be overwritten. The bearer cookie and CSRF token are separate secrets;
+login denials, request session lookup and CSRF enforcement for unsafe methods.
+Password verification yields an in-process proof bound to the observed credential
+hash and version. Session issuance revalidates it under a PostgreSQL row lock and
+commits any Argon2id policy upgrade, session digests, and success audit event in
+one transaction before returning client secrets. Stale or disabled credentials
+fail closed. PostgreSQL-backed authentication also atomically limits
+attempts per normalized login and observed socket peer across replicas. Its
+SHA-256 throttle keys are pseudonymous rather than anonymized, and forwarded
+headers are ignored until a trusted-proxy policy is configured. The bearer
+cookie and CSRF token are separate secrets;
 never place the CSRF token
 inside the HttpOnly session cookie.
+When `FORGE_PUBLIC_ORIGIN` is configured, the generated app wires `GET
+/auth/csrf` and `POST /auth/login`. The former returns a readable CSRF token
+and sets its host-only cookie; send that token in `x-csrf-token` and the exact
+configured `Origin` when posting `{"login":"...","password":"..."}`. The
+login response sets the HttpOnly session cookie, rotates the CSRF cookie, and
+returns the new CSRF token. Without the trusted origin, these routes are not
+registered. `POST /auth/logout` requires the authenticated session cookie, its
+session-bound `x-csrf-token`, and the exact configured `Origin`; it revokes the
+session and appends `session.logout` in one transaction, then clears both
+cookies. Authenticated route middleware, account provisioning, and tenant-aware
+authorization are not wired yet; these endpoints are not a complete
+account-management system.
 %%end%%
 %%end%%

@@ -1,16 +1,18 @@
 //! Authentication and server-side session contracts.
 //!
-//! This crate models session lifecycle and authenticated identity. It does not
-//! implement password hashing, cookie signing, or bearer-token cryptography;
-//! those are adapter mechanisms that require separate dependency/security
-//! review. A session proves identity only. Tenant roles are resolved separately
-//! so authorization changes do not remain stale inside credentials.
+//! This crate models session lifecycle, authenticated identity, and digest-only
+//! lookup keys for opaque credentials. It does not implement password hashing
+//! or cookie signing; those are adapter mechanisms that require separate
+//! dependency/security review. A session proves identity only. Tenant roles
+//! are resolved separately so authorization changes do not remain stale inside
+//! credentials.
 
 use std::num::NonZeroU64;
 
 use async_trait::async_trait;
 use forge_core::Id;
 use forge_security::PrincipalId;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Marker type for a session identity.
@@ -69,6 +71,12 @@ impl SessionBearerToken {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    /// Returns the one-way digest used for persistent session lookup.
+    #[must_use]
+    pub fn digest(&self) -> SessionCredentialDigest {
+        SessionCredentialDigest::from_bytes(credential_digest(self.0.as_bytes()))
+    }
 }
 
 impl std::fmt::Debug for SessionBearerToken {
@@ -93,6 +101,16 @@ impl CsrfToken {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    /// Returns the one-way digest stored with the bound session.
+    #[must_use]
+    pub fn digest(&self) -> CsrfTokenDigest {
+        CsrfTokenDigest::from_bytes(credential_digest(self.0.as_bytes()))
+    }
+}
+
+fn credential_digest(value: &[u8]) -> [u8; 32] {
+    Sha256::digest(value).into()
 }
 
 impl std::fmt::Debug for CsrfToken {
@@ -127,13 +145,13 @@ pub enum CredentialError {
 /// Fixed-size digest of an opaque session bearer credential.
 ///
 /// The raw bearer token is intentionally not part of Forge's persistence
-/// contract. Infrastructure adapters derive this digest with a reviewed
-/// cryptographic hash before calling a SessionStore.
+/// contract. [`SessionBearerToken::digest`] derives this digest before calling
+/// a `SessionStore`.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct SessionCredentialDigest([u8; 32]);
 
 impl SessionCredentialDigest {
-    /// Wraps a 256-bit credential digest produced by a cryptographic adapter.
+    /// Wraps a 256-bit credential digest.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -157,7 +175,7 @@ impl std::fmt::Debug for SessionCredentialDigest {
 pub struct CsrfTokenDigest([u8; 32]);
 
 impl CsrfTokenDigest {
-    /// Wraps a 256-bit digest produced by a cryptographic adapter.
+    /// Wraps a 256-bit credential digest.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -491,6 +509,128 @@ pub trait PasswordCredentialStore: Send + Sync {
     ) -> Result<(), PasswordCredentialStoreError>;
 }
 
+/// Opaque key used by durable login-attempt throttling. Callers should derive
+/// it with a keyed digest when the application has a stable secret available;
+/// the key itself is never a login name, address, or bearer credential.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct LoginAttemptKey([u8; 32]);
+
+impl LoginAttemptKey {
+    /// Wraps a fixed-width digest suitable for use as a throttle key.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the digest bytes for persistence.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for LoginAttemptKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LoginAttemptKey([REDACTED])")
+    }
+}
+
+/// Limits applied independently to one normalized login and one client key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoginAttemptPolicy {
+    max_per_login: u32,
+    max_per_client: u32,
+    window_seconds: u32,
+}
+
+impl LoginAttemptPolicy {
+    /// Creates a policy. Every count and the window must be positive; windows
+    /// are capped at seven days to bound persisted throttling state.
+    #[must_use]
+    pub const fn new(max_per_login: u32, max_per_client: u32, window_seconds: u32) -> Option<Self> {
+        if max_per_login == 0
+            || max_per_client == 0
+            || window_seconds == 0
+            || window_seconds > 604_800
+        {
+            return None;
+        }
+        Some(Self {
+            max_per_login,
+            max_per_client,
+            window_seconds,
+        })
+    }
+
+    /// Default web login policy: five attempts per login, thirty per client,
+    /// in a shared fifteen-minute fixed window.
+    #[must_use]
+    pub const fn web_default() -> Self {
+        Self {
+            max_per_login: 5,
+            max_per_client: 30,
+            window_seconds: 900,
+        }
+    }
+
+    /// Maximum requests for one login key in the active window.
+    #[must_use]
+    pub const fn max_per_login(self) -> u32 {
+        self.max_per_login
+    }
+
+    /// Maximum requests for one client key in the active window.
+    #[must_use]
+    pub const fn max_per_client(self) -> u32 {
+        self.max_per_client
+    }
+
+    /// Fixed-window duration in seconds.
+    #[must_use]
+    pub const fn window_seconds(self) -> u32 {
+        self.window_seconds
+    }
+}
+
+/// Decision returned after one login request is durably counted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoginAttemptDecision {
+    /// Neither the login nor client limit has been reached.
+    Allowed,
+    /// At least one limit is exhausted; wait this many seconds before retrying.
+    Limited { retry_after_seconds: NonZeroU64 },
+}
+
+/// Persistence boundary for shared, atomic login-attempt throttling.
+#[async_trait]
+pub trait LoginAttemptStore: Send + Sync {
+    /// Atomically records one attempt against both keys and returns the
+    /// resulting policy decision. Implementations must fail closed when their
+    /// backing store is unavailable and must not persist raw identifiers.
+    async fn record_and_check(
+        &self,
+        login: &LoginAttemptKey,
+        client: &LoginAttemptKey,
+        policy: LoginAttemptPolicy,
+    ) -> Result<LoginAttemptDecision, LoginAttemptStoreError>;
+
+    /// Clears only the login-key bucket after successful password verification.
+    /// Client-wide throttling remains in force so one successful account cannot
+    /// reset another login's abuse counter.
+    async fn clear_login(&self, login: &LoginAttemptKey) -> Result<(), LoginAttemptStoreError>;
+}
+
+/// Safe login-attempt persistence failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum LoginAttemptStoreError {
+    /// Durable throttling storage could not safely record the request.
+    #[error("login attempt store unavailable")]
+    Unavailable,
+    /// Stored throttle state violates the contract invariants.
+    #[error("invalid persisted login attempt state")]
+    CorruptRecord,
+}
+
 /// Safe password credential persistence error.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum PasswordCredentialStoreError {
@@ -601,6 +741,24 @@ mod tests {
                 .get(),
             7
         );
+    }
+
+    #[test]
+    fn login_attempt_policy_rejects_zero_or_unbounded_windows() {
+        assert!(LoginAttemptPolicy::new(0, 10, 60).is_none());
+        assert!(LoginAttemptPolicy::new(10, 0, 60).is_none());
+        assert!(LoginAttemptPolicy::new(10, 10, 0).is_none());
+        assert!(LoginAttemptPolicy::new(10, 10, 604_801).is_none());
+        assert_eq!(LoginAttemptPolicy::web_default().max_per_login(), 5);
+        assert_eq!(LoginAttemptPolicy::web_default().max_per_client(), 30);
+        assert_eq!(LoginAttemptPolicy::web_default().window_seconds(), 900);
+    }
+
+    #[test]
+    fn login_attempt_keys_are_redacted_from_debug() {
+        let key = LoginAttemptKey::from_bytes([0xAB; 32]);
+        assert_eq!(format!("{key:?}"), "LoginAttemptKey([REDACTED])");
+        assert_eq!(key.as_bytes(), &[0xAB; 32]);
     }
 
     #[test]
@@ -723,6 +881,7 @@ mod tests {
         let encoded = "ab".repeat(32);
         let bearer = SessionBearerToken::new(encoded.clone()).expect("valid bearer");
         let csrf = CsrfToken::new(encoded).expect("valid csrf token");
+        assert_eq!(bearer.digest().as_bytes(), csrf.digest().as_bytes());
         assert!(format!("{bearer:?}").contains("[REDACTED]"));
         assert!(format!("{csrf:?}").contains("[REDACTED]"));
         assert!(SessionBearerToken::new("AB".repeat(32)).is_err());

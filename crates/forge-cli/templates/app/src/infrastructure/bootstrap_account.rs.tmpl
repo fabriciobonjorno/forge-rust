@@ -1,0 +1,108 @@
+//! First-account persistence using the one-shot migration credential.
+
+use crate::application::bootstrap_account::{BootstrapAccountError, BootstrapAccountStore};
+use crate::infrastructure::audit::append_with;
+use async_trait::async_trait;
+use forge::audit::AuditEvent;
+use forge::auth::PasswordHash;
+use forge::security::PrincipalId;
+use forge::tenancy::TenantId;
+use sqlx::PgPool;
+
+/// PostgreSQL adapter used only by the explicit `bootstrap-account` command.
+pub struct PostgresBootstrapAccountStore {
+    pool: PgPool,
+}
+
+impl PostgresBootstrapAccountStore {
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl BootstrapAccountStore for PostgresBootstrapAccountStore {
+    async fn create_first_tenant_owner(
+        &self,
+        principal_id: PrincipalId,
+        tenant_id: TenantId,
+        login: &str,
+        tenant_name: &str,
+        password_hash: &PasswordHash,
+        events: &[AuditEvent; 2],
+    ) -> Result<(), BootstrapAccountError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| BootstrapAccountError::Unavailable)?;
+
+        // Serialize all bootstrap attempts, including concurrent invocations
+        // on different processes, before checking the empty-principal invariant.
+        sqlx::query("SELECT pg_advisory_xact_lock(731942, 1)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| BootstrapAccountError::Unavailable)?;
+
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM forge_principals)
+                 OR EXISTS (SELECT 1 FROM forge_tenants)",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| BootstrapAccountError::Unavailable)?;
+        if exists {
+            return Err(BootstrapAccountError::AlreadyBootstrapped);
+        }
+
+        sqlx::query("INSERT INTO forge_tenants (id, name) VALUES ($1, $2)")
+            .bind(tenant_id.into_uuid())
+            .bind(tenant_name)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| BootstrapAccountError::Unavailable)?;
+
+        sqlx::query(
+            "INSERT INTO forge_principals (id, login, password_hash)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(principal_id.into_uuid())
+        .bind(login)
+        .bind(password_hash.expose())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            if error
+                .as_database_error()
+                .is_some_and(|database| database.code().as_deref() == Some("23505"))
+            {
+                BootstrapAccountError::AlreadyBootstrapped
+            } else {
+                BootstrapAccountError::Unavailable
+            }
+        })?;
+
+        sqlx::query(
+            "INSERT INTO forge_tenant_memberships (tenant_id, principal_id, roles, state)
+             VALUES ($1, $2, ARRAY['owner']::text[], 'active')",
+        )
+        .bind(tenant_id.into_uuid())
+        .bind(principal_id.into_uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| BootstrapAccountError::Unavailable)?;
+
+        append_with(&mut *transaction, &events[0])
+            .await
+            .map_err(|_| BootstrapAccountError::Unavailable)?;
+        append_with(&mut *transaction, &events[1])
+            .await
+            .map_err(|_| BootstrapAccountError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| BootstrapAccountError::Unavailable)?;
+        Ok(())
+    }
+}

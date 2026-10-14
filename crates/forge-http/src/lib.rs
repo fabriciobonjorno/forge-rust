@@ -5,8 +5,14 @@
 //! internals. This keeps the adapter replaceable and application code stable.
 
 use std::{
-    collections::HashMap, convert::Infallible, fmt, future::Future, net::SocketAddr, pin::Pin,
-    sync::Arc, time::Duration,
+    collections::HashMap,
+    convert::Infallible,
+    fmt,
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -29,6 +35,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, warn};
 use uuid::Uuid;
 
+mod encoding;
+mod proxy;
+mod query;
+mod routing;
+
+pub use crate::proxy::ClientIpError;
+use crate::query::QueryError;
+
 /// Pause after a failed `accept` so transient errors such as `EMFILE` do not
 /// turn the accept loop into a busy loop.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
@@ -43,6 +57,7 @@ pub struct Request {
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
+    path_params: HashMap<String, String>,
     remote_addr: SocketAddr,
     request_id: Uuid,
 }
@@ -78,15 +93,83 @@ impl Request {
         self.remote_addr
     }
 
+    /// Resolves the originating client IP using explicitly trusted proxy CIDRs.
+    ///
+    /// `X-Forwarded-For` is ignored unless the direct TCP peer is configured as
+    /// trusted. For a trusted peer, a missing, malformed or unbounded chain is
+    /// an error so callers cannot accidentally rate-limit everyone by proxy IP.
+    pub fn client_ip(
+        &self,
+        trusted_proxies: &[forge_config::IpNetwork],
+    ) -> Result<IpAddr, ClientIpError> {
+        crate::proxy::resolve_client_ip(self.remote_addr.ip(), &self.headers, trusted_proxies)
+    }
+
     /// Server-generated UUIDv7 correlation identifier.
     #[must_use]
     pub fn request_id(&self) -> Uuid {
         self.request_id
     }
 
+    /// Creates a new request for testing purposes.
+    ///
+    /// This constructor is intended for use in tests only.
+    pub fn new_for_test(
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+        remote_addr: SocketAddr,
+        request_id: Uuid,
+    ) -> Self {
+        Self {
+            method,
+            uri,
+            headers,
+            body,
+            path_params: HashMap::new(),
+            remote_addr,
+            request_id,
+        }
+    }
+
     /// Decodes a JSON request body.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, JsonError> {
         serde_json::from_slice(&self.body).map_err(JsonError::Decode)
+    }
+
+    /// Decodes the query string into `T`.
+    ///
+    /// The query string is the part of the URI after `?`. It uses strict
+    /// `application/x-www-form-urlencoded` decoding and rejects empty segments,
+    /// repeated parameters, and unknown parameters when the target type uses
+    /// `#[serde(deny_unknown_fields)]`.
+    pub fn query<T: DeserializeOwned>(&self) -> Result<T, QueryError> {
+        crate::query::decode(self.uri.query())
+    }
+
+    /// Parses a named parameter captured by a dynamic route such as
+    /// `/customers/{id}`. Percent escapes are decoded before parsing; `+`
+    /// remains a literal plus, as it does in a URL path. Returns an error if the
+    /// parameter is missing, malformed or cannot be parsed as `T`.
+    pub fn path_param_as<T>(&self, name: &str) -> Result<T, PathParamError>
+    where
+        T: std::str::FromStr,
+        T::Err: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let value = self
+            .path_params
+            .get(name)
+            .ok_or_else(|| PathParamError::Missing {
+                name: name.to_owned(),
+            })?;
+        let decoded =
+            crate::encoding::percent_decode(value, false).map_err(|_| PathParamError::Invalid {
+                name: name.to_owned(),
+            })?;
+        decoded.parse().map_err(|_| PathParamError::Invalid {
+            name: name.to_owned(),
+        })
     }
 }
 
@@ -131,6 +214,24 @@ impl Response {
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.headers
     }
+
+    /// Returns response headers for adapters and in-process consumers.
+    #[must_use]
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    /// Returns the response status code.
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// Returns the response body.
+    #[must_use]
+    pub fn body(&self) -> &Bytes {
+        &self.body
+    }
 }
 
 /// JSON boundary error.
@@ -142,6 +243,26 @@ pub enum JsonError {
     /// Response serialization failed.
     #[error("response could not be serialized")]
     Encode(#[source] serde_json::Error),
+}
+
+/// Path parameter extraction error.
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum PathParamError {
+    /// A required path parameter was not found in the route.
+    #[error("missing path parameter {name}")]
+    Missing { name: String },
+    /// A path parameter could not be parsed as the requested type.
+    #[error("invalid path parameter {name}")]
+    Invalid { name: String },
+}
+
+impl PathParamError {
+    /// Returns the parameter name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Missing { name } | Self::Invalid { name } => name,
+        }
+    }
 }
 
 /// Object-safe asynchronous HTTP handler.
@@ -163,14 +284,15 @@ where
 /// Immutable route table once attached to a server.
 #[derive(Default)]
 pub struct Router {
-    routes: HashMap<(Method, String), Arc<dyn Handler>>,
+    root: routing::Node,
+    routes: Vec<(Method, String)>,
 }
 
 impl fmt::Debug for Router {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut routes: Vec<String> = self
             .routes
-            .keys()
+            .iter()
             .map(|(method, path)| format!("{method} {path}"))
             .collect();
         routes.sort_unstable();
@@ -188,19 +310,34 @@ impl Router {
         Self::default()
     }
 
-    /// Registers a route and rejects duplicates.
+    /// Registers a route and rejects duplicate or ambiguous method/pattern
+    /// pairs. Whole path segments may be named captures such as `{id}`.
+    /// Static segments take precedence over capture segments during dispatch.
     pub fn route(
         &mut self,
         method: Method,
         path: impl Into<String>,
         handler: impl Handler,
     ) -> Result<&mut Self, RouteError> {
-        let path = validate_path(path.into())?;
-        let key = (method.clone(), path.clone());
-        if self.routes.contains_key(&key) {
-            return Err(RouteError::Duplicate { method, path });
-        }
-        self.routes.insert(key, Arc::new(handler));
+        let path = path.into();
+        let segments = routing::parse_pattern(&path)?;
+        let params = segments
+            .iter()
+            .filter_map(|segment| match segment {
+                routing::Segment::Param(name) => Some(Arc::clone(name)),
+                routing::Segment::Static(_) => None,
+            })
+            .collect::<Vec<_>>();
+        self.root.insert(
+            segments,
+            routing::Endpoint {
+                method: method.clone(),
+                path: Arc::from(path.as_str()),
+                params: params.into_boxed_slice(),
+                handler: Arc::new(handler),
+            },
+        )?;
+        self.routes.push((method, path));
         Ok(self)
     }
 
@@ -221,21 +358,29 @@ impl Router {
         })
     }
 
-    async fn dispatch(&self, request: Request) -> Response {
+    pub async fn dispatch(&self, request: Request) -> Response {
         let path = request.uri.path().to_owned();
-        if let Some(handler) = self.routes.get(&(request.method.clone(), path.clone())) {
-            return handler.call(request).await;
-        }
-
-        if self
-            .routes
-            .keys()
-            .any(|(_, route_path)| route_path == &path)
-        {
-            return Response::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
-        }
-
-        Response::new(StatusCode::NOT_FOUND, "not found")
+        let mut captures = Vec::new();
+        let Some(node) = self.root.find(&path, &mut captures) else {
+            return Response::new(StatusCode::NOT_FOUND, "not found");
+        };
+        let Some(endpoint) = node.endpoint(&request.method) else {
+            let allow = node.allow();
+            let mut response = Response::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+            if let Ok(value) = HeaderValue::from_str(&allow) {
+                response.headers.insert(header::ALLOW, value);
+            }
+            return response;
+        };
+        let params = endpoint
+            .params
+            .iter()
+            .zip(captures)
+            .map(|(name, value)| (name.to_string(), value.to_owned()))
+            .collect();
+        let mut request = request;
+        request.path_params = params;
+        endpoint.handler.call(request).await
     }
 }
 
@@ -246,13 +391,6 @@ fn static_json(status: StatusCode, body: &'static str) -> Response {
         HeaderValue::from_static(JSON_CONTENT_TYPE),
     );
     response
-}
-
-fn validate_path(path: String) -> Result<String, RouteError> {
-    if !path.starts_with('/') || path.contains('?') || path.contains('#') {
-        return Err(RouteError::InvalidPath(path));
-    }
-    Ok(path)
 }
 
 /// Route registration error detected before serving traffic.
@@ -268,6 +406,19 @@ pub enum RouteError {
         method: Method,
         /// Absolute request path.
         path: String,
+    },
+    /// A route pattern uses the same parameter name more than once.
+    #[error("duplicate parameter {name:?} in route path {path:?}")]
+    DuplicateParameter { path: String, name: String },
+    /// Two route patterns have the same shape and method but different parameter names.
+    #[error("ambiguous route: {method} {path} conflicts with existing route {existing}")]
+    Ambiguous {
+        /// HTTP method.
+        method: Method,
+        /// The newly registered route pattern.
+        path: String,
+        /// The route pattern that was already registered.
+        existing: String,
     },
 }
 
@@ -486,6 +637,7 @@ async fn handle_request(
                 uri: parts.uri,
                 headers: parts.headers,
                 body,
+                path_params: HashMap::new(),
                 remote_addr,
                 request_id,
             };
@@ -567,6 +719,28 @@ pub enum ServerError {
     Bind(#[source] std::io::Error),
 }
 
+/// Readiness check trait for health probes.
+///
+/// Implementations should perform a quick check (e.g., database ping)
+/// and return an error if the dependency is unavailable.
+#[async_trait::async_trait]
+pub trait ReadinessCheck: Send + Sync {
+    /// Unique name of this check for logging.
+    fn name(&self) -> &'static str;
+
+    /// Performs the readiness check.
+    async fn check(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Boxed readiness check future.
+pub type BoxReadinessFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+            + Send
+            + 'a,
+    >,
+>;
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -587,6 +761,7 @@ mod tests {
             uri: path.parse().expect("valid test URI"),
             headers: HeaderMap::new(),
             body: Bytes::new(),
+            path_params: HashMap::new(),
             remote_addr: "127.0.0.1:4000".parse().expect("valid test address"),
             request_id: Uuid::now_v7(),
         }
@@ -605,6 +780,143 @@ mod tests {
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body, "customers");
+    }
+
+    #[tokio::test]
+    async fn dynamic_route_captures_and_decodes_typed_path_parameters() {
+        let mut router = Router::new();
+        router
+            .route(
+                Method::GET,
+                "/customers/{id}",
+                |request: Request| async move {
+                    let id: Uuid = request
+                        .path_param_as("id")
+                        .expect("route should provide a valid UUID capture");
+                    Response::new(StatusCode::OK, id.to_string())
+                },
+            )
+            .expect("dynamic route must register");
+
+        let id = Uuid::now_v7();
+        let response = router
+            .dispatch(request(Method::GET, &format!("/customers/{id}")))
+            .await;
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, id.to_string());
+    }
+
+    #[tokio::test]
+    async fn dynamic_route_percent_decodes_utf8_without_form_decoding_plus() {
+        let mut router = Router::new();
+        router
+            .route(
+                Method::GET,
+                "/products/{slug}",
+                |request: Request| async move {
+                    let slug: String = request.path_param_as("slug").expect("valid path capture");
+                    Response::new(StatusCode::OK, slug)
+                },
+            )
+            .expect("dynamic route must register");
+
+        let response = router
+            .dispatch(request(Method::GET, "/products/caf%C3%A9%2Btea"))
+            .await;
+
+        assert_eq!(response.body, "café+tea");
+    }
+
+    #[tokio::test]
+    async fn static_routes_take_precedence_over_parameters() {
+        let mut router = Router::new();
+        router
+            .route(
+                Method::GET,
+                "/customers/{id}",
+                |request: Request| async move {
+                    let id: String = request.path_param_as("id").expect("id capture");
+                    Response::new(StatusCode::OK, format!("customer:{id}"))
+                },
+            )
+            .expect("parameter route must register");
+        router
+            .route(Method::GET, "/customers/new", |_| async {
+                Response::new(StatusCode::OK, "new-customer")
+            })
+            .expect("static route must register");
+
+        let response = router
+            .dispatch(request(Method::GET, "/customers/new"))
+            .await;
+
+        assert_eq!(response.body, "new-customer");
+    }
+
+    #[tokio::test]
+    async fn dynamic_path_parameter_errors_are_distinguishable() {
+        let mut router = Router::new();
+        router
+            .route(
+                Method::GET,
+                "/customers/{id}",
+                |request: Request| async move {
+                    let result = request.path_param_as::<u64>("id");
+                    let status = match result {
+                        Ok(_) => StatusCode::OK,
+                        Err(PathParamError::Missing { .. }) => StatusCode::INTERNAL_SERVER_ERROR,
+                        Err(PathParamError::Invalid { .. }) => StatusCode::BAD_REQUEST,
+                    };
+                    Response::empty(status)
+                },
+            )
+            .expect("dynamic route must register");
+
+        let invalid = router
+            .dispatch(request(Method::GET, "/customers/not-a-number"))
+            .await;
+        let malformed_escape = router
+            .dispatch(request(Method::GET, "/customers/%GG"))
+            .await;
+
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+        assert_eq!(malformed_escape.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn dynamic_route_method_mismatch_reports_allowed_methods() {
+        let mut router = Router::new();
+        router
+            .route(Method::GET, "/customers/{id}", |_| async {
+                Response::empty(StatusCode::OK)
+            })
+            .expect("dynamic route must register");
+
+        let response = router
+            .dispatch(request(Method::POST, "/customers/123"))
+            .await;
+
+        assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers[header::ALLOW], "GET");
+    }
+
+    #[test]
+    fn ambiguous_dynamic_routes_are_rejected() {
+        let mut router = Router::new();
+        router
+            .route(Method::GET, "/customers/{id}", |_| async {
+                Response::empty(StatusCode::OK)
+            })
+            .expect("first parameter route must register");
+
+        let error = router
+            .route(Method::GET, "/customers/{customer_id}", |_| async {
+                Response::empty(StatusCode::OK)
+            })
+            .expect_err("equivalent parameter route must be rejected");
+
+        assert!(matches!(error, RouteError::Ambiguous { .. }));
     }
 
     #[tokio::test]
@@ -728,6 +1040,8 @@ mod tests {
             shutdown_grace: Duration::from_secs(30),
             max_body_bytes: 64,
             max_connections: 16,
+            public_origin: None,
+            trusted_proxies: Vec::new(),
         }
     }
 

@@ -2,7 +2,7 @@
 name = "forge-config"
 description = "Typed, validated runtime configuration for Forge applications"
 version.workspace = true
-edition.workspace = true
+edition = "2024"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

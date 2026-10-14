@@ -10,9 +10,13 @@
 mod error;
 mod id;
 mod lifecycle;
+mod pagination;
+mod version;
 
-pub use error::{ErrorCategory, ErrorMetadata, ErrorReport, ForgeError, Result};
+pub use error::{ErrorCategory, ErrorMetadata, ErrorReport, ForgeError, IntoForgeError, Result};
 pub use id::{Id, InvalidId};
 pub use lifecycle::{
     BoxLifecycleFuture, Cancellation, Lifecycle, LifecycleContext, LifecycleState,
 };
+pub use pagination::{Page, PageLimit, PageRequest};
+pub use version::Version;

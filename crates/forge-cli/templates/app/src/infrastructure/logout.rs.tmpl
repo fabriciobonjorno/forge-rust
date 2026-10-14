@@ -1,0 +1,63 @@
+//! PostgreSQL transaction for session revocation and audit evidence.
+
+use crate::application::logout::{LogoutSessionError, LogoutSessionStore};
+use crate::infrastructure::audit::append_with;
+use async_trait::async_trait;
+use forge::audit::AuditEvent;
+use forge::auth::{AuthenticatedPrincipal, UnixTimestamp};
+use sqlx::PgPool;
+
+pub struct PostgresLogoutSessionStore {
+    pool: PgPool,
+}
+
+impl PostgresLogoutSessionStore {
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LogoutSessionStore for PostgresLogoutSessionStore {
+    async fn revoke_with_audit(
+        &self,
+        principal: AuthenticatedPrincipal,
+        revoked_at: UnixTimestamp,
+        event: &AuditEvent,
+    ) -> Result<(), LogoutSessionError> {
+        let revoked_at =
+            i64::try_from(revoked_at.as_secs()).map_err(|_| LogoutSessionError::Unavailable)?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| LogoutSessionError::Unavailable)?;
+
+        let result = sqlx::query(
+            "UPDATE forge_sessions
+             SET revoked_at = to_timestamp($3::double precision)
+             WHERE id = $1 AND principal_id = $2
+               AND revoked_at IS NULL
+               AND issued_at <= to_timestamp($3::double precision)
+               AND expires_at > to_timestamp($3::double precision)",
+        )
+        .bind(principal.session_id().into_uuid())
+        .bind(principal.principal_id().into_uuid())
+        .bind(revoked_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| LogoutSessionError::Unavailable)?;
+
+        if result.rows_affected() != 1 {
+            return Err(LogoutSessionError::InvalidSession);
+        }
+        append_with(&mut *transaction, event)
+            .await
+            .map_err(|_| LogoutSessionError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| LogoutSessionError::Unavailable)
+    }
+}

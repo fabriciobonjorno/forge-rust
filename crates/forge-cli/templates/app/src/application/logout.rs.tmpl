@@ -1,0 +1,61 @@
+//! Audited session termination use case.
+
+use async_trait::async_trait;
+use forge::audit::{AuditAction, AuditActor, AuditEvent, AuditLink, AuditOutcome};
+use forge::auth::{AuthenticatedPrincipal, UnixTimestamp};
+
+#[async_trait]
+pub trait LogoutSessionStore: Send + Sync {
+    /// Revokes exactly the authenticated principal's session and appends its
+    /// audit event atomically.
+    async fn revoke_with_audit(
+        &self,
+        principal: AuthenticatedPrincipal,
+        revoked_at: UnixTimestamp,
+        event: &AuditEvent,
+    ) -> Result<(), LogoutSessionError>;
+}
+
+pub struct LogoutSession {
+    store: Box<dyn LogoutSessionStore>,
+}
+
+impl LogoutSession {
+    #[must_use]
+    pub fn new(store: impl LogoutSessionStore + 'static) -> Self {
+        Self {
+            store: Box::new(store),
+        }
+    }
+
+    pub async fn execute(
+        &self,
+        principal: AuthenticatedPrincipal,
+        revoked_at: UnixTimestamp,
+        link: AuditLink,
+    ) -> Result<(), LogoutSessionError> {
+        if revoked_at < principal.authenticated_at() {
+            return Err(LogoutSessionError::InvalidSession);
+        }
+        let event = AuditEvent::new(
+            revoked_at,
+            AuditActor::Principal(principal.principal_id()),
+            None,
+            AuditAction::new("session.logout").map_err(|_| LogoutSessionError::Unavailable)?,
+            AuditOutcome::Succeeded,
+        )
+        .with_request_link(link);
+
+        self.store
+            .revoke_with_audit(principal, revoked_at, &event)
+            .await
+    }
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum LogoutSessionError {
+    #[error("authenticated session is no longer active")]
+    InvalidSession,
+    #[error("authentication unavailable")]
+    Unavailable,
+}

@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use forge_config::{AppConfig, Environment, SecretString};
+use forge_config::{AppConfig, DatabaseConfig, Environment, SecretString};
 use forge_http::{RouteError, Router, Server, ServerError};
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -20,6 +20,8 @@ use tracing::{error, info};
 
 use crate::{
     cli::{self, Command},
+    compose::{ComposeError, Composition},
+    database::{Declaration, MigrationCommand},
     logging, probe, signal,
 };
 
@@ -36,6 +38,8 @@ type DatabaseCommandFuture =
     Pin<Box<dyn Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send + 'static>>;
 type DatabaseCommandHandler =
     Box<dyn Fn(SecretString) -> DatabaseCommandFuture + Send + Sync + 'static>;
+type ComposeHook =
+    Box<dyn FnOnce(&mut Composition<'_>) -> Result<(), ComposeError> + Send + 'static>;
 
 /// A Forge application process.
 ///
@@ -49,6 +53,8 @@ pub struct App {
     registrations: Vec<RouteRegistration>,
     migrate: Option<DatabaseCommandHandler>,
     rollback: Option<DatabaseCommandHandler>,
+    declaration: Option<Declaration>,
+    compose_hooks: Vec<ComposeHook>,
 }
 
 impl fmt::Debug for App {
@@ -75,6 +81,8 @@ impl App {
             registrations: Vec::new(),
             migrate: None,
             rollback: None,
+            declaration: None,
+            compose_hooks: Vec::new(),
         }
     }
 
@@ -135,6 +143,66 @@ impl App {
         self
     }
 
+    /// Declares PostgreSQL as the database backend with embedded migrations.
+    ///
+    /// This makes `FORGE_DATABASE_URL` mandatory for `serve` and adds the
+    /// `migrate` and `rollback` subcommands. The `migrator` is created by
+    /// `sqlx::migrate!()` and embedded into the binary.
+    ///
+    /// Requires the `postgres` feature on `forge-db`.
+    #[cfg(feature = "postgres")]
+    #[must_use]
+    pub fn postgres(mut self, migrator: forge_db::sqlx::migrate::Migrator) -> Self {
+        self.declaration = Some(Declaration::Postgres(migrator));
+        self
+    }
+
+    /// Declares MySQL/MariaDB as the database backend with embedded migrations.
+    ///
+    /// This makes `FORGE_DATABASE_URL` mandatory for `serve` and adds the
+    /// `migrate` and `rollback` subcommands. The `migrator` is created by
+    /// `sqlx::migrate!()` and embedded into the binary.
+    ///
+    /// Requires the `mysql` feature on `forge-db`.
+    #[cfg(feature = "mysql")]
+    #[must_use]
+    pub fn mysql(mut self, migrator: forge_db::sqlx::migrate::Migrator) -> Self {
+        self.declaration = Some(Declaration::MySql(migrator));
+        self
+    }
+
+    /// Declares SQLite as the database backend with embedded migrations.
+    ///
+    /// This makes `FORGE_DATABASE_URL` mandatory for `serve` and adds the
+    /// `migrate` and `rollback` subcommands. The `migrator` is created by
+    /// `sqlx::migrate!()` and embedded into the binary.
+    ///
+    /// Requires the `sqlite` feature on `forge-db`.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn sqlite(mut self, migrator: forge_db::sqlx::migrate::Migrator) -> Self {
+        self.declaration = Some(Declaration::Sqlite(migrator));
+        self
+    }
+
+    /// Registers a composition hook that runs at startup to wire adapters and routes.
+    ///
+    /// Composition hooks run inside the Tokio runtime, after the standard health
+    /// routes are registered and before the server accepts connections. They receive
+    /// a `Composition` context with access to the router, validated configuration,
+    /// and the database pool (if a backend was declared with `postgres`, `mysql`,
+    /// or `sqlite`).
+    ///
+    /// Multiple hooks can be registered; they run in registration order.
+    #[must_use]
+    pub fn compose(
+        mut self,
+        hook: impl FnOnce(&mut Composition<'_>) -> Result<(), ComposeError> + Send + 'static,
+    ) -> Self {
+        self.compose_hooks.push(Box::new(hook));
+        self
+    }
+
     /// Parses process arguments, runs the selected command and returns the
     /// process exit code.
     ///
@@ -169,6 +237,8 @@ impl App {
             registrations,
             migrate: _,
             rollback: _,
+            declaration,
+            compose_hooks,
         } = self;
 
         let config = match AppConfig::from_env() {
@@ -179,7 +249,26 @@ impl App {
             return config_error(&error);
         }
 
-        let router = match build_router(registrations) {
+        // Validate database scheme matches declaration
+        if let Some(ref decl) = declaration {
+            let expected_scheme = decl.scheme();
+            let actual_scheme = config.database.scheme();
+            if actual_scheme != Some(expected_scheme) {
+                let actual = actual_scheme.map_or("none".to_string(), |s| s.to_string());
+                write_stderr(&format!(
+                    "error: FORGE_DATABASE_URL scheme '{}' does not match declared backend '{}'\n",
+                    actual, expected_scheme
+                ));
+                return ExitCode::from(EXIT_CONFIG);
+            }
+        } else if config.database.url.is_some() {
+            write_stderr(
+                "error: FORGE_DATABASE_URL provided but no database backend declared (use App::postgres, App::mysql, or App::sqlite)\n",
+            );
+            return ExitCode::from(EXIT_CONFIG);
+        }
+
+        let mut router = match build_router(registrations) {
             Ok(router) => router,
             Err(error) => {
                 error!(app = name, error = %ErrorChain(&error), "failed to register routes");
@@ -196,6 +285,36 @@ impl App {
                 error!(app = name, error = %ErrorChain(&error), "failed to start async runtime");
                 return ExitCode::FAILURE;
             }
+        };
+
+        // SQLx lazy pools and adapters composed around them require a Tokio
+        // context even before the first request starts.
+        let _database = {
+            let _runtime_guard = runtime.enter();
+
+            let database = if let Some(ref decl) = declaration {
+                Some(match decl.connect_lazy(&config.database) {
+                    Ok(db) => db,
+                    Err(error) => {
+                        error!(app = name, error = %ErrorChain(&error), "failed to create database pool");
+                        return ExitCode::FAILURE;
+                    }
+                })
+            } else {
+                None
+            };
+
+            if !compose_hooks.is_empty() {
+                let mut composition = Composition::new(&mut router, &config, database.clone());
+                for hook in compose_hooks {
+                    if let Err(error) = hook(&mut composition) {
+                        error!(app = name, error = %ErrorChain(&error), "composition hook failed");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+
+            database
         };
 
         let result = runtime.block_on(serve_until_signal(name, version, config, router));
@@ -226,6 +345,35 @@ impl App {
             return ExitCode::from(EXIT_CONFIG);
         };
 
+        // Use the declaration to run migrations if available
+        if let Some(decl) = self.declaration {
+            let database_config = DatabaseConfig::new(url);
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    error!(app = self.name, error = %ErrorChain(&error), "failed to start async runtime");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let migration_command = match command {
+                DatabaseCommand::Migrate => MigrationCommand::Migrate,
+                DatabaseCommand::Rollback => MigrationCommand::Rollback,
+            };
+
+            let result = runtime.block_on(decl.run_migration_command(
+                self.name,
+                &database_config,
+                migration_command,
+            ));
+            runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+            return result;
+        }
+
+        // Fall back to the legacy migrations() handlers
         let handler = match command {
             DatabaseCommand::Migrate => self.migrate,
             DatabaseCommand::Rollback => self.rollback,
@@ -392,7 +540,7 @@ fn write_stderr(text: &str) {
 }
 
 /// Displays an error followed by each of its sources, separated by `: `.
-struct ErrorChain<'a>(&'a (dyn Error + 'static));
+pub struct ErrorChain<'a>(pub &'a (dyn Error + 'static));
 
 impl fmt::Display for ErrorChain<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

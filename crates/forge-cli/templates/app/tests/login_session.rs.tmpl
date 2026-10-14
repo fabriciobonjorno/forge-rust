@@ -1,0 +1,333 @@
+//! PostgreSQL contract for version-bound login, logout, and audit atomicity.
+
+use std::error::Error;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use app::application::login::{LoginSession, LoginSessionError};
+use app::application::logout::{LogoutSession, LogoutSessionError};
+use app::infrastructure::{
+    auth::{PostgresLoginAttemptStore, PostgresPasswordCredentialStore, PostgresSessionStore},
+    login::PostgresLoginSessionStore,
+    logout::PostgresLogoutSessionStore,
+    security::{
+        Argon2idPasswordHasher, SessionIssueError, authenticate_password,
+        issue_authenticated_session,
+    },
+};
+use argon2::{Algorithm, Argon2, Params, Version, password_hash::PasswordHasher as _};
+use forge::audit::AuditLink;
+use forge::auth::{SessionStore, UnixTimestamp};
+use sqlx::postgres::PgPoolOptions;
+use uuid::Uuid;
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL via FORGE_DATABASE_URL and FORGE_TEST_ADMIN_DATABASE_URL"]
+fn verified_login_and_logout_persist_session_audit_atomically() -> Result<(), Box<dyn Error>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let runtime_url = std::env::var("FORGE_DATABASE_URL")?;
+        let admin_url = std::env::var("FORGE_TEST_ADMIN_DATABASE_URL")?;
+        let runtime_pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&runtime_url)
+            .await?;
+        let admin_pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&admin_url)
+            .await?;
+        let hasher = Argon2idPasswordHasher;
+        let password = b"fixture-only-password";
+        let weak_params = Params::new(8, 1, 1, Some(32))?;
+        let weak_hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, weak_params);
+        let weak_hash = weak_hasher.hash_password(password)?.to_string();
+        let principal_id = Uuid::now_v7();
+        let login = format!("login-{}@example.invalid", principal_id);
+        sqlx::query(
+            "INSERT INTO forge_principals (id, login, password_hash)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(principal_id)
+        .bind(&login)
+        .bind(&weak_hash)
+        .execute(&admin_pool)
+        .await?;
+
+        let credentials = PostgresPasswordCredentialStore::new(runtime_pool.clone());
+        let throttle = PostgresLoginAttemptStore::new(runtime_pool.clone());
+        let session_store = PostgresSessionStore::new(runtime_pool.clone());
+        let login_store = LoginSession::new(PostgresLoginSessionStore::new(runtime_pool.clone()));
+        let now = UnixTimestamp::from_secs(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
+        let proof = authenticate_password(
+            &credentials,
+            &hasher,
+            &throttle,
+            "127.0.0.1".parse()?,
+            &login,
+            password,
+        )
+        .await?;
+        let link = AuditLink::new(Uuid::now_v7().to_string())?;
+        let link_value = link.as_str().to_owned();
+        let issued = issue_authenticated_session(
+            &login_store,
+            proof,
+            now,
+            UnixTimestamp::from_secs(now.as_secs() + 3600),
+            link,
+        )
+        .await?;
+        let restored = session_store
+            .find_by_credential(&issued.secrets.bearer_digest)
+            .await?
+            .ok_or_else(|| std::io::Error::other("issued session must be persisted"))?;
+        assert_eq!(restored.id(), issued.session.id());
+
+        sqlx::query("UPDATE forge_principals SET disabled_at = clock_timestamp() WHERE id = $1")
+            .bind(principal_id)
+            .execute(&admin_pool)
+            .await?;
+        assert!(
+            session_store
+                .find_by_credential(&issued.secrets.bearer_digest)
+                .await?
+                .is_none(),
+            "a disabled principal's existing sessions must fail closed"
+        );
+        sqlx::query("UPDATE forge_principals SET disabled_at = NULL WHERE id = $1")
+            .bind(principal_id)
+            .execute(&admin_pool)
+            .await?;
+
+        let (stored_hash, stored_version) = sqlx::query_as::<_, (String, i64)>(
+            "SELECT password_hash, version FROM forge_principals WHERE id = $1",
+        )
+        .bind(principal_id)
+        .fetch_one(&admin_pool)
+        .await?;
+        assert_ne!(stored_hash, weak_hash, "successful login upgrades the hash");
+        assert_eq!(
+            stored_version, 2,
+            "rehash increments the credential version"
+        );
+
+        let audit_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM forge_audit_events
+             WHERE request_link = $1 AND action = 'session.login' AND outcome = 'succeeded'",
+        )
+        .bind(&link_value)
+        .fetch_one(&admin_pool)
+        .await?;
+        assert_eq!(audit_count, 1);
+        let raw_bearer_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM forge_sessions WHERE credential_digest = $1",
+        )
+        .bind(issued.secrets.bearer.expose().as_bytes())
+        .fetch_one(&admin_pool)
+        .await?;
+        assert_eq!(raw_bearer_count, 0, "raw bearer must never be persisted");
+
+        let authenticated = restored.authenticate(now)?;
+        let logout = LogoutSession::new(PostgresLogoutSessionStore::new(runtime_pool.clone()));
+        let logout_link = AuditLink::new(Uuid::now_v7().to_string())?;
+        let logout_link_value = logout_link.as_str().to_owned();
+        logout.execute(authenticated, now, logout_link).await?;
+        assert!(
+            session_store
+                .find_by_credential(&issued.secrets.bearer_digest)
+                .await?
+                .is_none(),
+            "logout must revoke the session credential"
+        );
+        let logout_audit_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM forge_audit_events
+             WHERE request_link = $1 AND action = 'session.logout' AND outcome = 'succeeded'",
+        )
+        .bind(&logout_link_value)
+        .fetch_one(&admin_pool)
+        .await?;
+        assert_eq!(logout_audit_count, 1);
+        assert_eq!(
+            logout
+                .execute(
+                    authenticated,
+                    now,
+                    AuditLink::new(Uuid::now_v7().to_string())?
+                )
+                .await,
+            Err(LogoutSessionError::InvalidSession),
+            "a session cannot be logged out twice"
+        );
+
+        let proof = authenticate_password(
+            &credentials,
+            &hasher,
+            &throttle,
+            "127.0.0.1".parse()?,
+            &login,
+            password,
+        )
+        .await?;
+        let logout_failure_session = issue_authenticated_session(
+            &login_store,
+            proof,
+            now,
+            UnixTimestamp::from_secs(now.as_secs() + 3600),
+            AuditLink::new(Uuid::now_v7().to_string())?,
+        )
+        .await?;
+        let logout_failure_principal = logout_failure_session.session.authenticate(now)?;
+        let logout_failure_link = "forge-e2e-reject-logout-audit";
+        sqlx::query(
+            "ALTER TABLE forge_audit_events ADD CONSTRAINT forge_e2e_reject_logout_audit
+             CHECK (request_link IS DISTINCT FROM 'forge-e2e-reject-logout-audit')",
+        )
+        .execute(&admin_pool)
+        .await?;
+        let failed_logout = logout
+            .execute(
+                logout_failure_principal,
+                now,
+                AuditLink::new(logout_failure_link)?,
+            )
+            .await;
+        assert_eq!(failed_logout, Err(LogoutSessionError::Unavailable));
+        sqlx::query("ALTER TABLE forge_audit_events DROP CONSTRAINT forge_e2e_reject_logout_audit")
+            .execute(&admin_pool)
+            .await?;
+        assert!(
+            session_store
+                .find_by_credential(&logout_failure_session.secrets.bearer_digest)
+                .await?
+                .is_some(),
+            "failed logout audit must roll back the session revocation"
+        );
+
+        // Reject the success audit and prove the session insert rolls back too.
+        let failure_link = "forge-e2e-reject-login-audit".to_owned();
+        sqlx::query(
+            "UPDATE forge_principals SET password_hash = $2, version = version + 1
+             WHERE id = $1",
+        )
+        .bind(principal_id)
+        .bind(&weak_hash)
+        .execute(&admin_pool)
+        .await?;
+        let weak_version =
+            sqlx::query_scalar::<_, i64>("SELECT version FROM forge_principals WHERE id = $1")
+                .bind(principal_id)
+                .fetch_one(&admin_pool)
+                .await?;
+        sqlx::query(
+            "ALTER TABLE forge_audit_events ADD CONSTRAINT forge_e2e_reject_login_audit
+             CHECK (request_link IS DISTINCT FROM 'forge-e2e-reject-login-audit')",
+        )
+        .execute(&admin_pool)
+        .await?;
+        let sessions_before = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM forge_sessions WHERE principal_id = $1",
+        )
+        .bind(principal_id)
+        .fetch_one(&admin_pool)
+        .await?;
+        let proof = authenticate_password(
+            &credentials,
+            &hasher,
+            &throttle,
+            "127.0.0.1".parse()?,
+            &login,
+            password,
+        )
+        .await?;
+        let failed = issue_authenticated_session(
+            &login_store,
+            proof,
+            now,
+            UnixTimestamp::from_secs(now.as_secs() + 3600),
+            AuditLink::new(failure_link.clone())?,
+        )
+        .await;
+        assert!(matches!(
+            failed,
+            Err(SessionIssueError::Login(LoginSessionError::Unavailable))
+        ));
+        sqlx::query("ALTER TABLE forge_audit_events DROP CONSTRAINT forge_e2e_reject_login_audit")
+            .execute(&admin_pool)
+            .await?;
+        let sessions_after = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM forge_sessions WHERE principal_id = $1",
+        )
+        .bind(principal_id)
+        .fetch_one(&admin_pool)
+        .await?;
+        assert_eq!(sessions_after, sessions_before);
+        let (hash_after_audit_failure, version_after_audit_failure) =
+            sqlx::query_as::<_, (String, i64)>(
+                "SELECT password_hash, version FROM forge_principals WHERE id = $1",
+            )
+            .bind(principal_id)
+            .fetch_one(&admin_pool)
+            .await?;
+        assert_eq!(hash_after_audit_failure, weak_hash);
+        assert_eq!(version_after_audit_failure, weak_version);
+        let failed_audit_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM forge_audit_events WHERE request_link = $1",
+        )
+        .bind(&failure_link)
+        .fetch_one(&admin_pool)
+        .await?;
+        assert_eq!(failed_audit_count, 0);
+
+        // A credential change after verification invalidates the proof before
+        // any session or success audit can be committed.
+        let stale_link = Uuid::now_v7().to_string();
+        let proof = authenticate_password(
+            &credentials,
+            &hasher,
+            &throttle,
+            "127.0.0.1".parse()?,
+            &login,
+            password,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE forge_principals SET disabled_at = clock_timestamp(), version = version + 1
+             WHERE id = $1",
+        )
+        .bind(principal_id)
+        .execute(&admin_pool)
+        .await?;
+        let stale = issue_authenticated_session(
+            &login_store,
+            proof,
+            now,
+            UnixTimestamp::from_secs(now.as_secs() + 3600),
+            AuditLink::new(stale_link.clone())?,
+        )
+        .await;
+        assert!(matches!(
+            stale,
+            Err(SessionIssueError::Login(
+                LoginSessionError::InvalidCredentials
+            ))
+        ));
+        let stale_audit_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM forge_audit_events WHERE request_link = $1",
+        )
+        .bind(&stale_link)
+        .fetch_one(&admin_pool)
+        .await?;
+        assert_eq!(stale_audit_count, 0);
+
+        // Audit events are append-only, even for administrators. They remain
+        // in this disposable test database and use random request links.
+        sqlx::query("DELETE FROM forge_principals WHERE id = $1")
+            .bind(principal_id)
+            .execute(&admin_pool)
+            .await?;
+        runtime_pool.close().await;
+        admin_pool.close().await;
+        Ok::<(), Box<dyn Error>>(())
+    })
+}

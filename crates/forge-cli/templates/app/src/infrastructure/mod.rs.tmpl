@@ -3,9 +3,14 @@
 %%if database%%
 pub mod audit;
 pub mod auth;
+pub mod bootstrap_account;
 %%end%%
 pub mod cache;
 pub mod database;
+%%if database%%
+pub mod login;
+pub mod logout;
+%%end%%
 pub mod queue;
 pub mod security;
 pub mod telemetry;

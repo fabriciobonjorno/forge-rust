@@ -88,7 +88,10 @@ traversal/symlinks, upload limits, security headers, key rotation, webhook
 signatures, replay windows, idempotency digest mismatch, audit completeness, and
 all fail-closed rules in the [threat model](threat-model.md). Database-enabled
 generated-app tests additionally prove the runtime audit writer can append one
-event but cannot SELECT, UPDATE, or DELETE audit history.
+event but cannot SELECT, UPDATE, or DELETE audit history. Successful password
+login must prove that credential revalidation, optional rehash, session insert,
+and success audit commit atomically; stale/disabled credentials and an injected
+audit rejection must leave no new session or success event.
 
 ### Jobs and events
 

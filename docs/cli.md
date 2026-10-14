@@ -18,7 +18,8 @@ from a checkout.
 ```text
 forge id
 forge new <name> [--skip-docker] [--skip-ci] [--skip-database] [--skip-lockfile] [--forge-path <PATH>]
-forge generate migration <name>
+forge generate migration <name> [--version <sqlx-version>] [--dry-run]
+forge generate resource <name> --fields <name:type,...> [--global] [--version <sqlx-version>] [--dry-run]
 forge check
 forge test
 forge format
@@ -36,6 +37,32 @@ non-zero status.
 Prints a new UUIDv7 identifier to standard output. UUIDv7 values sort by
 creation time and are Forge's default identifier format
 ([ADR 0003](adr/0003-uuidv7-default-identifiers.md)).
+
+## HTTP route parameters
+
+`Router::route` accepts whole-segment named captures such as
+`/products/{id}`. Dispatch captures the raw path segment, and
+`Request::path_param_as` percent-decodes it and parses the requested Rust type.
+Static paths take precedence over captures; duplicate or ambiguous patterns
+fail during route registration. A matched path with the wrong method returns
+`405` and an `Allow` header. Malformed or unparseable captures are reported as
+`PathParamError::Invalid`.
+
+```rust,ignore
+router.route(Method::GET, "/products/{id}", |request: Request| async move {
+    let id: uuid::Uuid = match forge::web::path_param(&request, "id") {
+        Ok(id) => id,
+        Err(failure) => return forge::web::error(&failure),
+    };
+    // Call an application query before returning its result.
+    forge::web::json(StatusCode::OK, &serde_json::json!({ "id": id }))
+})?;
+```
+
+This is transport support only. `forge generate page` adds basic server-rendered
+views, but the resource generator still does not wire authenticated CRUD
+handlers, session composition or CSRF. Tenant-sensitive CRUD routes must wait
+until those boundaries are composed safely.
 
 ## `forge new <name>`
 
@@ -90,11 +117,90 @@ Create a reversible migration:
 
 ```sh
 forge generate migration create_customers
+forge generate migration create_customers --dry-run
+forge generate migration create_customers --version 20261004010101 --dry-run
 ```
 
 Forge creates a versioned `.up.sql` / `.down.sql` pair using a positive,
 time-sortable numeric migration version. It creates files with create-new
 semantics and never overwrites an existing migration.
+`--dry-run` emits a versioned JSON preview with paths, operations and exact
+contents, without creating directories or files. Pass `--version` to make the
+path stable across previews and generation; it must be a positive SQLx-compatible
+signed 64-bit value and unique among the application's migrations. Without it,
+Forge assigns a Unix nanosecond timestamp and the preview marks the path provisional.
+
+### `forge generate resource <name>`
+
+Generates a resource slice: a typed domain entity, an application repository
+port, CRUD use cases with optimistic concurrency inputs, a PostgreSQL adapter,
+module registrations, and a PostgreSQL migration. The command requires a
+database-enabled Forge application created by `forge new`.
+
+```sh
+forge generate resource Project --fields 'name:string,owner_id:uuid,active:bool'
+forge generate resource PlatformSetting --fields 'key:string,value:text' --global
+forge generate resource Project --fields 'name:string,owner_id:uuid' --dry-run
+forge generate resource Project --fields 'name:string' --version 20261004010202 --dry-run
+```
+
+`--dry-run` emits a versioned JSON preview of every generated source, migration,
+and module-registration append. It performs the same input and destination
+checks and makes no filesystem changes. `--version` makes the generated
+migration path reproducible; without it, the preview marks that path provisional.
+Forge refuses to traverse symlinks below the application root when resolving
+generator targets.
+
+Supported field types are `string`, `text`, `uuid`, `bool`, and text-backed
+`enum`. Constrain an enum's allowed values with `enum[value|value]`, for example
+`status:enum[draft|published]`; Forge validates the values and adds a PostgreSQL
+`CHECK` constraint. The generated Rust representation remains `String`, so
+application-level closed enum types are still open. Bare `enum` remains accepted
+for compatibility and does not add a value constraint. Resource, field, and
+constrained enum values are validated before they are used in paths or SQL.
+Generated files use create-new semantics; the command refuses to overwrite an
+existing entity or migration.
+
+Resources are tenant-scoped by default. Their entity carries a `TenantId`, the
+generated repository port requires an authorized `TenantContext` on every
+operation, generated use cases check exact permissions (`project:create`,
+`project:read`, `project:update`, `project:delete`, `project:list` for `Project`),
+and the migration enables and forces PostgreSQL RLS with a policy bound to the
+transaction-local `forge.tenant_id` setting. `--global` omits tenant state and
+RLS. Adapters must still use the generated app's tenant transaction helper for
+every tenant-scoped query.
+
+This generator does not yet create authenticated HTTP CRUD routes or automatic
+database provisioning. Basic standalone page generation is available through
+`forge generate page`, but it is not connected to resource use cases. The
+resource generator creates an ignored PostgreSQL integration
+test for CRUD, permissions, optimistic locking and tenant isolation; run it
+through `scripts/e2e-generated-app.sh` or explicitly with a migrated test
+database and `FORGE_DATABASE_URL`. Tenant-scoped HTTP routes must wait until the
+app's authentication boundary can construct `TenantContext`; never accept a raw
+tenant id from a request as a substitute. The generator remains partial and
+must not be treated as a complete web CRUD vertical slice.
+
+### `forge generate page <name>`
+
+Generates a server-rendered HTML view in `src/adapters/views`, a `GET` route,
+and the module/route registrations. The route is derived from the PascalCase
+name (`UserProfile` becomes `/user-profile`). The generated page is automatically
+reachable after generation; it does not edit the hand-written HTTP adapter.
+
+```sh
+forge generate page Home
+forge generate page UserProfile --dry-run
+```
+
+Generated views use `forge::web::html` for the UTF-8 response and
+`forge::web::escape_html` for every dynamic text value. The initial page renderer
+supports escaped title and paragraph text, not raw markup or a general-purpose
+template language. `--dry-run` returns the complete versioned JSON preview
+without creating or appending files. Generation refuses existing page files and
+duplicate module/route registrations. The route-registration file is a
+framework-managed append-only file; custom HTTP handlers remain in
+`src/adapters/http`.
 
 Generated database applications separate runtime and migration credentials.
 Both values are treated as secrets by Forge configuration and are redacted from
@@ -123,9 +229,11 @@ PostgreSQL settings for RLS policies.
 The generated security module uses Argon2id for password authentication, issues
 independent 256-bit bearer/CSRF secrets from the OS CSPRNG, persists only SHA-256
 digests, emits a Secure/HttpOnly/SameSite=Lax `__Host-forge_session` cookie,
-and enforces `x-csrf-token` on unsafe cookie-authenticated methods. These
-mechanisms are infrastructure helpers; Forge does not impose universal login or
-logout routes.
+and enforces `x-csrf-token` on unsafe cookie-authenticated methods. It also
+applies a shared PostgreSQL login-attempt limit across replicas. The current
+throttle digests are pseudonymous rather than anonymized, and client identity uses
+the socket peer until trusted-proxy support exists. These mechanisms are
+infrastructure helpers; Forge does not impose universal login or logout routes.
 
 ### Generated tree
 
@@ -161,6 +269,7 @@ shop/
 │   ├── domain/
 │   ├── application/
 │   ├── adapters/
+│   │   └── views/           # generated HTML views and route registrations
 │   ├── infrastructure/
 │   └── bootstrap/
 └── tests/
@@ -226,9 +335,40 @@ Runs `cargo build --release --locked`, producing `target/release/<name>`. This
 is the same release build the Dockerfile performs. It requires a `Cargo.lock`
 that is up to date with `Cargo.toml`.
 
+## `forge capabilities --format json`
+
+`forge new` writes `.forge/capabilities.json`, `AGENTS.md`, and
+`docs/for-ai.md` from the same scaffold options that control generated files.
+Inside a generated application, `forge capabilities --format json` prints the
+versioned manifest for editors, automation, and coding agents. The manifest
+describes what was scaffolded; `partial` and `not_available` generator statuses
+must not be treated as ready features. It contains no environment values or
+credentials.
+
+## `forge doctor --format json [--probe-database] [--timeout-ms <MILLISECONDS>]`
+
+Runs read-only checks against the current directory and process environment,
+returning a versioned JSON report with stable check codes, categories, statuses,
+relative paths, and corrective hints. By default it is static and sends no
+network requests. `--probe-database` opts into bounded TCP reachability checks
+for configured PostgreSQL URLs; `--timeout-ms` sets a per-endpoint timeout from
+100 to 10000 ms (default 1500). The probe does not authenticate, issue SQL, or
+prove database health. Reports distinguish TCP reachability from authentication
+and schema checks. Database URL values are never included in output. The command
+exits successfully when it has produced a report; consumers should inspect the
+top-level `status` and individual check statuses.
+
+Use `--json-errors` on any command to emit execution failures as a JSON object
+on stderr with `schema_version`, stable `code`, `message`, optional `path`, and
+`hint`. Argument syntax errors also use the versioned JSON envelope when the
+flag is present; their message is generic so invalid values are not echoed.
+Successful command output and `--help`/`--version` are unchanged. Forge uses
+exit code `1` for execution errors and `2` for syntax errors.
+
 ## Generated application binary
 
-Every application built with `forge::App` accepts these subcommands:
+Generated application binaries expose these subcommands. Commands other than
+`bootstrap-account` are dispatched by `forge::App`:
 
 | Command | Behavior |
 | --- | --- |
@@ -236,6 +376,7 @@ Every application built with `forge::App` accepts these subcommands:
 | `healthcheck` | Sends `GET /health/live` to the loopback address on the configured port. Exits `0` if healthy, `1` otherwise. |
 | `migrate` | For database-enabled apps, applies all pending embedded migrations. |
 | `rollback` | For database-enabled apps, reverts the latest reversible migration. |
+| `bootstrap-account <login> <tenant-name>` | For database-enabled apps, prompts for a password without echo and atomically creates the first tenant, principal, active `owner` membership and audit events. Requires the migration URL. The app's deny-by-default RBAC policy must explicitly grant `owner` permissions. |
 | `version` | Prints the application version. |
 | `help` | Prints usage. |
 

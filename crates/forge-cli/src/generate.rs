@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::CliError;
+use crate::capabilities::CapabilityManifest;
+use crate::preview::{GenerationPreview, PreviewFile};
+use crate::resource::ensure_no_symlink_components;
 
 /// Toolchain pinned by generated applications and their builder image.
 /// Kept equal to the framework's `rust-toolchain.toml` by a unit test.
@@ -66,9 +69,15 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Always, "src/domain/mod.rs" => "src/domain/mod.rs.tmpl"),
     template!(Group::Always, "src/application/mod.rs" => "src/application/mod.rs.tmpl"),
     template!(Group::Always, "src/adapters/mod.rs" => "src/adapters/mod.rs.tmpl"),
+    template!(Group::Always, "src/adapters/views/mod.rs" => "src/adapters/views/mod.rs.tmpl"),
+    template!(Group::Always, "src/adapters/views/routes.rs" => "src/adapters/views/routes.rs.tmpl"),
     template!(Group::Always, "src/adapters/http/mod.rs" => "src/adapters/http/mod.rs.tmpl"),
+    template!(Group::Database, "src/adapters/http/auth.rs" => "src/adapters/http/auth.rs.tmpl"),
     template!(Group::Always, "src/infrastructure/mod.rs" => "src/infrastructure/mod.rs.tmpl"),
     template!(Group::Always, "src/bootstrap/mod.rs" => "src/bootstrap/mod.rs.tmpl"),
+    template!(Group::Database, "src/bootstrap/account.rs" => "src/bootstrap/account.rs.tmpl"),
+    template!(Group::Database, "src/application/bootstrap_account.rs" => "src/application/bootstrap_account.rs.tmpl"),
+    template!(Group::Database, "src/infrastructure/bootstrap_account.rs" => "src/infrastructure/bootstrap_account.rs.tmpl"),
     template!(Group::Always, "tests/architecture.rs" => "tests/architecture.rs.tmpl"),
     template!(Group::Database, "build.rs" => "build.rs.tmpl"),
     template!(Group::Database, ".gitattributes" => "gitattributes.tmpl"),
@@ -91,11 +100,43 @@ const TEMPLATES: &[Template] = &[
     ),
     template!(
         Group::Database,
+        "migrations/00000000000000000003_forge_login_throttle.up.sql" => "migrations/00000000000000000003_forge_login_throttle.up.sql.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "migrations/00000000000000000003_forge_login_throttle.down.sql" => "migrations/00000000000000000003_forge_login_throttle.down.sql.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "migrations/00000000000000000004_forge_tenants.up.sql" => "migrations/00000000000000000004_forge_tenants.up.sql.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "migrations/00000000000000000004_forge_tenants.down.sql" => "migrations/00000000000000000004_forge_tenants.down.sql.tmpl"
+    ),
+    template!(
+        Group::Database,
         "src/infrastructure/audit/mod.rs" => "src/infrastructure/audit/mod.rs.tmpl"
     ),
     template!(
         Group::Database,
         "src/infrastructure/auth/mod.rs" => "src/infrastructure/auth/mod.rs.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "src/application/login.rs" => "src/application/login.rs.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "src/application/logout.rs" => "src/application/logout.rs.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "src/infrastructure/login.rs" => "src/infrastructure/login.rs.tmpl"
+    ),
+    template!(
+        Group::Database,
+        "src/infrastructure/logout.rs" => "src/infrastructure/logout.rs.tmpl"
     ),
     template!(
         Group::Database,
@@ -109,6 +150,8 @@ const TEMPLATES: &[Template] = &[
         Group::Database,
         "src/infrastructure/database/mod.rs" => "src/infrastructure/database/mod.rs.tmpl"
     ),
+    template!(Group::Database, "tests/login_throttle.rs" => "tests/login_throttle.rs.tmpl"),
+    template!(Group::Database, "tests/login_session.rs" => "tests/login_session.rs.tmpl"),
     template!(
         Group::DatabaseDocker,
         "docker/postgres/init.sql" => "docker/postgres/init.sql.tmpl"
@@ -190,29 +233,77 @@ const RESERVED_MODULES: &[(&str, &str)] = &[
     ),
 ];
 
-pub(crate) fn create_migration(root: &Path, name: &str) -> Result<(PathBuf, PathBuf), CliError> {
-    let normalized = normalize_migration_name(name)?;
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(CliError::Clock)?;
-    let version = elapsed.as_nanos();
+pub(crate) fn create_migration(
+    root: &Path,
+    name: &str,
+    version: Option<u64>,
+) -> Result<(PathBuf, PathBuf), CliError> {
+    let files = migration_plan(root, name, version)?;
     let migrations = root.join("migrations");
     fs::create_dir_all(&migrations).map_err(|source| CliError::CreateDirectory {
-        path: migrations.clone(),
+        path: migrations,
         source,
     })?;
-
-    let stem = format!("{version}_{normalized}");
-    let up = migrations.join(format!("{stem}.up.sql"));
-    let down = migrations.join(format!("{stem}.down.sql"));
-
-    write_new_file(&up, &format!("-- {normalized}: apply migration\n\n"))?;
-    if let Err(error) = write_new_file(&down, &format!("-- {normalized}: revert migration\n\n")) {
+    let up = files[0].path.clone();
+    let down = files[1].path.clone();
+    write_new_file(&up, &files[0].content)?;
+    if let Err(error) = write_new_file(&down, &files[1].content) {
         let _ = fs::remove_file(&up);
         return Err(error);
     }
-
     Ok((up, down))
+}
+
+pub(crate) fn preview_migration(
+    root: &Path,
+    name: &str,
+    version: Option<u64>,
+) -> Result<GenerationPreview, CliError> {
+    Ok(GenerationPreview::new(
+        version.is_none(),
+        migration_plan(root, name, version)?,
+    ))
+}
+
+fn migration_plan(
+    root: &Path,
+    name: &str,
+    version: Option<u64>,
+) -> Result<Vec<PreviewFile>, CliError> {
+    let normalized = normalize_migration_name(name)?;
+    let version = match version {
+        Some(version) if version > 0 && version <= i64::MAX as u64 => version.to_string(),
+        Some(_) => {
+            return Err(CliError::InvalidMigrationName {
+                name: name.to_owned(),
+                reason: "migration version must be between 1 and 9223372036854775807",
+            });
+        }
+        None => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(CliError::Clock)?
+            .as_nanos()
+            .to_string(),
+    };
+    let migrations = root.join("migrations");
+    let stem = format!("{version}_{normalized}");
+    let up = migrations.join(format!("{stem}.up.sql"));
+    let down = migrations.join(format!("{stem}.down.sql"));
+    for path in [&migrations, &up, &down] {
+        ensure_no_symlink_components(root, path)?;
+    }
+    Ok(vec![
+        PreviewFile {
+            path: up,
+            operation: "create",
+            content: format!("-- {normalized}: apply migration\n\n"),
+        },
+        PreviewFile {
+            path: down,
+            operation: "create",
+            content: format!("-- {normalized}: revert migration\n\n"),
+        },
+    ])
 }
 
 fn normalize_migration_name(name: &str) -> Result<String, CliError> {
@@ -441,6 +532,25 @@ fn write_application(
         )?;
     }
 
+    let manifest = CapabilityManifest::for_application(
+        &options.name,
+        options.database,
+        options.docker,
+        options.ci,
+    );
+    let metadata_dir = root.join(".forge");
+    fs::create_dir_all(&metadata_dir).map_err(|source| CliError::CreateDirectory {
+        path: metadata_dir,
+        source,
+    })?;
+    let manifest_path = root.join(".forge/capabilities.json");
+    let mut manifest_content =
+        serde_json::to_string_pretty(&manifest).map_err(CliError::SerializeCapabilityManifest)?;
+    manifest_content.push('\n');
+    write_file(&manifest_path, &manifest_content)?;
+    write_file(&root.join("AGENTS.md"), &manifest.render_agent_guide())?;
+    write_file(&root.join("docs/for-ai.md"), &manifest.render_ai_guide())?;
+
     Ok(())
 }
 
@@ -501,6 +611,9 @@ fn render(template: &str, variables: &[(&str, &str)], docker: bool, database: bo
 
     for (name, value) in variables {
         output = output.replace(name, value);
+    }
+    while output.ends_with("\n\n") {
+        output.pop();
     }
     output
 }
@@ -591,8 +704,8 @@ mod tests {
     #[test]
     fn creates_reversible_migration_files() {
         let root = tempfile::tempdir().expect("temporary directory should be available");
-        let (up, down) =
-            create_migration(root.path(), "Create Users").expect("migration should be created");
+        let (up, down) = create_migration(root.path(), "Create Users", Some(1234))
+            .expect("migration should be created");
 
         assert!(up.is_file());
         assert!(down.is_file());
@@ -621,6 +734,40 @@ mod tests {
                 down.strip_prefix(root.path()).unwrap().to_str().unwrap()
             )
             .contains("revert migration")
+        );
+    }
+
+    #[test]
+    fn explicit_migration_version_makes_preview_paths_repeatable() {
+        let root = tempfile::tempdir().expect("temporary directory should be available");
+        let first = preview_migration(root.path(), "Create Users", Some(20261004010101))
+            .expect("first preview");
+        let second = preview_migration(root.path(), "Create Users", Some(20261004010101))
+            .expect("second preview");
+        assert_eq!(first.files.len(), 2);
+        assert_eq!(first.files[0].path, second.files[0].path);
+        assert_eq!(first.files[1].path, second.files[1].path);
+        assert!(!first.paths_are_provisional);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_preview_rejects_a_symlinked_migrations_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary root");
+        let outside = tempfile::tempdir().expect("temporary migration directory");
+        symlink(outside.path(), root.path().join("migrations"))
+            .expect("migration symlink should be created");
+
+        let error = preview_migration(root.path(), "create_users", Some(1234))
+            .expect_err("generator must refuse to write outside the app");
+        assert!(matches!(error, CliError::UnsafeSymlinkPath(_)));
+        assert_eq!(
+            fs::read_dir(outside.path())
+                .expect("outside directory")
+                .count(),
+            0
         );
     }
 
@@ -697,11 +844,34 @@ mod tests {
             root.join("migrations/00000000000000000002_forge_identity.down.sql")
                 .is_file()
         );
+        assert!(
+            root.join("migrations/00000000000000000004_forge_tenants.up.sql")
+                .is_file()
+        );
+        assert!(
+            root.join("migrations/00000000000000000004_forge_tenants.down.sql")
+                .is_file()
+        );
         assert!(root.join("src/infrastructure/audit/mod.rs").is_file());
         assert!(root.join("src/infrastructure/auth/mod.rs").is_file());
+        assert!(root.join("src/adapters/http/auth.rs").is_file());
+        assert!(root.join("src/application/login.rs").is_file());
+        assert!(root.join("src/application/logout.rs").is_file());
+        assert!(root.join("src/application/bootstrap_account.rs").is_file());
+        assert!(
+            root.join("src/infrastructure/bootstrap_account.rs")
+                .is_file()
+        );
+        assert!(root.join("src/bootstrap/account.rs").is_file());
+        assert!(root.join("src/infrastructure/login.rs").is_file());
+        assert!(root.join("src/infrastructure/logout.rs").is_file());
+        assert!(root.join("tests/login_session.rs").is_file());
         assert!(root.join("src/infrastructure/tenancy/mod.rs").is_file());
         assert!(root.join("src/infrastructure/security/mod.rs").is_file());
         assert!(root.join("docker/postgres/init.sql").is_file());
+        let bootstrap = read(&root, "src/bootstrap/mod.rs");
+        assert!(bootstrap.contains(".postgres(MIGRATOR)"));
+        assert!(!bootstrap.contains("migrate_database"));
 
         let identity_migration = read(
             &root,
@@ -713,6 +883,20 @@ mod tests {
         assert!(identity_migration.contains("CREATE TABLE forge_tenant_memberships"));
         assert!(identity_migration.contains("GRANT UPDATE (password_hash, updated_at, version)"));
 
+        let tenant_migration = read(
+            &root,
+            "migrations/00000000000000000004_forge_tenants.up.sql",
+        );
+        assert!(tenant_migration.contains("CREATE TABLE forge_tenants"));
+        assert!(tenant_migration.contains("forge_tenant_memberships_tenant_fk"));
+
+        let bootstrap_use_case = read(&root, "src/application/bootstrap_account.rs");
+        assert!(bootstrap_use_case.contains("create_first_tenant_owner"));
+        assert!(bootstrap_use_case.contains("tenant.bootstrap"));
+        let bootstrap_adapter = read(&root, "src/infrastructure/bootstrap_account.rs");
+        assert!(bootstrap_adapter.contains("ARRAY['owner']::text[]"));
+        assert!(bootstrap_adapter.contains("&events[1]"));
+
         let auth_module = read(&root, "src/infrastructure/auth/mod.rs");
         assert!(auth_module.contains("PasswordCredentialVersion"));
         assert!(auth_module.contains("replace_password_hash"));
@@ -721,9 +905,27 @@ mod tests {
         let security_module = read(&root, "src/infrastructure/security/mod.rs");
         assert!(security_module.contains("Argon2idPasswordHasher"));
         assert!(security_module.contains("needs_rehash"));
-        assert!(security_module.contains("replace_password_hash"));
-        assert!(security_module.contains("__Host-forge_session"));
-        assert!(security_module.contains("x-csrf-token"));
+        assert!(security_module.contains("VerifiedPassword::new"));
+        assert!(security_module.contains("issue_authenticated_session"));
+        assert!(!security_module.contains(".replace_password_hash("));
+        assert!(!security_module.contains("forge::http"));
+        assert!(security_module.contains("Zeroizing::new(password.to_vec())"));
+        assert!(manifest.contains("rpassword = \"=7.5.4\""));
+        let auth_http_module = read(&root, "src/adapters/http/auth.rs");
+        assert!(auth_http_module.contains("__Host-forge_session"));
+        assert!(auth_http_module.contains("x-csrf-token"));
+        assert!(auth_http_module.contains("/auth/logout"));
+
+        let logout_use_case = read(&root, "src/application/logout.rs");
+        assert!(logout_use_case.contains("session.logout"));
+        let logout_persistence = read(&root, "src/infrastructure/logout.rs");
+        assert!(logout_persistence.contains("append_with(&mut *transaction, event)"));
+        assert!(logout_persistence.contains("revoked_at IS NULL"));
+
+        let login_persistence = read(&root, "src/infrastructure/login.rs");
+        assert!(login_persistence.contains("FOR UPDATE"));
+        assert!(login_persistence.contains("append_with(&mut *transaction, event)"));
+        assert!(login_persistence.contains("insert_with(&mut *transaction, session"));
 
         let database_module = read(&root, "src/infrastructure/database/mod.rs");
         assert!(database_module.contains("begin_tenant_transaction"));

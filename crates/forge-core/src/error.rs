@@ -176,6 +176,14 @@ pub struct ErrorReport<'a> {
 /// A Forge operation result.
 pub type Result<T, E = ForgeError> = std::result::Result<T, E>;
 
+/// Trait for converting database errors into [`ForgeError`].
+///
+/// Implemented by [`forge_db::DbError`] in the `forge-db` crate.
+pub trait IntoForgeError {
+    /// Converts this error into a [`ForgeError`].
+    fn into_forge_error(self) -> ForgeError;
+}
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, io};

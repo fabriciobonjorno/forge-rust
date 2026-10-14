@@ -5,12 +5,13 @@
 
 use async_trait::async_trait;
 use forge::auth::{
-    CsrfTokenDigest, PasswordCredential, PasswordCredentialStore, PasswordCredentialStoreError,
-    PasswordCredentialVersion, PasswordHash, Session, SessionCredentialDigest, SessionId,
-    SessionStore, SessionStoreError, UnixTimestamp,
+    CsrfTokenDigest, LoginAttemptDecision, LoginAttemptKey, LoginAttemptPolicy, LoginAttemptStore,
+    LoginAttemptStoreError, PasswordCredential, PasswordCredentialStore,
+    PasswordCredentialStoreError, PasswordCredentialVersion, PasswordHash, Session,
+    SessionCredentialDigest, SessionId, SessionStore, SessionStoreError, UnixTimestamp,
 };
 use forge::security::PrincipalId;
-use sqlx::{PgPool, types::Uuid};
+use sqlx::{Executor, PgPool, Postgres, types::Uuid};
 
 /// SQLx-backed password credential lookup.
 ///
@@ -121,37 +122,7 @@ impl SessionStore for PostgresSessionStore {
         credential: &SessionCredentialDigest,
         csrf: &CsrfTokenDigest,
     ) -> Result<(), SessionStoreError> {
-        let issued_at = timestamp_to_i64(session.issued_at())?;
-        let expires_at = timestamp_to_i64(session.expires_at())?;
-        let revoked_at = session.revoked_at().map(timestamp_to_i64).transpose()?;
-
-        sqlx::query(
-            "INSERT INTO forge_sessions (
-                id, principal_id, credential_digest, csrf_digest,
-                issued_at, expires_at, revoked_at
-             )
-             VALUES (
-                $1, $2, $3, $4,
-                to_timestamp($5::double precision),
-                to_timestamp($6::double precision),
-                CASE
-                    WHEN $7::bigint IS NULL THEN NULL
-                    ELSE to_timestamp($7::double precision)
-                END
-             )",
-        )
-        .bind(session.id().into_uuid())
-        .bind(session.principal_id().into_uuid())
-        .bind(credential.as_bytes().as_slice())
-        .bind(csrf.as_bytes().as_slice())
-        .bind(issued_at)
-        .bind(expires_at)
-        .bind(revoked_at)
-        .execute(&self.pool)
-        .await
-        .map_err(map_sqlx_error)?;
-
-        Ok(())
+        insert_with(&self.pool, session, credential, csrf).await
     }
 
     async fn find_by_credential(
@@ -160,13 +131,16 @@ impl SessionStore for PostgresSessionStore {
     ) -> Result<Option<Session>, SessionStoreError> {
         let row = sqlx::query_as::<_, (Uuid, Uuid, i64, i64, Option<i64>)>(
             "SELECT
-                id,
-                principal_id,
-                EXTRACT(EPOCH FROM issued_at)::bigint,
-                EXTRACT(EPOCH FROM expires_at)::bigint,
-                EXTRACT(EPOCH FROM revoked_at)::bigint
-             FROM forge_sessions
-             WHERE credential_digest = $1
+                session.id,
+                session.principal_id,
+                EXTRACT(EPOCH FROM session.issued_at)::bigint,
+                EXTRACT(EPOCH FROM session.expires_at)::bigint,
+                EXTRACT(EPOCH FROM session.revoked_at)::bigint
+             FROM forge_sessions AS session
+             INNER JOIN forge_principals AS principal
+                ON principal.id = session.principal_id
+               AND principal.disabled_at IS NULL
+             WHERE session.credential_digest = $1
              LIMIT 1",
         )
         .bind(credential.as_bytes().as_slice())
@@ -295,6 +269,50 @@ impl SessionStore for PostgresSessionStore {
     }
 }
 
+/// Inserts a session through a caller-owned executor so credential/session
+/// issuance can share one transaction with its mandatory audit event.
+pub(crate) async fn insert_with<'e, E>(
+    executor: E,
+    session: &Session,
+    credential: &SessionCredentialDigest,
+    csrf: &CsrfTokenDigest,
+) -> Result<(), SessionStoreError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let issued_at = timestamp_to_i64(session.issued_at())?;
+    let expires_at = timestamp_to_i64(session.expires_at())?;
+    let revoked_at = session.revoked_at().map(timestamp_to_i64).transpose()?;
+
+    sqlx::query(
+        "INSERT INTO forge_sessions (
+            id, principal_id, credential_digest, csrf_digest,
+            issued_at, expires_at, revoked_at
+         )
+         VALUES (
+            $1, $2, $3, $4,
+            to_timestamp($5::double precision),
+            to_timestamp($6::double precision),
+            CASE
+                WHEN $7::bigint IS NULL THEN NULL
+                ELSE to_timestamp($7::double precision)
+            END
+         )",
+    )
+    .bind(session.id().into_uuid())
+    .bind(session.principal_id().into_uuid())
+    .bind(credential.as_bytes().as_slice())
+    .bind(csrf.as_bytes().as_slice())
+    .bind(issued_at)
+    .bind(expires_at)
+    .bind(revoked_at)
+    .execute(executor)
+    .await
+    .map_err(map_sqlx_error)?;
+
+    Ok(())
+}
+
 fn restore_session(
     (id, principal_id, issued_at, expires_at, revoked_at): (Uuid, Uuid, i64, i64, Option<i64>),
 ) -> Result<Session, SessionStoreError> {
@@ -330,4 +348,150 @@ fn map_sqlx_error(error: sqlx::Error) -> SessionStoreError {
     } else {
         SessionStoreError::Unavailable
     }
+}
+
+/// PostgreSQL-backed login throttling shared by every application replica.
+#[derive(Clone)]
+pub struct PostgresLoginAttemptStore {
+    pool: PgPool,
+}
+
+impl PostgresLoginAttemptStore {
+    /// Creates a store using the least-privilege runtime pool.
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LoginAttemptStore for PostgresLoginAttemptStore {
+    async fn record_and_check(
+        &self,
+        login: &LoginAttemptKey,
+        client: &LoginAttemptKey,
+        policy: LoginAttemptPolicy,
+    ) -> Result<LoginAttemptDecision, LoginAttemptStoreError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(map_login_attempt_sqlx_error)?;
+
+        // Opportunistically prune a bounded batch. The transaction-scoped
+        // advisory lock allows one replica at a time to do cleanup without
+        // serializing ordinary throttle updates.
+        let (prune,): (bool,) =
+            sqlx::query_as("SELECT pg_try_advisory_xact_lock(86432245178095521)")
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(map_login_attempt_sqlx_error)?;
+        if prune {
+            sqlx::query(
+                "DELETE FROM forge_login_attempt_buckets
+                 WHERE ctid IN (
+                     SELECT ctid FROM forge_login_attempt_buckets
+                     WHERE window_started_at < statement_timestamp() - INTERVAL '7 days'
+                     ORDER BY window_started_at
+                     LIMIT 500
+                 )",
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_login_attempt_sqlx_error)?;
+        }
+
+        let login_result = record_attempt_bucket(
+            &mut transaction,
+            1,
+            login,
+            policy.max_per_login(),
+            policy.window_seconds(),
+        )
+        .await?;
+        let client_result = record_attempt_bucket(
+            &mut transaction,
+            2,
+            client,
+            policy.max_per_client(),
+            policy.window_seconds(),
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(map_login_attempt_sqlx_error)?;
+
+        let retry_after = [login_result, client_result]
+            .into_iter()
+            .filter(|(attempts, maximum, _)| attempts > maximum)
+            .map(|(_, _, retry_after)| retry_after)
+            .max();
+
+        match retry_after {
+            Some(seconds) => Ok(LoginAttemptDecision::Limited {
+                retry_after_seconds: std::num::NonZeroU64::new(seconds)
+                    .ok_or(LoginAttemptStoreError::CorruptRecord)?,
+            }),
+            None => Ok(LoginAttemptDecision::Allowed),
+        }
+    }
+
+    async fn clear_login(&self, login: &LoginAttemptKey) -> Result<(), LoginAttemptStoreError> {
+        sqlx::query(
+            "DELETE FROM forge_login_attempt_buckets
+             WHERE scope = 1 AND key_digest = $1",
+        )
+        .bind(login.as_bytes().as_slice())
+        .execute(&self.pool)
+        .await
+        .map_err(map_login_attempt_sqlx_error)?;
+        Ok(())
+    }
+}
+
+async fn record_attempt_bucket(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: i16,
+    key: &LoginAttemptKey,
+    maximum: u32,
+    window_seconds: u32,
+) -> Result<(u32, u32, u64), LoginAttemptStoreError> {
+    let row = sqlx::query_as::<_, (i64, i64)>(
+        "INSERT INTO forge_login_attempt_buckets (
+             scope, key_digest, window_started_at, attempt_count
+         ) VALUES ($1, $2, statement_timestamp(), 1)
+         ON CONFLICT (scope, key_digest) DO UPDATE SET
+             window_started_at = CASE
+                 WHEN forge_login_attempt_buckets.window_started_at
+                      + make_interval(secs => $3::double precision) <= statement_timestamp()
+                 THEN statement_timestamp()
+                 ELSE forge_login_attempt_buckets.window_started_at
+             END,
+             attempt_count = CASE
+                 WHEN forge_login_attempt_buckets.window_started_at
+                      + make_interval(secs => $3::double precision) <= statement_timestamp()
+                 THEN 1
+                 ELSE forge_login_attempt_buckets.attempt_count + 1
+             END
+         RETURNING attempt_count::bigint,
+             GREATEST(1, CEIL(EXTRACT(EPOCH FROM (
+                 window_started_at + make_interval(secs => $3::double precision)
+                 - statement_timestamp()
+             )))::bigint)",
+    )
+    .bind(scope)
+    .bind(key.as_bytes().as_slice())
+    .bind(f64::from(window_seconds))
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(map_login_attempt_sqlx_error)?;
+    let attempts = u32::try_from(row.0).map_err(|_| LoginAttemptStoreError::CorruptRecord)?;
+    let retry_after = u64::try_from(row.1).map_err(|_| LoginAttemptStoreError::CorruptRecord)?;
+    Ok((attempts, maximum, retry_after))
+}
+
+fn map_login_attempt_sqlx_error(error: sqlx::Error) -> LoginAttemptStoreError {
+    tracing::error!(error = %error, "login attempt persistence failed");
+    LoginAttemptStoreError::Unavailable
 }

@@ -2,7 +2,7 @@
 name = "forge-db"
 description = "Database contracts and transaction primitives for Forge applications"
 version.workspace = true
-edition.workspace = true
+edition = "2024"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,6 +11,18 @@ repository.workspace = true
 async-trait.workspace = true
 forge-tenancy = { path = "../forge-tenancy" }
 thiserror.workspace = true
+sqlx = { workspace = true, default-features = false, features = [] }
+tempfile.workspace = true
+forge-config = { path = "../forge-config" }
+forge-core = { path = "../forge-core" }
+tracing.workspace = true
+uuid.workspace = true
+
+[features]
+postgres = ["sqlx/postgres"]
+mysql = ["sqlx/mysql"]
+sqlite = ["sqlx/sqlite"]
+testing = []
 
 [lints]
 workspace = true

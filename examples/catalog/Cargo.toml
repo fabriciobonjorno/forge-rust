@@ -1,0 +1,38 @@
+[package]
+name = "catalog"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "catalog"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+forge = { path = "../../crates/forge" }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+sqlx = { version = "0.9", default-features = false, features = ["chrono", "json", "macros", "migrate", "postgres", "runtime-tokio", "uuid"] }
+
+[dev-dependencies]
+# Disposable per-test databases (`forge_db::testing`) for tests/postgres.rs.
+forge-db = { path = "../../crates/forge-db", features = ["postgres", "testing"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+expect_used = "deny"
+unwrap_used = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

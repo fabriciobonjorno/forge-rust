@@ -1,0 +1,17 @@
+-- Preserve tenants and memberships; rollback requires an empty tenant registry.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM forge_tenant_memberships)
+        OR EXISTS (SELECT 1 FROM forge_tenants)
+    THEN
+        RAISE EXCEPTION 'cannot roll back tenant registry while tenants or memberships exist';
+    END IF;
+END
+$$;
+
+ALTER TABLE forge_tenant_memberships
+    DROP CONSTRAINT forge_tenant_memberships_tenant_fk;
+
+DROP INDEX forge_tenants_name_unique;
+DROP TABLE forge_tenants;
+

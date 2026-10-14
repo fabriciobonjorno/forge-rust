@@ -8,6 +8,8 @@ use serde::Serialize;
 /// and `/health/ready` itself.
 pub fn routes(router: &mut Router) -> Result<(), RouteError> {
     router.route(Method::GET, "/", index)?;
+    router.route(Method::GET, "/hello/{name}", hello)?;
+    include!("../views/routes.rs");
     Ok(())
 }
 
@@ -24,4 +26,22 @@ async fn index(_request: Request) -> Response {
     };
     Response::json(StatusCode::OK, &body)
         .unwrap_or_else(|_| Response::empty(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+#[derive(Serialize)]
+struct Greeting {
+    message: String,
+}
+
+async fn hello(request: Request) -> Response {
+    let name: String = match forge::web::path_param(&request, "name") {
+        Ok(name) => name,
+        Err(failure) => return forge::web::error(&failure),
+    };
+    forge::web::json(
+        StatusCode::OK,
+        &Greeting {
+            message: format!("Hello, {name}!"),
+        },
+    )
 }

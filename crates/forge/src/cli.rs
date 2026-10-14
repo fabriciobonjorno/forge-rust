@@ -80,10 +80,12 @@ Environment:
   FORGE_SHUTDOWN_GRACE_SECS   connection drain period on shutdown in seconds (default: 15)
   FORGE_MAX_BODY_BYTES        maximum request body size in bytes (default: 1048576)
   FORGE_MAX_CONNECTIONS       maximum concurrent connections (default: 10000)
+  FORGE_PUBLIC_ORIGIN         canonical HTTPS origin for browser authentication (default: unset)
+  FORGE_TRUSTED_PROXIES       comma-separated proxy IPs/CIDRs (default: none)
   FORGE_LOG                   log filter directives (default: info)
   FORGE_LOG_FORMAT            json | text (default: json in production, text otherwise)
   FORGE_DATABASE_URL           least-privilege PostgreSQL runtime connection URL
-  FORGE_MIGRATION_DATABASE_URL PostgreSQL migration connection URL (required for migrate/rollback)
+  FORGE_MIGRATION_DATABASE_URL PostgreSQL migration connection URL (required for commands needing migration privileges)
 
 Unknown FORGE_* variables are rejected at startup.
 "

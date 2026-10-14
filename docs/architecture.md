@@ -8,9 +8,15 @@ in progress: server-side session lifecycle, deny-by-default RBAC, explicit
 membership and authorized TenantContext contracts, least-privilege PostgreSQL/RLS,
 digest-only persistent sessions, Argon2id password verification, opaque
 session/CSRF secrets, secure cookie helpers, and append-only audit persistence
-are implemented, including optimistic Argon2id rehash-on-policy-upgrade after a
-successful login. Login throttling, turnkey HTTP auth route composition, and
-stronger audit integrity/retention controls remain open.
+are implemented, including version-bound atomic login issuance and atomic
+logout revocation/audit. Database-enabled generated apps compose CSRF bootstrap,
+login, and logout routes when `FORGE_PUBLIC_ORIGIN` is configured, and share
+PostgreSQL fixed-window throttling across replicas. A one-shot migration-role
+command provisions the first principal with an atomic audit record. Keyed throttle
+digests, authenticated route middleware, generated owner-role permission policy,
+tenant-aware authorization wiring, and stronger audit integrity/retention
+controls remain open. Trusted proxy CIDR
+configuration and explicit X-Forwarded-For resolution are available to adapters.
 
 Forge is an opinionated Rust application framework for long-lived services. Its
 value is the integration of explicit application architecture, secure defaults,
@@ -225,11 +231,29 @@ use Argon2id on Tokio blocking workers; bearer and CSRF tokens are independent
 serialized in a Secure/HttpOnly/SameSite=Lax `__Host-forge_session` cookie; and
 unsafe cookie-authenticated HTTP methods require the independent
 `x-csrf-token` value. Public login denial does not reveal whether an account is
-missing, disabled, or has the wrong password. Successfully verified passwords
-whose PHC parameters no longer match policy are rehashed and updated with an
-optimistic credential version; a concurrent password change/disable wins and the
-login fails closed rather than overwriting it. See
-[ADR 0014](adr/0014-argon2-session-cookie-and-csrf.md).
+missing, disabled, or has the wrong password. Verification produces a
+non-serializable proof bound to the observed credential version and hash. A
+single PostgreSQL transaction revalidates that proof under lock, optionally
+rehashes, inserts the session digests, and appends the success audit event before
+returning secrets. A concurrent password change or disable invalidates the proof;
+an audit/session failure rolls back the whole issuance. See
+[ADR 0014](adr/0014-argon2-session-cookie-and-csrf.md) and
+[ADR 0017](adr/0017-version-bound-login-session-issuance.md).
+
+The generated HTTP adapter owns cookie/header parsing, CSRF method policy and
+caller-safe HTTP error mapping. `forge-auth` owns the typed bearer/CSRF digest
+contract; infrastructure owns password hashing and SQL-backed session stores.
+The generated architecture test rejects HTTP, cookie and routing dependencies
+from the infrastructure ring.
+
+Pre-session browser login now has generated routes: `GET /auth/csrf` issues a
+fresh double-submit proof in a host-only readable cookie, and `POST /auth/login`
+requires its header echo and exactly one `Origin` matching the validated
+`FORGE_PUBLIC_ORIGIN`. `POST /auth/logout` requires the authenticated session,
+its CSRF token, and the same exact-origin check; revocation and audit append
+share one PostgreSQL transaction. These routes are not registered when the
+trusted public origin is unset. The origin is HTTPS except for loopback HTTP
+during local development.
 
 ### Database and transactions
 
@@ -418,6 +442,11 @@ quality gates:
   that Compose is production orchestration.
 - Provider-neutral AI contracts expose a common, intentionally limited capability
   model; vendor-specific features require explicit extensions.
+- AI-friendly authoring is a product requirement: commands, generators, diagnostics,
+  and application context must be discoverable and machine-readable. The execution
+  security boundary in ADR 0005 remains authoritative; AI convenience never grants
+  ambient filesystem, process, network, database, or secret access. See
+  [AI-friendly authoring](ai-friendly.md) for its staged contract and current status.
 - Performance targets are budgets to measure, not current results. See
   [performance targets](performance-targets.md).
 

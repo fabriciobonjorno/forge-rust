@@ -1,0 +1,1 @@
+//! Server-rendered HTML views and their generated HTTP route registrations.

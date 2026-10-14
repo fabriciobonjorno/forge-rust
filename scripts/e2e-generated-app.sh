@@ -11,6 +11,10 @@ skip_docker="${FORGE_E2E_SKIP_DOCKER:-0}"
 unset FORGE_E2E_SKIP_DOCKER
 app_name="forge-e2e-app"
 app_dir="$work_dir/$app_name"
+repo_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+if [[ "$repo_target_dir" != /* ]]; then
+  repo_target_dir="$repo_root/$repo_target_dir"
+fi
 server_pid=""
 
 log() { printf '\n==> %s\n' "$*"; }
@@ -41,8 +45,8 @@ wait_for_http() {
 }
 
 log "Building the forge CLI"
-cargo build --quiet --locked --manifest-path "$repo_root/Cargo.toml" -p forge-cli
-forge="$repo_root/target/debug/forge"
+CARGO_TARGET_DIR="$repo_target_dir" cargo build --quiet --locked --manifest-path "$repo_root/Cargo.toml" -p forge-cli
+forge="$repo_target_dir/debug/forge"
 
 log "Generating $app_name"
 new_args=(new "$app_name" --skip-lockfile --forge-path .forge/crates/forge)
@@ -55,6 +59,18 @@ tar -C "$repo_root" --exclude ./target --exclude ./.git --exclude './examples/*/
   | tar -C "$app_dir/.forge" -xf -
 
 cd "$app_dir"
+generated_target_dir="${CARGO_TARGET_DIR:-$app_dir/target}"
+if [[ "$generated_target_dir" != /* ]]; then
+  generated_target_dir="$app_dir/$generated_target_dir"
+fi
+export CARGO_TARGET_DIR="$generated_target_dir"
+generated_app="$generated_target_dir/debug/$app_name"
+if [[ "$skip_docker" != 1 ]]; then
+  log "Generating tenant-scoped Project resource"
+  "$forge" generate resource Project --fields 'name:string,owner_id:uuid,active:bool'
+fi
+log "Generating a server-rendered Home page"
+"$forge" generate page Home
 cargo generate-lockfile --quiet
 
 log "Running the generated application's quality gates"
@@ -108,11 +124,19 @@ SQL
   runtime_database_url="postgres://app_runtime:app_runtime@127.0.0.1:${postgres_port}/forge_e2e_app"
   migration_database_url="postgres://app_migrator:app_migrator@127.0.0.1:${postgres_port}/forge_e2e_app"
 
-  if FORGE_DATABASE_URL="$runtime_database_url" "target/debug/$app_name" migrate 2>/dev/null; then
+  if FORGE_DATABASE_URL="$runtime_database_url" "$generated_app" migrate 2>/dev/null; then
     fail "migrate must not accept the runtime database credential"
   fi
 
-  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" migrate
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "$generated_app" migrate
+  log "Exercising generated Project CRUD, permissions, optimistic locking and RLS"
+  FORGE_DATABASE_URL="$runtime_database_url" \
+    cargo test --quiet --locked --test resource_project -- --ignored
+  FORGE_DATABASE_URL="$runtime_database_url" \
+    cargo test --quiet --locked --test login_throttle -- --ignored
+  FORGE_DATABASE_URL="$runtime_database_url" \
+  FORGE_TEST_ADMIN_DATABASE_URL="postgres://postgres:postgres@127.0.0.1:${postgres_port}/forge_e2e_app" \
+    cargo test --quiet --locked --test login_session -- --ignored
   [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" == "forge_e2e_probe" ]]     || fail "migrate did not create the probe table"
   [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_audit_events')")" == "forge_audit_events" ]] \
     || fail "framework audit migration did not create the audit table"
@@ -331,10 +355,10 @@ SQL
     fail "RLS must reject a cross-tenant write"
   fi
 
-  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" rollback
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "$generated_app" rollback
   [[ -z "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" ]]     || fail "rollback did not remove the probe table"
 
-  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" migrate
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "$generated_app" migrate
 fi
 
 log "Host run: serve, probe and graceful shutdown"
@@ -344,14 +368,16 @@ env_args=(FORGE_BIND="127.0.0.1:$port" FORGE_SHUTDOWN_GRACE_SECS=5)
 if [[ -n "$runtime_database_url" ]]; then
   env_args+=(FORGE_DATABASE_URL="$runtime_database_url")
 fi
-env "${env_args[@]}" "target/debug/$app_name" &
+env "${env_args[@]}" "$generated_app" &
 server_pid=$!
 wait_for_http "http://127.0.0.1:$port/health/live"
 curl --silent --fail "http://127.0.0.1:$port/health/ready" | grep -q '"ready"' || fail "readiness body"
 curl --silent --fail "http://127.0.0.1:$port/" | grep -q "\"application\":\"$app_name\"" || fail "index route"
+curl --silent --fail "http://127.0.0.1:$port/hello/Forge" | grep -q '"message":"Hello, Forge!"' || fail "dynamic route parameter"
+curl --silent --fail "http://127.0.0.1:$port/home" | grep -q '<h1>Home</h1>' || fail "generated server-rendered page"
 [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:$port/missing")" == 404 ]]   || fail "unknown route must return 404"
-env "${env_args[@]}" "target/debug/$app_name" healthcheck || fail "healthcheck subcommand"
-if FORGE_BIDN="typo" "target/debug/$app_name" healthcheck 2>/dev/null; then
+env "${env_args[@]}" "$generated_app" healthcheck || fail "healthcheck subcommand"
+if FORGE_BIDN="typo" "$generated_app" healthcheck 2>/dev/null; then
   fail "unknown FORGE_* keys must be rejected"
 fi
 kill -TERM "$server_pid"
@@ -359,7 +385,7 @@ status=0
 wait "$server_pid" || status=$?
 server_pid=""
 [[ "$status" == 0 ]] || fail "SIGTERM should exit 0, got $status"
-if env "${env_args[@]}" "target/debug/$app_name" healthcheck 2>/dev/null; then
+if env "${env_args[@]}" "$generated_app" healthcheck 2>/dev/null; then
   fail "healthcheck must fail when the server is down"
 fi
 echo "host run OK"
@@ -390,6 +416,8 @@ if docker run --rm --entrypoint /bin/sh "$image" -c true >/dev/null 2>&1; then
 fi
 
 curl --silent --fail "http://127.0.0.1:3000/" | grep -q "\"application\":\"$app_name\""   || fail "container index route"
+curl --silent --fail "http://127.0.0.1:3000/hello/Forge" | grep -q '"message":"Hello, Forge!"' || fail "container dynamic route parameter"
+curl --silent --fail "http://127.0.0.1:3000/home" | grep -q '<h1>Home</h1>' || fail "container generated server-rendered page"
 docker compose logs app 2>&1 | grep -m1 -q ' | {' || fail "production logs must be JSON"
 
 # The named volume must preserve the migrated schema across an application restart.

@@ -1,0 +1,15 @@
+[package]
+name = "forge-example-postgres"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "postgres"
+path = "postgres.rs"
+
+[dependencies]
+forge = { path = "../../../crates/forge" }
+forge_core = { path = "../../../../crates/forge-core" }
+serde = { workspace = true, features = ["derive"] }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "macros", "migrate", "chrono", "json", "uuid"] }

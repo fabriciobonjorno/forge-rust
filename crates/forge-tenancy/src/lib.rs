@@ -237,12 +237,129 @@ pub trait MembershipStore: Send + Sync {
     ) -> Result<(), MembershipStoreError>;
 }
 
+/// Resolves the current membership and requires an explicit permission before
+/// producing a tenant context for application use cases.
+///
+/// Memberships are loaded for every call so role changes and suspensions take
+/// effect without waiting for the authenticated session to expire. A missing,
+/// mismatched, inactive, or unauthorized membership is deliberately reported
+/// as the same denial.
+pub async fn authorize_tenant_context(
+    store: &dyn MembershipStore,
+    authenticated: AuthenticatedPrincipal,
+    tenant_id: TenantId,
+    policy: &RbacPolicy,
+    permission: &Permission,
+) -> Result<TenantContext, TenantAuthorizationError> {
+    let membership = store
+        .find(tenant_id, authenticated.principal_id())
+        .await
+        .map_err(TenantAuthorizationError::Store)?
+        .ok_or(TenantAuthorizationError::Denied)?;
+
+    if membership.tenant_id() != tenant_id
+        || membership.principal_id() != authenticated.principal_id()
+    {
+        return Err(TenantAuthorizationError::Denied);
+    }
+
+    TenantContext::authorize(authenticated, &membership, policy, permission)
+        .map_err(|_| TenantAuthorizationError::Denied)
+}
+
+/// Failure while resolving and authorizing a tenant membership.
+#[derive(Debug, Error)]
+pub enum TenantAuthorizationError {
+    /// No current membership or the requested permission was not granted.
+    #[error("tenant access denied")]
+    Denied,
+    /// Membership storage could not safely resolve the current authorization state.
+    #[error(transparent)]
+    Store(#[from] MembershipStoreError),
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use forge_auth::{Session, UnixTimestamp};
     use forge_security::{Permission, RbacPolicy, Role};
 
     use super::*;
+
+    #[derive(Default)]
+    struct MemoryMembershipStore {
+        membership: Mutex<Option<Membership>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl MembershipStore for MemoryMembershipStore {
+        async fn find(
+            &self,
+            tenant_id: TenantId,
+            principal_id: PrincipalId,
+        ) -> Result<Option<Membership>, MembershipStoreError> {
+            if self.fail {
+                return Err(MembershipStoreError::new(
+                    MembershipStoreErrorKind::Unavailable,
+                    "membership store unavailable",
+                    true,
+                ));
+            }
+            Ok(self
+                .membership
+                .lock()
+                .map_err(|_| {
+                    MembershipStoreError::new(
+                        MembershipStoreErrorKind::Unavailable,
+                        "membership store unavailable",
+                        true,
+                    )
+                })?
+                .as_ref()
+                .filter(|membership| {
+                    membership.tenant_id() == tenant_id && membership.principal_id() == principal_id
+                })
+                .cloned())
+        }
+
+        async fn upsert(&self, membership: &Membership) -> Result<(), MembershipStoreError> {
+            *self.membership.lock().map_err(|_| {
+                MembershipStoreError::new(
+                    MembershipStoreErrorKind::Unavailable,
+                    "membership store unavailable",
+                    true,
+                )
+            })? = Some(membership.clone());
+            Ok(())
+        }
+
+        async fn suspend(
+            &self,
+            tenant_id: TenantId,
+            principal_id: PrincipalId,
+        ) -> Result<(), MembershipStoreError> {
+            if let Some(membership) = self
+                .membership
+                .lock()
+                .map_err(|_| {
+                    MembershipStoreError::new(
+                        MembershipStoreErrorKind::Unavailable,
+                        "membership store unavailable",
+                        true,
+                    )
+                })?
+                .as_mut()
+                .filter(|membership| {
+                    membership.tenant_id() == tenant_id && membership.principal_id() == principal_id
+                })
+            {
+                membership.suspend();
+            }
+            Ok(())
+        }
+    }
 
     fn authenticated(principal: PrincipalId) -> AuthenticatedPrincipal {
         Session::new(
@@ -253,6 +370,13 @@ mod tests {
         .expect("valid session")
         .authenticate(UnixTimestamp::from_secs(11))
         .expect("session should authenticate")
+    }
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should start")
     }
 
     #[test]
@@ -335,5 +459,90 @@ mod tests {
             TenantContext::authorize(authenticated(principal), &membership, &policy, &permission,),
             Err(TenantContextError::InactiveMembership)
         );
+    }
+
+    #[test]
+    fn async_authorization_uses_current_membership_and_exact_permission() {
+        let runtime = test_runtime();
+        runtime.block_on(async {
+            let principal = PrincipalId::new();
+            let tenant = TenantId::new();
+            let role = Role::new("owner").expect("valid role");
+            let permission = Permission::new("projects:read").expect("valid permission");
+            let store = MemoryMembershipStore::default();
+            store
+                .upsert(&Membership::active(tenant, principal, vec![role.clone()]))
+                .await
+                .expect("membership should persist");
+
+            let mut policy = RbacPolicy::new();
+            policy.allow(role, permission.clone());
+            let context = authorize_tenant_context(
+                &store,
+                authenticated(principal),
+                tenant,
+                &policy,
+                &permission,
+            )
+            .await
+            .expect("current active membership should authorize");
+            assert_eq!(context.tenant_id(), tenant);
+            assert_eq!(context.authorization().permission(), &permission);
+
+            store
+                .suspend(tenant, principal)
+                .await
+                .expect("membership should suspend");
+            assert!(matches!(
+                authorize_tenant_context(
+                    &store,
+                    authenticated(principal),
+                    tenant,
+                    &policy,
+                    &permission,
+                )
+                .await,
+                Err(TenantAuthorizationError::Denied)
+            ));
+        });
+    }
+
+    #[test]
+    fn async_authorization_denies_missing_membership_and_propagates_store_failure() {
+        let runtime = test_runtime();
+        runtime.block_on(async {
+            let principal = PrincipalId::new();
+            let tenant = TenantId::new();
+            let permission = Permission::new("projects:read").expect("valid permission");
+            let policy = RbacPolicy::new();
+
+            assert!(matches!(
+                authorize_tenant_context(
+                    &MemoryMembershipStore::default(),
+                    authenticated(principal),
+                    tenant,
+                    &policy,
+                    &permission,
+                )
+                .await,
+                Err(TenantAuthorizationError::Denied)
+            ));
+
+            let unavailable = MemoryMembershipStore {
+                fail: true,
+                ..MemoryMembershipStore::default()
+            };
+            assert!(matches!(
+                authorize_tenant_context(
+                    &unavailable,
+                    authenticated(principal),
+                    tenant,
+                    &policy,
+                    &permission,
+                )
+                .await,
+                Err(TenantAuthorizationError::Store(_))
+            ));
+        });
     }
 }

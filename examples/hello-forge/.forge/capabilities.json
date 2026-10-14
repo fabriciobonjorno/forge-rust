@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "forge_version": "0.1.0",
+  "application": "hello-forge",
+  "features": {
+    "database": null,
+    "authentication": false,
+    "tenancy": false,
+    "audit": false,
+    "docker": true,
+    "ci": false,
+    "jobs_and_events": false,
+    "ai_providers_and_execution": false
+  },
+  "generators": [
+    {
+      "command": "forge generate migration",
+      "status": "available",
+      "description": "Creates a reversible SQL migration pair. Applying it requires a configured database integration."
+    },
+    {
+      "command": "forge generate resource",
+      "status": "not_available",
+      "description": "Requires a database-enabled application."
+    },
+    {
+      "command": "forge generate page",
+      "status": "available",
+      "description": "Creates a server-rendered HTML view with escaped text values and automatically registers a GET route; no view service or framework-owned template dependency is required."
+    }
+  ]
+}

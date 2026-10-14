@@ -1,0 +1,254 @@
+//! First-account bootstrap use case.
+
+use async_trait::async_trait;
+use forge::audit::{AuditAction, AuditActor, AuditEvent, AuditOutcome};
+use forge::auth::{PasswordHash, UnixTimestamp};
+use forge::security::PrincipalId;
+use forge::tenancy::TenantId;
+
+#[async_trait]
+pub trait BootstrapAccountStore: Send + Sync {
+    /// Creates the first tenant, principal and owner membership with audit
+    /// evidence in one database transaction.
+    async fn create_first_tenant_owner(
+        &self,
+        principal_id: PrincipalId,
+        tenant_id: TenantId,
+        login: &str,
+        tenant_name: &str,
+        password_hash: &PasswordHash,
+        events: &[AuditEvent; 2],
+    ) -> Result<(), BootstrapAccountError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootstrapAccountResult {
+    principal_id: PrincipalId,
+    tenant_id: TenantId,
+}
+
+impl BootstrapAccountResult {
+    #[must_use]
+    pub const fn principal_id(&self) -> PrincipalId {
+        self.principal_id
+    }
+
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant_id
+    }
+}
+
+pub struct BootstrapAccount {
+    store: Box<dyn BootstrapAccountStore>,
+}
+
+impl BootstrapAccount {
+    #[must_use]
+    pub fn new(store: impl BootstrapAccountStore + 'static) -> Self {
+        Self {
+            store: Box::new(store),
+        }
+    }
+
+    pub async fn execute(
+        &self,
+        login: &str,
+        tenant_name: &str,
+        password_hash: &PasswordHash,
+        occurred_at: UnixTimestamp,
+    ) -> Result<BootstrapAccountResult, BootstrapAccountError> {
+        let normalized = login.trim();
+        if normalized.is_empty()
+            || normalized.len() > 320
+            || normalized.chars().any(char::is_control)
+        {
+            return Err(BootstrapAccountError::InvalidLogin);
+        }
+        let tenant_name = tenant_name.trim();
+        if tenant_name.is_empty()
+            || tenant_name.len() > 200
+            || tenant_name.chars().any(char::is_control)
+        {
+            return Err(BootstrapAccountError::InvalidTenantName);
+        }
+        let principal_id = PrincipalId::new();
+        let tenant_id = TenantId::new();
+        let principal_event = AuditEvent::new(
+            occurred_at,
+            AuditActor::System,
+            None,
+            AuditAction::new("principal.bootstrap")
+                .map_err(|_| BootstrapAccountError::Unavailable)?,
+            AuditOutcome::Succeeded,
+        );
+        let tenant_event = AuditEvent::new(
+            occurred_at,
+            AuditActor::System,
+            Some(tenant_id),
+            AuditAction::new("tenant.bootstrap").map_err(|_| BootstrapAccountError::Unavailable)?,
+            AuditOutcome::Succeeded,
+        );
+        self.store
+            .create_first_tenant_owner(
+                principal_id,
+                tenant_id,
+                normalized,
+                tenant_name,
+                password_hash,
+                &[principal_event, tenant_event],
+            )
+            .await?;
+        Ok(BootstrapAccountResult {
+            principal_id,
+            tenant_id,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum BootstrapAccountError {
+    #[error("login must be between 1 and 320 UTF-8 bytes and contain no control characters")]
+    InvalidLogin,
+    #[error("tenant name must be between 1 and 200 UTF-8 bytes and contain no control characters")]
+    InvalidTenantName,
+    #[error("initial tenant bootstrap was already used")]
+    AlreadyBootstrapped,
+    #[error("account bootstrap failed")]
+    Unavailable,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, sync::Mutex};
+
+    use super::*;
+    use async_trait::async_trait;
+
+    type RecordedCall = (PrincipalId, TenantId, String, String, [AuditEvent; 2]);
+
+    #[derive(Clone, Default)]
+    struct RecordingStore {
+        call: std::sync::Arc<Mutex<Option<RecordedCall>>>,
+    }
+
+    #[async_trait]
+    impl BootstrapAccountStore for RecordingStore {
+        async fn create_first_tenant_owner(
+            &self,
+            principal_id: PrincipalId,
+            tenant_id: TenantId,
+            login: &str,
+            tenant_name: &str,
+            _password_hash: &PasswordHash,
+            events: &[AuditEvent; 2],
+        ) -> Result<(), BootstrapAccountError> {
+            *self
+                .call
+                .lock()
+                .map_err(|_| BootstrapAccountError::Unavailable)? = Some((
+                principal_id,
+                tenant_id,
+                login.to_owned(),
+                tenant_name.to_owned(),
+                events.clone(),
+            ));
+            Ok(())
+        }
+    }
+
+    fn runtime() -> Result<tokio::runtime::Runtime, std::io::Error> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    }
+
+    fn test_hash() -> Result<PasswordHash, Box<dyn Error>> {
+        Ok(PasswordHash::new(
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA",
+        )?)
+    }
+
+    #[test]
+    fn trims_login_and_records_system_bootstrap_audit() -> Result<(), Box<dyn Error>> {
+        let runtime = runtime()?;
+        let store = RecordingStore::default();
+        let use_case = BootstrapAccount::new(store.clone());
+        let hash = test_hash()?;
+        let result = runtime.block_on(use_case.execute(
+            "  admin@example.test  ",
+            " Acme Inc ",
+            &hash,
+            UnixTimestamp::from_secs(10),
+        ))?;
+
+        let call = store
+            .call
+            .lock()
+            .map_err(|_| "recording store lock poisoned")?;
+        let (principal_id, tenant_id, login, tenant, events) =
+            call.as_ref().ok_or("store was not called")?;
+        assert_eq!(login, "admin@example.test");
+        assert_eq!(tenant, "Acme Inc");
+        assert_eq!(result.principal_id(), *principal_id);
+        assert_eq!(result.tenant_id(), *tenant_id);
+        assert_eq!(events[0].actor(), AuditActor::System);
+        assert_eq!(events[0].action().as_str(), "principal.bootstrap");
+        assert_eq!(events[0].outcome(), AuditOutcome::Succeeded);
+        assert_eq!(events[1].action().as_str(), "tenant.bootstrap");
+        assert_eq!(events[1].tenant_id(), Some(*tenant_id));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_logins_before_persistence() -> Result<(), Box<dyn Error>> {
+        let runtime = runtime()?;
+        let store = RecordingStore::default();
+        let use_case = BootstrapAccount::new(store.clone());
+        let hash = test_hash()?;
+        let long_login = "x".repeat(321);
+        for login in ["", "  ", "invalid\nlogin", long_login.as_str()] {
+            assert_eq!(
+                runtime.block_on(use_case.execute(
+                    login,
+                    "Tenant",
+                    &hash,
+                    UnixTimestamp::from_secs(10)
+                )),
+                Err(BootstrapAccountError::InvalidLogin)
+            );
+        }
+        let call = store
+            .call
+            .lock()
+            .map_err(|_| "recording store lock poisoned")?;
+        assert!(call.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_tenant_names_before_persistence() -> Result<(), Box<dyn Error>> {
+        let runtime = runtime()?;
+        let store = RecordingStore::default();
+        let use_case = BootstrapAccount::new(store.clone());
+        let hash = test_hash()?;
+        let long_name = "x".repeat(201);
+        for tenant in ["", "  ", "invalid\ntenant", long_name.as_str()] {
+            assert_eq!(
+                runtime.block_on(use_case.execute(
+                    "admin@example.test",
+                    tenant,
+                    &hash,
+                    UnixTimestamp::from_secs(10)
+                )),
+                Err(BootstrapAccountError::InvalidTenantName)
+            );
+        }
+        let call = store
+            .call
+            .lock()
+            .map_err(|_| "recording store lock poisoned")?;
+        assert!(call.is_none());
+        Ok(())
+    }
+}

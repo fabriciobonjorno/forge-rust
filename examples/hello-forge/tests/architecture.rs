@@ -62,7 +62,15 @@ const RULES: &[Rule] = &[
     },
     Rule {
         ring: "src/infrastructure",
-        forbidden: &["crate::adapters", "crate::bootstrap"],
+        forbidden: &[
+            "crate::adapters",
+            "crate::bootstrap",
+            "forge::http",
+            "forge_http",
+            "http",
+            "hyper",
+            "cookie",
+        ],
     },
 ];
 

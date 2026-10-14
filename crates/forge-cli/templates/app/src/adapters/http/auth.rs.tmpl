@@ -1,0 +1,1084 @@
+//! HTTP translation for session cookies and CSRF headers.
+//!
+//! Persistence and token lifecycle stay behind Forge authentication contracts;
+//! this adapter owns the HTTP representation and its safe error mapping.
+
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use cookie::{Cookie, SameSite};
+use forge::audit::AuditLink;
+use forge::auth::{
+    AuthenticatedPrincipal, CsrfToken, SessionBearerToken, SessionStore, SessionStoreError,
+    UnixTimestamp,
+};
+use forge::config::IpNetwork;
+use forge::core::{ErrorCategory, ForgeError};
+use forge::http::{HeaderValue, Method, Request, Response, Router, StatusCode, header};
+use forge::security::{Permission, RbacPolicy};
+use forge::tenancy::{TenantAuthorizationError, TenantContext, TenantId, authorize_tenant_context};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use subtle::ConstantTimeEq as _;
+
+use crate::{
+    application::login::LoginSession,
+    application::logout::LogoutSession,
+    infrastructure::{
+        auth::{PostgresLoginAttemptStore, PostgresPasswordCredentialStore, PostgresSessionStore},
+        logout::PostgresLogoutSessionStore,
+        security::{
+            Argon2idPasswordHasher, LoginError, authenticate_password, issue_authenticated_session,
+            issue_pre_session_csrf_token,
+        },
+        tenancy::PgMembershipStore,
+    },
+};
+
+const SESSION_LIFETIME_SECONDS: u64 = 8 * 60 * 60;
+
+/// Name of the host-only session cookie.
+///
+/// The `__Host-` prefix requires Secure, Path=/, and no Domain attribute.
+pub const SESSION_COOKIE_NAME: &str = "__Host-forge_session";
+
+/// Host-only cookie that carries the pre-session CSRF proof for login.
+pub const PRE_SESSION_CSRF_COOKIE_NAME: &str = "__Host-forge_csrf";
+
+/// Header expected on cookie-authenticated state-changing requests.
+pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
+
+/// Header carrying the explicit tenant selected for an authenticated request.
+pub const TENANT_HEADER_NAME: &str = "x-forge-tenant-id";
+
+/// Resolves authenticated browser requests into an authorized tenant context.
+///
+/// The caller must supply an explicit deny-by-default policy. This type checks
+/// a fresh membership for every request and enforces Origin plus session-bound
+/// CSRF on unsafe methods.
+#[derive(Clone)]
+pub struct TenantRequestAuthorizer {
+    expected_origin: String,
+    sessions: PostgresSessionStore,
+    memberships: PgMembershipStore,
+    policy: RbacPolicy,
+}
+
+impl TenantRequestAuthorizer {
+    /// Creates a request authorizer using the application's runtime database pool.
+    #[must_use]
+    pub fn new(pool: PgPool, expected_origin: String, policy: RbacPolicy) -> Self {
+        Self {
+            expected_origin,
+            sessions: PostgresSessionStore::new(pool.clone()),
+            memberships: PgMembershipStore::new(pool),
+            policy,
+        }
+    }
+
+    /// Authenticates, checks browser request proofs and authorizes one capability.
+    pub async fn authorize(
+        &self,
+        request: &Request,
+        permission: &Permission,
+        now: UnixTimestamp,
+    ) -> Result<TenantContext, TenantRequestAuthorizationError> {
+        let authenticated = authenticate_request(&self.sessions, request, now)
+            .await
+            .map_err(TenantRequestAuthorizationError::Authentication)?;
+
+        if !is_safe_method(request.method()) {
+            verify_exact_origin(request, &self.expected_origin)
+                .map_err(TenantRequestAuthorizationError::Authentication)?;
+            enforce_csrf(&self.sessions, request, authenticated)
+                .await
+                .map_err(TenantRequestAuthorizationError::Authentication)?;
+        }
+
+        let tenant_id = tenant_id_from_request(request)?;
+        authorize_tenant_context(
+            &self.memberships,
+            authenticated,
+            tenant_id,
+            &self.policy,
+            permission,
+        )
+        .await
+        .map_err(|error| match error {
+            TenantAuthorizationError::Denied => TenantRequestAuthorizationError::Denied,
+            TenantAuthorizationError::Store(_) => {
+                TenantRequestAuthorizationError::AuthorizationUnavailable
+            }
+        })
+    }
+}
+
+fn tenant_id_from_request(request: &Request) -> Result<TenantId, TenantRequestAuthorizationError> {
+    let mut values = request.headers().get_all(TENANT_HEADER_NAME).iter();
+    let value = values
+        .next()
+        .ok_or(TenantRequestAuthorizationError::TenantRequired)?;
+    if values.next().is_some() {
+        return Err(TenantRequestAuthorizationError::InvalidTenant);
+    }
+    value
+        .to_str()
+        .map_err(|_| TenantRequestAuthorizationError::InvalidTenant)?
+        .parse()
+        .map_err(|_| TenantRequestAuthorizationError::InvalidTenant)
+}
+
+/// Failure while authenticating and authorizing a tenant-scoped HTTP request.
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum TenantRequestAuthorizationError {
+    /// Session or browser request proof is invalid.
+    #[error("request authentication failed")]
+    Authentication(#[from] RequestAuthError),
+    /// The caller did not choose an explicit tenant.
+    #[error("tenant context required")]
+    TenantRequired,
+    /// The explicit tenant header is malformed or ambiguous.
+    #[error("invalid tenant context")]
+    InvalidTenant,
+    /// Membership is missing/inactive or the requested permission is denied.
+    #[error("tenant access denied")]
+    Denied,
+    /// Membership or authorization storage is unavailable.
+    #[error("tenant authorization unavailable")]
+    AuthorizationUnavailable,
+}
+
+impl TenantRequestAuthorizationError {
+    /// Converts the failure into a caller-safe JSON response.
+    #[must_use]
+    pub fn into_response(self) -> Response {
+        let response = match self {
+            Self::Authentication(error) => error.into_response(),
+            Self::TenantRequired | Self::InvalidTenant => forge::web::error(&ForgeError::new(
+                ErrorCategory::Validation,
+                "invalid_tenant_context",
+                "provide one valid tenant identifier in the x-forge-tenant-id header",
+            )),
+            Self::Denied => forge::web::error(&ForgeError::new(
+                ErrorCategory::Forbidden,
+                "tenant_access_denied",
+                "the requested tenant operation is not authorized",
+            )),
+            Self::AuthorizationUnavailable => forge::web::error(
+                &ForgeError::new(
+                    ErrorCategory::Infrastructure,
+                    "tenant_authorization_unavailable",
+                    "tenant authorization is temporarily unavailable",
+                )
+                .with_retryable(true),
+            ),
+        };
+        no_store(response)
+    }
+}
+
+struct LoginRouteState {
+    expected_origin: String,
+    trusted_proxies: Vec<IpNetwork>,
+    credentials: PostgresPasswordCredentialStore,
+    sessions: PostgresSessionStore,
+    throttle: PostgresLoginAttemptStore,
+    login: LoginSession,
+    logout: LogoutSession,
+    hasher: Argon2idPasswordHasher,
+}
+
+/// Registers browser login endpoints after explicit public-origin configuration.
+pub fn register_login_routes(
+    router: &mut Router,
+    pool: PgPool,
+    expected_origin: String,
+    trusted_proxies: Vec<IpNetwork>,
+) -> Result<(), forge::http::RouteError> {
+    let state = Arc::new(LoginRouteState {
+        expected_origin,
+        trusted_proxies,
+        credentials: PostgresPasswordCredentialStore::new(pool.clone()),
+        sessions: PostgresSessionStore::new(pool.clone()),
+        throttle: PostgresLoginAttemptStore::new(pool.clone()),
+        login: LoginSession::new(
+            crate::infrastructure::login::PostgresLoginSessionStore::new(pool.clone()),
+        ),
+        logout: LogoutSession::new(PostgresLogoutSessionStore::new(pool)),
+        hasher: Argon2idPasswordHasher,
+    });
+
+    router.route(Method::GET, "/auth/csrf", |_request: Request| async {
+        csrf_bootstrap_response()
+    })?;
+
+    let login_state = Arc::clone(&state);
+    router.route(Method::POST, "/auth/login", move |request: Request| {
+        let state = Arc::clone(&login_state);
+        async move { login(request, state).await }
+    })?;
+    let logout_state = Arc::clone(&state);
+    router.route(Method::POST, "/auth/logout", move |request: Request| {
+        let state = Arc::clone(&logout_state);
+        async move { logout(request, state).await }
+    })?;
+    Ok(())
+}
+
+fn csrf_bootstrap_response() -> Response {
+    let token = match issue_pre_session_csrf_token() {
+        Ok(token) => token,
+        Err(_) => return unavailable_response(),
+    };
+    let response = forge::web::json(
+        StatusCode::OK,
+        &CsrfBootstrap {
+            csrf_token: token.expose(),
+        },
+    );
+    let mut response = no_store(response);
+    if let Ok(cookie) = HeaderValue::from_str(&pre_session_csrf_set_cookie(&token)) {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+    } else {
+        return unavailable_response();
+    }
+    response
+}
+
+#[derive(Serialize)]
+struct CsrfBootstrap<'a> {
+    csrf_token: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginRequest {
+    login: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct LoginResponse<'a> {
+    authenticated: bool,
+    csrf_token: &'a str,
+}
+
+async fn login(request: Request, state: Arc<LoginRouteState>) -> Response {
+    if let Err(error) = verify_pre_session_login_csrf(&request, &state.expected_origin) {
+        return no_store(error.into_response());
+    }
+    let client_ip = match request.client_ip(&state.trusted_proxies) {
+        Ok(ip) => ip,
+        Err(_) => {
+            return no_store(forge::web::error(&ForgeError::new(
+                ErrorCategory::Forbidden,
+                "client_address_untrusted",
+                "the client address could not be resolved safely",
+            )));
+        }
+    };
+    let input = match forge::web::decode_json::<LoginRequest>(&request) {
+        Ok(input) => input,
+        Err(error) => return no_store(forge::web::error(&error)),
+    };
+    let proof = match authenticate_password(
+        &state.credentials,
+        &state.hasher,
+        &state.throttle,
+        client_ip,
+        &input.login,
+        input.password.as_bytes(),
+    )
+    .await
+    {
+        Ok(proof) => proof,
+        Err(LoginError::InvalidCredentials) => {
+            return no_store(forge::web::error(&ForgeError::new(
+                ErrorCategory::Unauthenticated,
+                "invalid_credentials",
+                "login or password is incorrect",
+            )));
+        }
+        Err(LoginError::TooManyAttempts {
+            retry_after_seconds,
+        }) => {
+            let mut response = no_store(forge::web::error(&ForgeError::new(
+                ErrorCategory::RateLimited,
+                "login_rate_limited",
+                "too many login attempts",
+            )));
+            if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            return response;
+        }
+        Err(LoginError::AuthenticationUnavailable) => return unavailable_response(),
+    };
+
+    let now = match SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| UnixTimestamp::from_secs(duration.as_secs()))
+    {
+        Some(now) => now,
+        None => return unavailable_response(),
+    };
+    let expires = match now
+        .as_secs()
+        .checked_add(SESSION_LIFETIME_SECONDS)
+        .map(UnixTimestamp::from_secs)
+    {
+        Some(expires) => expires,
+        None => return unavailable_response(),
+    };
+    let link = match AuditLink::new(request.request_id().to_string()) {
+        Ok(link) => link,
+        Err(_) => return unavailable_response(),
+    };
+    let issued = match issue_authenticated_session(&state.login, proof, now, expires, link).await {
+        Ok(issued) => issued,
+        Err(_) => return unavailable_response(),
+    };
+
+    let response = forge::web::json(
+        StatusCode::OK,
+        &LoginResponse {
+            authenticated: true,
+            csrf_token: issued.secrets.csrf.expose(),
+        },
+    );
+    let mut response = no_store(response);
+    for cookie in [
+        session_set_cookie(&issued.secrets.bearer),
+        pre_session_csrf_set_cookie(&issued.secrets.csrf),
+    ] {
+        match HeaderValue::from_str(&cookie) {
+            Ok(value) => {
+                response.headers_mut().append(header::SET_COOKIE, value);
+            }
+            Err(_) => return unavailable_response(),
+        }
+    }
+    response
+}
+
+async fn logout(request: Request, state: Arc<LoginRouteState>) -> Response {
+    if let Err(error) = verify_exact_origin(&request, &state.expected_origin) {
+        return no_store(error.into_response());
+    }
+    let now = match current_unix_timestamp() {
+        Some(now) => now,
+        None => return unavailable_response(),
+    };
+    let authenticated = match authenticate_request(&state.sessions, &request, now).await {
+        Ok(authenticated) => authenticated,
+        Err(error) => return no_store(error.into_response()),
+    };
+    if let Err(error) = enforce_csrf(&state.sessions, &request, authenticated).await {
+        return no_store(error.into_response());
+    }
+    let link = match AuditLink::new(request.request_id().to_string()) {
+        Ok(link) => link,
+        Err(_) => return unavailable_response(),
+    };
+    if state
+        .logout
+        .execute(authenticated, now, link)
+        .await
+        .is_err()
+    {
+        return unavailable_response();
+    }
+    clear_auth_cookies(Response::empty(StatusCode::NO_CONTENT))
+}
+
+fn current_unix_timestamp() -> Option<UnixTimestamp> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| UnixTimestamp::from_secs(duration.as_secs()))
+}
+
+fn clear_auth_cookies(response: Response) -> Response {
+    let mut response = no_store(response);
+    for cookie in [session_remove_cookie(), pre_session_csrf_remove_cookie()] {
+        match HeaderValue::from_str(&cookie) {
+            Ok(value) => {
+                response.headers_mut().append(header::SET_COOKIE, value);
+            }
+            Err(_) => return unavailable_response(),
+        }
+    }
+    response
+}
+
+fn unavailable_response() -> Response {
+    no_store(forge::web::error(&ForgeError::new(
+        ErrorCategory::Infrastructure,
+        "authentication_unavailable",
+        "authentication is temporarily unavailable",
+    )))
+}
+
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Serializes a host-only session cookie.
+#[must_use]
+pub fn session_set_cookie(token: &SessionBearerToken) -> String {
+    Cookie::build((SESSION_COOKIE_NAME, token.expose().to_owned()))
+        .path("/")
+        .secure(true)
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .build()
+        .to_string()
+}
+
+/// Serializes a cookie that immediately removes the current session cookie.
+#[must_use]
+pub fn session_remove_cookie() -> String {
+    Cookie::build(SESSION_COOKIE_NAME)
+        .path("/")
+        .secure(true)
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .removal()
+        .build()
+        .to_string()
+}
+
+/// Serializes the readable double-submit CSRF cookie used before login.
+///
+/// It is intentionally not HttpOnly: same-origin client code must copy this
+/// value into `x-csrf-token`. The `__Host-` prefix prevents a sibling
+/// subdomain from planting a parent-domain cookie.
+#[must_use]
+pub fn pre_session_csrf_set_cookie(token: &CsrfToken) -> String {
+    Cookie::build((PRE_SESSION_CSRF_COOKIE_NAME, token.expose().to_owned()))
+        .path("/")
+        .secure(true)
+        .http_only(false)
+        .same_site(SameSite::Lax)
+        .build()
+        .to_string()
+}
+
+/// Serializes a cookie that immediately removes the pre-session CSRF cookie.
+#[must_use]
+pub fn pre_session_csrf_remove_cookie() -> String {
+    Cookie::build(PRE_SESSION_CSRF_COOKIE_NAME)
+        .path("/")
+        .secure(true)
+        .http_only(false)
+        .same_site(SameSite::Lax)
+        .removal()
+        .build()
+        .to_string()
+}
+
+/// Validates the browser origin and double-submit proof for a password-login
+/// request. `expected_origin` must come from trusted application configuration;
+/// never derive it from the request's `Host` header.
+pub fn verify_pre_session_login_csrf(
+    request: &Request,
+    expected_origin: &str,
+) -> Result<(), RequestAuthError> {
+    verify_exact_origin(request, expected_origin)?;
+
+    let mut cookie_token = None;
+    for value in request.headers().get_all(header::COOKIE).iter() {
+        let value = value.to_str().map_err(|_| RequestAuthError::InvalidCsrf)?;
+        for parsed in Cookie::split_parse(value) {
+            let cookie = parsed.map_err(|_| RequestAuthError::InvalidCsrf)?;
+            if cookie.name() == PRE_SESSION_CSRF_COOKIE_NAME {
+                let parsed = CsrfToken::new(cookie.value().to_owned())
+                    .map_err(|_| RequestAuthError::InvalidCsrf)?;
+                if cookie_token.replace(parsed).is_some() {
+                    return Err(RequestAuthError::InvalidCsrf);
+                }
+            }
+        }
+    }
+    let cookie_token = cookie_token.ok_or(RequestAuthError::MissingCsrf)?;
+
+    let mut headers = request.headers().get_all(CSRF_HEADER_NAME).iter();
+    let header = headers.next().ok_or(RequestAuthError::MissingCsrf)?;
+    if headers.next().is_some() {
+        return Err(RequestAuthError::InvalidCsrf);
+    }
+    let header = header.to_str().map_err(|_| RequestAuthError::InvalidCsrf)?;
+    let header_token =
+        CsrfToken::new(header.to_owned()).map_err(|_| RequestAuthError::InvalidCsrf)?;
+
+    if bool::from(
+        cookie_token
+            .digest()
+            .as_bytes()
+            .ct_eq(header_token.digest().as_bytes()),
+    ) {
+        Ok(())
+    } else {
+        Err(RequestAuthError::InvalidCsrf)
+    }
+}
+
+fn verify_exact_origin(request: &Request, expected_origin: &str) -> Result<(), RequestAuthError> {
+    let mut origins = request.headers().get_all(header::ORIGIN).iter();
+    let origin = origins.next().ok_or(RequestAuthError::InvalidOrigin)?;
+    if origins.next().is_some()
+        || expected_origin.is_empty()
+        || expected_origin == "null"
+        || origin.to_str().ok() != Some(expected_origin)
+    {
+        return Err(RequestAuthError::InvalidOrigin);
+    }
+    Ok(())
+}
+
+/// Authenticates a request from its host-only session cookie.
+///
+/// A missing cookie and every invalid or expired session share one public
+/// error so callers cannot infer whether a session record exists.
+pub async fn authenticate_request(
+    store: &dyn SessionStore,
+    request: &Request,
+    now: UnixTimestamp,
+) -> Result<AuthenticatedPrincipal, RequestAuthError> {
+    let mut bearer = None;
+    for value in request.headers().get_all(header::COOKIE).iter() {
+        let value = value
+            .to_str()
+            .map_err(|_| RequestAuthError::InvalidSession)?;
+        if let Some(found) = parse_session_cookie(value)?
+            && bearer.replace(found).is_some()
+        {
+            return Err(RequestAuthError::InvalidSession);
+        }
+    }
+
+    let bearer = bearer.ok_or(RequestAuthError::MissingSession)?;
+    let digest = bearer.digest();
+    let session = store
+        .find_by_credential(&digest)
+        .await
+        .map_err(map_session_store_error)?
+        .ok_or(RequestAuthError::InvalidSession)?;
+
+    session
+        .authenticate(now)
+        .map_err(|_| RequestAuthError::InvalidSession)
+}
+
+/// Enforces the session-bound CSRF token for every unsafe HTTP method.
+pub async fn enforce_csrf(
+    store: &dyn SessionStore,
+    request: &Request,
+    authenticated: AuthenticatedPrincipal,
+) -> Result<(), RequestAuthError> {
+    if is_safe_method(request.method()) {
+        return Ok(());
+    }
+
+    let mut values = request.headers().get_all(CSRF_HEADER_NAME).iter();
+    let value = values.next().ok_or(RequestAuthError::MissingCsrf)?;
+    if values.next().is_some() {
+        return Err(RequestAuthError::InvalidCsrf);
+    }
+    let value = value.to_str().map_err(|_| RequestAuthError::InvalidCsrf)?;
+    let token = CsrfToken::new(value.to_owned()).map_err(|_| RequestAuthError::InvalidCsrf)?;
+
+    match store
+        .verify_csrf(authenticated.session_id(), &token.digest())
+        .await
+        .map_err(map_session_store_error)?
+    {
+        true => Ok(()),
+        false => Err(RequestAuthError::InvalidCsrf),
+    }
+}
+
+/// Parses one Cookie header value using RFC cookie grammar.
+pub fn parse_session_cookie(value: &str) -> Result<Option<SessionBearerToken>, RequestAuthError> {
+    for parsed in Cookie::split_parse(value) {
+        let cookie = match parsed {
+            Ok(cookie) => cookie,
+            Err(_) => continue,
+        };
+        if cookie.name() == SESSION_COOKIE_NAME {
+            return SessionBearerToken::new(cookie.value().to_owned())
+                .map(Some)
+                .map_err(|_| RequestAuthError::InvalidSession);
+        }
+    }
+    Ok(None)
+}
+
+/// Returns whether the method is safe according to HTTP semantics.
+#[must_use]
+pub fn is_safe_method(method: &Method) -> bool {
+    method == Method::GET
+        || method == Method::HEAD
+        || method == Method::OPTIONS
+        || method == Method::TRACE
+}
+
+fn map_session_store_error(error: SessionStoreError) -> RequestAuthError {
+    match error {
+        SessionStoreError::Unavailable => RequestAuthError::AuthenticationUnavailable,
+        SessionStoreError::Conflict | SessionStoreError::CorruptRecord => {
+            RequestAuthError::InvalidSession
+        }
+    }
+}
+
+/// HTTP authentication failure with deliberately bounded public detail.
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum RequestAuthError {
+    /// No Forge session cookie was supplied.
+    #[error("authentication required")]
+    MissingSession,
+    /// Session cookie/session record was invalid, expired or revoked.
+    #[error("authentication required")]
+    InvalidSession,
+    /// Required CSRF proof was not supplied.
+    #[error("CSRF token required")]
+    MissingCsrf,
+    /// CSRF proof was malformed or did not match the authenticated session.
+    #[error("invalid CSRF token")]
+    InvalidCsrf,
+    /// Request origin is absent, duplicated, opaque, or not configured.
+    #[error("request origin is not allowed")]
+    InvalidOrigin,
+    /// Durable authentication storage is unavailable.
+    #[error("authentication unavailable")]
+    AuthenticationUnavailable,
+}
+
+impl RequestAuthError {
+    /// Converts the error into a caller-safe Forge JSON response.
+    #[must_use]
+    pub fn into_response(self) -> Response {
+        let failure = match self {
+            Self::MissingSession | Self::InvalidSession => ForgeError::new(
+                ErrorCategory::Unauthenticated,
+                "authentication_required",
+                "a valid authenticated session is required",
+            ),
+            Self::MissingCsrf | Self::InvalidCsrf | Self::InvalidOrigin => ForgeError::new(
+                ErrorCategory::Forbidden,
+                "csrf_validation_failed",
+                "the request did not provide a valid CSRF proof",
+            ),
+            Self::AuthenticationUnavailable => ForgeError::new(
+                ErrorCategory::Infrastructure,
+                "authentication_unavailable",
+                "authentication is temporarily unavailable",
+            )
+            .with_retryable(true),
+        };
+        forge::web::error(&failure)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge::http::StatusCode;
+
+    fn result_ok<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error:?}"),
+        }
+    }
+
+    fn option_some<T>(value: Option<T>, context: &str) -> T {
+        match value {
+            Some(value) => value,
+            None => panic!("{context}"),
+        }
+    }
+
+    #[test]
+    fn tenant_header_requires_one_valid_typed_identifier() {
+        use forge::http::{HeaderMap, Method, Uri};
+        use uuid::Uuid;
+
+        let make_request = |values: &[String]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(
+                    TENANT_HEADER_NAME,
+                    result_ok(value.parse(), "valid tenant header value"),
+                );
+            }
+            Request::new_for_test(
+                Method::GET,
+                Uri::from_static("/projects"),
+                headers,
+                Default::default(),
+                result_ok("127.0.0.1:4000".parse(), "valid remote address"),
+                Uuid::now_v7(),
+            )
+        };
+        let tenant_id = TenantId::new();
+
+        assert_eq!(
+            tenant_id_from_request(&make_request(&[tenant_id.to_string()])),
+            Ok(tenant_id)
+        );
+        assert_eq!(
+            tenant_id_from_request(&make_request(&[])),
+            Err(TenantRequestAuthorizationError::TenantRequired)
+        );
+        assert_eq!(
+            tenant_id_from_request(&make_request(&["not-a-uuidv7".to_owned()])),
+            Err(TenantRequestAuthorizationError::InvalidTenant)
+        );
+        assert_eq!(
+            tenant_id_from_request(&make_request(&[
+                tenant_id.to_string(),
+                TenantId::new().to_string(),
+            ])),
+            Err(TenantRequestAuthorizationError::InvalidTenant)
+        );
+    }
+
+    #[test]
+    fn tenant_authorization_errors_are_no_store_and_do_not_disclose_membership() {
+        let missing = TenantRequestAuthorizationError::Denied.into_response();
+        let malformed = TenantRequestAuthorizationError::InvalidTenant.into_response();
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+        assert_eq!(malformed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            missing
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .map(HeaderValue::as_bytes),
+            Some(b"no-store".as_slice())
+        );
+        assert_eq!(
+            malformed
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .map(HeaderValue::as_bytes),
+            Some(b"no-store".as_slice())
+        );
+        assert_eq!(
+            missing.body(),
+            TenantRequestAuthorizationError::Denied
+                .into_response()
+                .body()
+        );
+    }
+
+    #[test]
+    fn browser_login_routes_register_with_lazy_postgres_pool() {
+        let runtime = result_ok(
+            tokio::runtime::Builder::new_current_thread().build(),
+            "test Tokio runtime",
+        );
+        let _runtime_guard = runtime.enter();
+        let pool = result_ok(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://forge:forge@127.0.0.1/forge"),
+            "lazy PostgreSQL pool",
+        );
+        let mut router = Router::new();
+        result_ok(
+            register_login_routes(
+                &mut router,
+                pool,
+                "https://app.example.test".to_owned(),
+                Vec::new(),
+            ),
+            "register authentication routes",
+        );
+
+        let routes = format!("{router:?}");
+        assert!(routes.contains("GET /auth/csrf"));
+        assert!(routes.contains("POST /auth/login"));
+        assert!(routes.contains("POST /auth/logout"));
+    }
+
+    #[test]
+    fn csrf_bootstrap_is_no_store_and_sets_a_token_cookie() {
+        let response = csrf_bootstrap_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .map(HeaderValue::as_bytes),
+            Some(b"no-store".as_slice()),
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn logout_clears_both_host_only_auth_cookies_without_caching() {
+        let response = clear_auth_cookies(Response::empty(StatusCode::NO_CONTENT));
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .map(HeaderValue::as_bytes),
+            Some(b"no-store".as_slice()),
+        );
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|header| header.to_str().ok())
+            .collect();
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies.iter().any(|cookie| {
+            cookie.starts_with("__Host-forge_session=") && cookie.contains("Max-Age=0")
+        }));
+        assert!(cookies.iter().any(|cookie| {
+            cookie.starts_with("__Host-forge_csrf=")
+                && cookie.contains("Max-Age=0")
+                && !cookie.contains("HttpOnly")
+        }));
+    }
+
+    #[test]
+    fn cookie_is_host_only_secure_http_only_and_lax() {
+        let token = result_ok(SessionBearerToken::new("ab".repeat(32)), "valid test token");
+        let rendered = session_set_cookie(&token);
+        assert!(rendered.starts_with("__Host-forge_session="));
+        assert!(rendered.contains("Path=/"));
+        assert!(rendered.contains("Secure"));
+        assert!(rendered.contains("HttpOnly"));
+        assert!(rendered.contains("SameSite=Lax"));
+        assert!(!rendered.contains("Domain="));
+    }
+
+    #[test]
+    fn pre_session_csrf_cookie_is_host_only_secure_readable_and_lax() {
+        let token = result_ok(CsrfToken::new("cd".repeat(32)), "valid test token");
+        let rendered = pre_session_csrf_set_cookie(&token);
+        assert!(rendered.starts_with("__Host-forge_csrf="));
+        assert!(rendered.contains("Path=/"));
+        assert!(rendered.contains("Secure"));
+        assert!(rendered.contains("SameSite=Lax"));
+        assert!(!rendered.contains("HttpOnly"));
+        assert!(!rendered.contains("Domain="));
+    }
+
+    #[test]
+    fn cookie_parser_uses_cookie_grammar_and_rejects_bad_tokens() {
+        let token = "ab".repeat(32);
+        let header = format!("other=1; {SESSION_COOKIE_NAME}={token}; another=2");
+        let parsed = option_some(
+            result_ok(parse_session_cookie(&header), "valid Cookie header"),
+            "Forge cookie exists",
+        );
+        assert_eq!(parsed.expose(), token);
+        assert_eq!(
+            parse_session_cookie("__Host-forge_session=short"),
+            Err(RequestAuthError::InvalidSession)
+        );
+    }
+
+    #[test]
+    fn csrf_is_required_only_for_unsafe_methods() {
+        for safe in [Method::GET, Method::HEAD, Method::OPTIONS, Method::TRACE] {
+            assert!(is_safe_method(&safe));
+        }
+        for unsafe_method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(!is_safe_method(&unsafe_method));
+        }
+    }
+
+    #[test]
+    fn invalid_and_missing_sessions_have_the_same_public_response() {
+        let missing = RequestAuthError::MissingSession.into_response();
+        let invalid = RequestAuthError::InvalidSession.into_response();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(missing.body(), invalid.body());
+    }
+
+    #[test]
+    fn pre_session_login_requires_exact_origin_and_double_submit_token() {
+        use forge::http::{HeaderMap, Method, Uri};
+        use uuid::Uuid;
+
+        let value = "ab".repeat(32);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            result_ok("https://app.example.test".parse(), "valid origin header"),
+        );
+        headers.insert(
+            header::COOKIE,
+            result_ok(
+                format!("{PRE_SESSION_CSRF_COOKIE_NAME}={value}").parse(),
+                "valid cookie header",
+            ),
+        );
+        headers.insert(
+            CSRF_HEADER_NAME,
+            result_ok(value.parse(), "valid CSRF header"),
+        );
+        let request = Request::new_for_test(
+            Method::POST,
+            Uri::from_static("/auth/login"),
+            headers,
+            Default::default(),
+            result_ok("127.0.0.1:4000".parse(), "valid remote address"),
+            Uuid::now_v7(),
+        );
+
+        assert_eq!(
+            verify_pre_session_login_csrf(&request, "https://app.example.test"),
+            Ok(())
+        );
+        assert_eq!(
+            verify_pre_session_login_csrf(&request, "https://attacker.example.test"),
+            Err(RequestAuthError::InvalidOrigin)
+        );
+    }
+
+    #[test]
+    fn pre_session_login_rejects_missing_mismatched_and_ambiguous_proofs() {
+        use forge::http::{HeaderMap, Method, Uri};
+        use uuid::Uuid;
+
+        let make_request = |cookie: Option<&str>, csrf: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::ORIGIN,
+                result_ok("https://app.example.test".parse(), "valid origin header"),
+            );
+            if let Some(cookie) = cookie {
+                headers.insert(
+                    header::COOKIE,
+                    result_ok(cookie.parse(), "valid cookie header"),
+                );
+            }
+            if let Some(csrf) = csrf {
+                headers.insert(
+                    CSRF_HEADER_NAME,
+                    result_ok(csrf.parse(), "valid CSRF header"),
+                );
+            }
+            Request::new_for_test(
+                Method::POST,
+                Uri::from_static("/auth/login"),
+                headers,
+                Default::default(),
+                result_ok("127.0.0.1:4000".parse(), "valid remote address"),
+                Uuid::now_v7(),
+            )
+        };
+        let token = "ab".repeat(32);
+        let cookie = format!("{PRE_SESSION_CSRF_COOKIE_NAME}={token}");
+
+        assert_eq!(
+            verify_pre_session_login_csrf(
+                &make_request(None, Some(&token)),
+                "https://app.example.test"
+            ),
+            Err(RequestAuthError::MissingCsrf)
+        );
+        assert_eq!(
+            verify_pre_session_login_csrf(
+                &make_request(Some(&cookie), Some(&"cd".repeat(32))),
+                "https://app.example.test"
+            ),
+            Err(RequestAuthError::InvalidCsrf)
+        );
+        assert_eq!(
+            verify_pre_session_login_csrf(
+                &make_request(Some(&format!("{cookie}; {cookie}")), Some(&token)),
+                "https://app.example.test"
+            ),
+            Err(RequestAuthError::InvalidCsrf)
+        );
+        assert_eq!(
+            verify_pre_session_login_csrf(&make_request(Some(&cookie), Some(&token)), ""),
+            Err(RequestAuthError::InvalidOrigin)
+        );
+    }
+
+    #[test]
+    fn pre_session_login_rejects_missing_or_duplicate_origin_and_duplicate_header() {
+        use forge::http::{HeaderMap, HeaderValue, Method, Uri};
+        use uuid::Uuid;
+
+        let request = |include_origin: bool, duplicate_origin: bool, duplicate_csrf: bool| {
+            let token = "ef".repeat(32);
+            let mut headers = HeaderMap::new();
+            if include_origin {
+                headers.append(
+                    header::ORIGIN,
+                    result_ok("https://app.example.test".parse(), "valid origin header"),
+                );
+                if duplicate_origin {
+                    headers.append(
+                        header::ORIGIN,
+                        result_ok("https://app.example.test".parse(), "valid origin header"),
+                    );
+                }
+            }
+            headers.insert(
+                header::COOKIE,
+                result_ok(
+                    format!("{PRE_SESSION_CSRF_COOKIE_NAME}={token}").parse(),
+                    "valid cookie header",
+                ),
+            );
+            headers.append(
+                CSRF_HEADER_NAME,
+                result_ok::<HeaderValue, _>(token.parse(), "valid CSRF header"),
+            );
+            if duplicate_csrf {
+                headers.append(
+                    CSRF_HEADER_NAME,
+                    result_ok(token.parse(), "valid repeated CSRF header"),
+                );
+            }
+            Request::new_for_test(
+                Method::POST,
+                Uri::from_static("/auth/login"),
+                headers,
+                Default::default(),
+                result_ok("127.0.0.1:4000".parse(), "valid remote address"),
+                Uuid::now_v7(),
+            )
+        };
+
+        assert_eq!(
+            verify_pre_session_login_csrf(
+                &request(false, false, false),
+                "https://app.example.test"
+            ),
+            Err(RequestAuthError::InvalidOrigin)
+        );
+        assert_eq!(
+            verify_pre_session_login_csrf(&request(true, true, false), "https://app.example.test"),
+            Err(RequestAuthError::InvalidOrigin)
+        );
+        assert_eq!(
+            verify_pre_session_login_csrf(&request(true, false, true), "https://app.example.test"),
+            Err(RequestAuthError::InvalidCsrf)
+        );
+    }
+}

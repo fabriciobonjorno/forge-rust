@@ -1,0 +1,94 @@
+//! PostgreSQL concurrency contract for generated login throttling.
+
+use std::error::Error;
+
+use app::infrastructure::auth::PostgresLoginAttemptStore;
+use forge::auth::{LoginAttemptDecision, LoginAttemptKey, LoginAttemptPolicy, LoginAttemptStore};
+use sha2::{Digest, Sha256};
+use sqlx::postgres::PgPoolOptions;
+use tokio::task::JoinSet;
+use uuid::Uuid;
+
+#[test]
+#[ignore = "requires migrated PostgreSQL via FORGE_DATABASE_URL"]
+fn login_attempt_throttling_is_shared_atomic_and_clears_only_login_bucket()
+-> Result<(), Box<dyn Error>> {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let database_url = std::env::var("FORGE_DATABASE_URL")?;
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await?;
+        let store = PostgresLoginAttemptStore::new(pool.clone());
+        let login = random_key();
+        let client = random_key();
+        let policy = LoginAttemptPolicy::new(5, 30, 60)
+            .ok_or_else(|| std::io::Error::other("test policy must be valid"))?;
+
+        let mut tasks = JoinSet::new();
+        for _ in 0..10 {
+            let store = store.clone();
+            let task_login = login;
+            let task_client = client;
+            tasks.spawn(async move {
+                store
+                    .record_and_check(&task_login, &task_client, policy)
+                    .await
+            });
+        }
+        let mut allowed = 0;
+        let mut limited = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result?? {
+                LoginAttemptDecision::Allowed => allowed += 1,
+                LoginAttemptDecision::Limited {
+                    retry_after_seconds,
+                } => {
+                    assert!(retry_after_seconds.get() > 0);
+                    limited += 1;
+                }
+            }
+        }
+        assert_eq!(
+            allowed, 5,
+            "login limit must hold under concurrent requests"
+        );
+        assert_eq!(limited, 5);
+
+        store.clear_login(&login).await?;
+        assert_eq!(
+            store.record_and_check(&login, &client, policy).await?,
+            LoginAttemptDecision::Allowed,
+            "successful authentication reset must clear the login bucket"
+        );
+
+        let shared_client = random_key();
+        let client_policy = LoginAttemptPolicy::new(100, 3, 60)
+            .ok_or_else(|| std::io::Error::other("client test policy must be valid"))?;
+        for _ in 0..3 {
+            assert_eq!(
+                store
+                    .record_and_check(&random_key(), &shared_client, client_policy)
+                    .await?,
+                LoginAttemptDecision::Allowed
+            );
+        }
+        assert!(matches!(
+            store
+                .record_and_check(&random_key(), &shared_client, client_policy)
+                .await?,
+            LoginAttemptDecision::Limited { .. }
+        ));
+
+        pool.close().await;
+        Ok(())
+    })
+}
+
+fn random_key() -> LoginAttemptKey {
+    LoginAttemptKey::from_bytes(Sha256::digest(Uuid::now_v7().as_bytes()).into())
+}

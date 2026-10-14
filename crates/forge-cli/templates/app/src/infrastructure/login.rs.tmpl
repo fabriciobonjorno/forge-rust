@@ -1,0 +1,93 @@
+//! PostgreSQL transaction for version-bound login session issuance.
+
+use crate::application::login::{LoginSessionError, LoginSessionStore, VerifiedPassword};
+use crate::infrastructure::{audit::append_with, auth::insert_with};
+use async_trait::async_trait;
+use forge::audit::AuditEvent;
+use forge::auth::{CsrfTokenDigest, Session, SessionCredentialDigest};
+use sqlx::{PgPool, types::Uuid};
+
+/// Stores a successful login's credential rehash, session, and audit event in
+/// one PostgreSQL transaction.
+pub struct PostgresLoginSessionStore {
+    pool: PgPool,
+}
+
+impl PostgresLoginSessionStore {
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl LoginSessionStore for PostgresLoginSessionStore {
+    async fn issue_with_audit(
+        &self,
+        proof: &VerifiedPassword,
+        session: &Session,
+        bearer: &SessionCredentialDigest,
+        csrf: &CsrfTokenDigest,
+        event: &AuditEvent,
+    ) -> Result<(), LoginSessionError> {
+        if session.principal_id() != proof.principal_id() {
+            return Err(LoginSessionError::InvalidCredentials);
+        }
+        let version = i64::try_from(proof.observed_version().get())
+            .map_err(|_| LoginSessionError::Unavailable)?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| LoginSessionError::Unavailable)?;
+
+        // Compare both version and hash under a row lock. The hash equality is
+        // defense in depth against a credential writer that forgot to advance
+        // the version. The lock serializes this issuance with password changes
+        // and account disable operations.
+        let principal = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM forge_principals
+             WHERE id = $1 AND version = $2 AND password_hash = $3
+               AND disabled_at IS NULL FOR UPDATE",
+        )
+        .bind(proof.principal_id().into_uuid())
+        .bind(version)
+        .bind(proof.observed_hash().expose())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| LoginSessionError::Unavailable)?;
+        if principal.is_none() {
+            return Err(LoginSessionError::InvalidCredentials);
+        }
+
+        if let Some(replacement_hash) = proof.replacement_hash() {
+            let updated = sqlx::query(
+                "UPDATE forge_principals
+                 SET password_hash = $3,
+                     updated_at = clock_timestamp(),
+                     version = version + 1
+                 WHERE id = $1 AND version = $2 AND disabled_at IS NULL",
+            )
+            .bind(proof.principal_id().into_uuid())
+            .bind(version)
+            .bind(replacement_hash.expose())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| LoginSessionError::Unavailable)?;
+            if updated.rows_affected() != 1 {
+                return Err(LoginSessionError::InvalidCredentials);
+            }
+        }
+
+        insert_with(&mut *transaction, session, bearer, csrf)
+            .await
+            .map_err(|_| LoginSessionError::Unavailable)?;
+        append_with(&mut *transaction, event)
+            .await
+            .map_err(|_| LoginSessionError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| LoginSessionError::Unavailable)
+    }
+}

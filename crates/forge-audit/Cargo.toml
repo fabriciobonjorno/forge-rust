@@ -2,7 +2,7 @@
 name = "forge-audit"
 description = "Immutable security audit event and append-only sink contracts for Forge applications"
 version.workspace = true
-edition.workspace = true
+edition = "2024"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true

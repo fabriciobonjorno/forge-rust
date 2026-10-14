@@ -4,25 +4,164 @@
 //! ports can depend on these transaction/error contracts while concrete SQLx
 //! adapters remain in infrastructure.
 
-use async_trait::async_trait;
 use forge_tenancy::TenantContext;
 use thiserror::Error;
 
-/// Stable database failure categories exposed across application boundaries.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DatabaseErrorKind {
-    /// The database or connection pool is unavailable.
-    Unavailable,
-    /// An operation exceeded its deadline.
-    Timeout,
-    /// Optimistic concurrency check failed.
-    Conflict,
-    /// A database constraint rejected the write.
-    Constraint,
-    /// Migration execution or validation failed.
-    Migration,
-    /// Adapter-specific failure that is safe to classify only as infrastructure.
-    Infrastructure,
+// Public modules
+pub mod backend;
+pub mod database;
+pub mod error;
+pub mod migrate;
+
+// Re-export SQLx's Migrator for test support
+pub use sqlx::migrate::Migrator;
+
+// Re-export sqlx for migration macro access
+pub use sqlx;
+
+// Re-export key types at crate root for compatibility
+pub use backend::{Backend, RowsAffected};
+#[cfg(feature = "mysql")]
+pub use database::MySqlDatabase;
+#[cfg(feature = "sqlite")]
+pub use database::SqliteDatabase;
+#[cfg(feature = "postgres")]
+pub use database::{Database, PgDatabase, TransactionWrapper};
+#[cfg(not(feature = "postgres"))]
+pub use database::{Database, TransactionWrapper};
+pub use error::{DbError, Kind as DatabaseErrorKind};
+
+/// Testing support module (only available with `testing` feature).
+#[cfg(feature = "testing")]
+pub mod testing {
+    use crate::{DbError, Migrator};
+
+    /// A provisioned test database.
+    #[derive(Debug)]
+    pub struct Provisioned {
+        pub name: String,
+        pub url: String,
+    }
+
+    impl Provisioned {
+        /// Creates a new provisioned test database.
+        pub fn new(name: String, url: String) -> Self {
+            Self { name, url }
+        }
+    }
+
+    /// Isolated PostgreSQL database for an integration test.
+    #[cfg(feature = "postgres")]
+    pub struct PgTestDatabase {
+        database: crate::PgDatabase,
+        admin: sqlx::PgPool,
+        name: String,
+    }
+
+    #[cfg(feature = "postgres")]
+    impl std::fmt::Debug for PgTestDatabase {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("PgTestDatabase")
+                .field("name", &self.name)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    impl PgTestDatabase {
+        /// Creates a uniquely named database using `FORGE_TEST_DATABASE_URL`
+        /// as the administrative connection. The target URL must connect as a
+        /// role allowed to create and drop databases.
+        pub async fn create(migrator: &Migrator) -> Result<Self, DbError> {
+            use sqlx::{
+                AssertSqlSafe, ConnectOptions,
+                postgres::{PgConnectOptions, PgPoolOptions},
+            };
+            use std::str::FromStr;
+
+            let target = std::env::var("FORGE_TEST_DATABASE_URL").map_err(|_| {
+                DbError::Configuration(sqlx::Error::Configuration(
+                    "FORGE_TEST_DATABASE_URL is required for PostgreSQL integration tests".into(),
+                ))
+            })?;
+            let options = PgConnectOptions::from_str(&target).map_err(DbError::from)?;
+            let admin_options = options.clone().database("postgres");
+            let admin = PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with(admin_options)
+                .await
+                .map_err(DbError::from)?;
+            let name = format!("forge_test_{}", uuid::Uuid::now_v7().simple());
+
+            // The identifier is generated locally from UUID hex, never from
+            // environment/user input; PostgreSQL cannot bind DB identifiers.
+            sqlx::query(AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+                .execute(&admin)
+                .await
+                .map_err(DbError::from)?;
+
+            let database_url = options.database(&name).to_url_lossy().to_string();
+            let config =
+                forge_config::DatabaseConfig::new(forge_config::SecretString::new(database_url));
+            let database = match crate::PgDatabase::connect(&config).await {
+                Ok(database) => database,
+                Err(error) => {
+                    let _ =
+                        sqlx::query(AssertSqlSafe(format!("DROP DATABASE IF EXISTS \"{name}\"")))
+                            .execute(&admin)
+                            .await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = database.migrate(migrator).await {
+                database.close().await;
+                let _ = sqlx::query(AssertSqlSafe(format!("DROP DATABASE IF EXISTS \"{name}\"")))
+                    .execute(&admin)
+                    .await;
+                return Err(error);
+            }
+
+            Ok(Self {
+                database,
+                admin,
+                name,
+            })
+        }
+
+        /// Returns the isolated migrated database.
+        #[must_use]
+        pub const fn database(&self) -> &crate::PgDatabase {
+            &self.database
+        }
+
+        /// Closes connections and drops the isolated database.
+        pub async fn cleanup(self) -> Result<(), DbError> {
+            use sqlx::{AssertSqlSafe, Executor};
+
+            self.database.close().await;
+            self.admin
+                .execute(AssertSqlSafe(format!(
+                    "DROP DATABASE IF EXISTS \"{}\"",
+                    self.name
+                )))
+                .await
+                .map_err(DbError::from)?;
+            self.admin.close().await;
+            Ok(())
+        }
+    }
+
+    /// Error for test database provisioning.
+    #[derive(Debug, thiserror::Error)]
+    pub enum ProvisionError {
+        #[error("database already exists: {0}")]
+        AlreadyExists(String),
+        #[error("database not found: {0}")]
+        NotFound(String),
+        #[error("provisioning failed: {0}")]
+        Failed(#[from] DbError),
+    }
 }
 
 /// Framework-owned database error.
@@ -59,6 +198,23 @@ impl DatabaseError {
     #[must_use]
     pub const fn retryable(&self) -> bool {
         self.retryable
+    }
+}
+
+impl From<sqlx::Error> for DatabaseError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::new(
+            DatabaseErrorKind::Infrastructure,
+            "database query failed",
+            matches!(
+                error,
+                sqlx::Error::PoolTimedOut
+                    | sqlx::Error::PoolClosed
+                    | sqlx::Error::WorkerCrashed
+                    | sqlx::Error::Io(_)
+                    | sqlx::Error::Tls(_)
+            ),
+        )
     }
 }
 
@@ -110,20 +266,18 @@ impl RecordVersion {
 ///
 /// Concrete adapters own the connection/transaction implementation. The
 /// transaction cannot be committed twice because commit/rollback consume it.
-#[async_trait]
 pub trait Transaction: Send {
     /// Commits all work in this transaction.
-    async fn commit(self) -> Result<(), DatabaseError>;
+    fn commit(self) -> impl Future<Output = Result<(), DbError>> + Send;
 
     /// Explicitly rolls back all work in this transaction.
-    async fn rollback(self) -> Result<(), DatabaseError>;
+    fn rollback(self) -> impl Future<Output = Result<(), DbError>> + Send;
 }
 
 /// Starts lifetime-scoped transactions.
 ///
 /// The generic associated transaction type prevents a transaction from
 /// outliving the manager/adapter that created it.
-#[async_trait]
 pub trait TransactionManager: Send + Sync {
     /// Concrete transaction bound to the manager borrow.
     type Transaction<'a>: Transaction + 'a
@@ -131,7 +285,7 @@ pub trait TransactionManager: Send + Sync {
         Self: 'a;
 
     /// Begins a new transaction.
-    async fn begin(&self) -> Result<Self::Transaction<'_>, DatabaseError>;
+    fn begin(&self) -> impl Future<Output = Result<Self::Transaction<'_>, DbError>> + Send;
 }
 
 /// Validated maximum number of records requested from a repository page.
@@ -192,7 +346,6 @@ impl<T, C> CursorPage<T, C> {
 /// semantics are not appropriate. This contract exists for ordinary aggregates
 /// and deliberately exposes only Forge-owned types. SQLx rows, pools,
 /// transactions and query builders stay in infrastructure adapters.
-#[async_trait]
 pub trait Repository: Send + Sync {
     /// Nominal identifier type, typically forge_core::Id<Marker>.
     type Id: Send + Sync;
@@ -202,37 +355,43 @@ pub trait Repository: Send + Sync {
     type Cursor: Send + Sync;
 
     /// Loads an entity by typed identifier.
-    async fn find(&self, id: &Self::Id) -> Result<Option<Self::Entity>, DatabaseError>;
+    fn find(
+        &self,
+        id: &Self::Id,
+    ) -> impl Future<Output = Result<Option<Self::Entity>, DatabaseError>> + Send;
 
     /// Inserts a new entity at RecordVersion::INITIAL.
-    async fn insert(&self, entity: &Self::Entity) -> Result<(), DatabaseError>;
+    fn insert(
+        &self,
+        entity: &Self::Entity,
+    ) -> impl Future<Output = Result<(), DatabaseError>> + Send;
 
     /// Persists an optimistic update and returns the new record version.
     ///
     /// Adapters must classify a zero-row optimistic update as
     /// DatabaseErrorKind::Conflict rather than silently overwriting newer data.
-    async fn update(
+    fn update(
         &self,
         entity: &Self::Entity,
         expected_version: RecordVersion,
-    ) -> Result<RecordVersion, DatabaseError>;
+    ) -> impl Future<Output = Result<RecordVersion, DatabaseError>> + Send;
 
     /// Deletes an entity only when its persisted version matches.
-    async fn delete(
+    fn delete(
         &self,
         id: &Self::Id,
         expected_version: RecordVersion,
-    ) -> Result<(), DatabaseError>;
+    ) -> impl Future<Output = Result<(), DatabaseError>> + Send;
 
     /// Reads a bounded deterministic page.
     ///
     /// Concrete adapters should use an indexed stable ordering tuple (normally
     /// created_at plus id) and must not emulate cursors with unbounded OFFSET.
-    async fn page(
+    fn page(
         &self,
         after: Option<&Self::Cursor>,
         limit: PageLimit,
-    ) -> Result<CursorPage<Self::Entity, Self::Cursor>, DatabaseError>;
+    ) -> impl Future<Output = Result<CursorPage<Self::Entity, Self::Cursor>, DatabaseError>> + Send;
 }
 
 /// Typed repository contract for tenant-owned aggregates.
@@ -241,7 +400,6 @@ pub trait Repository: Send + Sync {
 /// TenantContext. There is intentionally no overload that accepts only a raw
 /// tenant identifier, so tenant-sensitive application code cannot accidentally
 /// omit the authorization boundary.
-#[async_trait]
 pub trait TenantRepository: Send + Sync {
     /// Nominal identifier type, typically forge_core::Id<Marker>.
     type Id: Send + Sync;
@@ -251,42 +409,42 @@ pub trait TenantRepository: Send + Sync {
     type Cursor: Send + Sync;
 
     /// Loads an entity within the authorized tenant.
-    async fn find(
+    fn find(
         &self,
         context: &TenantContext,
         id: &Self::Id,
-    ) -> Result<Option<Self::Entity>, DatabaseError>;
+    ) -> impl Future<Output = Result<Option<Self::Entity>, DatabaseError>> + Send;
 
     /// Inserts an entity within the authorized tenant.
-    async fn insert(
+    fn insert(
         &self,
         context: &TenantContext,
         entity: &Self::Entity,
-    ) -> Result<(), DatabaseError>;
+    ) -> impl Future<Output = Result<(), DatabaseError>> + Send;
 
     /// Persists an optimistic tenant-scoped update.
-    async fn update(
+    fn update(
         &self,
         context: &TenantContext,
         entity: &Self::Entity,
         expected_version: RecordVersion,
-    ) -> Result<RecordVersion, DatabaseError>;
+    ) -> impl Future<Output = Result<RecordVersion, DatabaseError>> + Send;
 
     /// Deletes within the authorized tenant when the version matches.
-    async fn delete(
+    fn delete(
         &self,
         context: &TenantContext,
         id: &Self::Id,
         expected_version: RecordVersion,
-    ) -> Result<(), DatabaseError>;
+    ) -> impl Future<Output = Result<(), DatabaseError>> + Send;
 
     /// Reads a bounded deterministic page within the authorized tenant.
-    async fn page(
+    fn page(
         &self,
         context: &TenantContext,
         after: Option<&Self::Cursor>,
         limit: PageLimit,
-    ) -> Result<CursorPage<Self::Entity, Self::Cursor>, DatabaseError>;
+    ) -> impl Future<Output = Result<CursorPage<Self::Entity, Self::Cursor>, DatabaseError>> + Send;
 }
 
 #[cfg(test)]

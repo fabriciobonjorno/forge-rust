@@ -10,38 +10,69 @@
 use std::process::ExitCode;
 
 %%if database%%
-use forge::config::SecretString;
-use sqlx::{PgPool, migrate::Migrator};
+pub mod account;
 
-static MIGRATOR: Migrator = sqlx::migrate!();
+use forge::ComposeError;
 
-async fn migrate_database(url: SecretString) -> Result<(), sqlx::Error> {
-    let pool = PgPool::connect(url.expose()).await?;
-    MIGRATOR.run(&pool).await?;
-    pool.close().await;
-    Ok(())
-}
-
-async fn rollback_database(url: SecretString) -> Result<(), sqlx::Error> {
-    let pool = PgPool::connect(url.expose()).await?;
-    let target = sqlx::query_scalar::<_, i64>(
-        "SELECT version FROM _sqlx_migrations ORDER BY version DESC OFFSET 1 LIMIT 1",
-    )
-    .fetch_optional(&pool)
-    .await?
-    .unwrap_or(0);
-    MIGRATOR.undo(&pool, target).await?;
-    pool.close().await;
+/// Wires database-backed adapters and the browser authentication routes.
+pub fn compose(composition: &mut forge::Composition<'_>) -> Result<(), ComposeError> {
+    let Some(origin) = composition.config().server.public_origin.clone() else {
+        return Ok(());
+    };
+    let trusted_proxies = composition.config().server.trusted_proxies.clone();
+    let pool = composition.postgres()?.pool().clone();
+    crate::adapters::http::auth::register_login_routes(
+        composition.router(),
+        pool,
+        origin,
+        trusted_proxies,
+    )?;
     Ok(())
 }
 %%end%%
-/// Runs the command selected on the command line (serve by default).
+%%if !database%%
+/// No database-backed adapters are needed by this application.
+pub fn compose(_composition: &mut forge::Composition<'_>) -> Result<(), forge::ComposeError> {
+    Ok(())
+}
+%%end%%
+
+/// Dispatches framework commands and the generated app's one-shot account setup.
 pub fn run() -> ExitCode {
+    %%if database%%
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "bootstrap-account")
+    {
+        return account::run(&arguments[1..]);
+    }
+    if arguments.len() == 1
+        && arguments[0]
+            .to_str()
+            .is_some_and(|argument| matches!(argument, "help" | "--help" | "-h"))
+    {
+        let result = run_server();
+        account::print_help();
+        return result;
+    }
+    %%end%%
+    run_server()
+}
+
+fn run_server() -> ExitCode {
+    %%if database%%
+    use sqlx::migrate::Migrator;
+
+    const MIGRATOR: Migrator = sqlx::migrate!();
+
+%%end%%
     forge::App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
-%%if database%%
-        .migrations(migrate_database, rollback_database)
-%%end%%
+    %%if database%%
+        .postgres(MIGRATOR)
+    %%end%%
         .routes(crate::adapters::http::routes)
+        .compose(crate::bootstrap::compose)
         .run()
 }

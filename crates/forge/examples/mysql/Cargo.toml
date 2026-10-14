@@ -1,0 +1,15 @@
+[package]
+name = "forge-example-mysql"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "mysql"
+path = "mysql.rs"
+
+[dependencies]
+forge = { path = "../../../crates/forge" }
+forge_core = { path = "../../../../crates/forge-core" }
+serde = { workspace = true, features = ["derive"] }
+sqlx = { workspace = true, features = ["mysql", "runtime-tokio", "macros", "migrate", "chrono", "json", "uuid"] }

@@ -1,0 +1,159 @@
+//! One-time local command for creating the first authenticatable account.
+
+use std::{
+    ffi::OsString,
+    process::ExitCode,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use crate::{
+    application::bootstrap_account::{BootstrapAccount, BootstrapAccountError},
+    infrastructure::{
+        bootstrap_account::PostgresBootstrapAccountStore, security::Argon2idPasswordHasher,
+    },
+};
+use forge::auth::{PasswordHasher, UnixTimestamp};
+use sqlx::postgres::PgPoolOptions;
+use subtle::ConstantTimeEq as _;
+use zeroize::{Zeroize as _, Zeroizing};
+
+pub fn print_help() {
+    println!(
+        "\nGenerated application command:\n  bootstrap-account <login> <tenant-name>  Create the first tenant and owner account using no-echo password prompts and the migration URL."
+    );
+}
+
+pub fn run(arguments: &[OsString]) -> ExitCode {
+    let Some(login) = arguments.first().and_then(|value| value.to_str()) else {
+        eprintln!(
+            "usage: {} bootstrap-account <login> <tenant-name>",
+            env!("CARGO_PKG_NAME")
+        );
+        return ExitCode::from(2);
+    };
+    let Some(tenant_name) = arguments.get(1).and_then(|value| value.to_str()) else {
+        eprintln!(
+            "usage: {} bootstrap-account <login> <tenant-name>",
+            env!("CARGO_PKG_NAME")
+        );
+        return ExitCode::from(2);
+    };
+    if arguments.len() != 2 {
+        eprintln!(
+            "usage: {} bootstrap-account <login> <tenant-name>",
+            env!("CARGO_PKG_NAME")
+        );
+        return ExitCode::from(2);
+    }
+    if login.trim().is_empty()
+        || login.len() > 320
+        || login.chars().any(char::is_control)
+        || login.starts_with('-')
+    {
+        eprintln!("login must be 1 to 320 UTF-8 bytes without control characters");
+        return ExitCode::from(2);
+    }
+    if tenant_name.trim().is_empty()
+        || tenant_name.len() > 200
+        || tenant_name.chars().any(char::is_control)
+    {
+        eprintln!("tenant name must be 1 to 200 UTF-8 bytes without control characters");
+        return ExitCode::from(2);
+    }
+
+    let database_url = match std::env::var("FORGE_MIGRATION_DATABASE_URL") {
+        Ok(url) if !url.is_empty() => Zeroizing::new(url),
+        _ => {
+            eprintln!("account bootstrap requires FORGE_MIGRATION_DATABASE_URL");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut password = match rpassword::prompt_password("New account password: ") {
+        Ok(value) => Zeroizing::new(value),
+        Err(_) => {
+            eprintln!("could not read password from terminal");
+            return ExitCode::FAILURE;
+        }
+    };
+    let confirmation = match rpassword::prompt_password("Confirm password: ") {
+        Ok(value) => Zeroizing::new(value),
+        Err(_) => {
+            eprintln!("could not read password confirmation from terminal");
+            return ExitCode::FAILURE;
+        }
+    };
+    if password.len() != confirmation.len()
+        || !bool::from(password.as_bytes().ct_eq(confirmation.as_bytes()))
+    {
+        eprintln!("password confirmation does not match");
+        return ExitCode::FAILURE;
+    }
+    drop(confirmation);
+    if password.is_empty() || password.len() > 1024 {
+        eprintln!("password must contain between 1 and 1024 UTF-8 bytes");
+        return ExitCode::FAILURE;
+    }
+
+    let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => UnixTimestamp::from_secs(duration.as_secs()),
+        Err(_) => {
+            eprintln!("system clock is before the Unix epoch");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            eprintln!("could not start the account bootstrap runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(async {
+        let hash = Argon2idPasswordHasher
+            .hash(password.as_bytes())
+            .await
+            .map_err(|_| "password hashing failed")?;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect(&database_url)
+            .await
+            .map_err(|_| "could not connect using FORGE_MIGRATION_DATABASE_URL")?;
+        let operation = BootstrapAccount::new(PostgresBootstrapAccountStore::new(pool.clone()))
+            .execute(login, tenant_name, &hash, timestamp)
+            .await;
+        pool.close().await;
+        operation.map_err(|error| match error {
+            BootstrapAccountError::InvalidLogin => {
+                "login must be 1 to 320 UTF-8 bytes without control characters"
+            }
+            BootstrapAccountError::InvalidTenantName => {
+                "tenant name must be 1 to 200 UTF-8 bytes without control characters"
+            }
+            BootstrapAccountError::AlreadyBootstrapped => {
+                "an account or tenant already exists; bootstrap is one-time only"
+            }
+            BootstrapAccountError::Unavailable => {
+                "account bootstrap failed; no credentials or database details were logged"
+            }
+        })
+    });
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    // Ensure the command's plaintext buffer is zeroized before reporting success.
+    password.zeroize();
+
+    match result {
+        Ok(_) => {
+            println!("Initial tenant and owner account created with audit evidence.");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::FAILURE
+        }
+    }
+}

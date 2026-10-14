@@ -58,7 +58,8 @@ The generated `compose.yaml` builds the image and publishes it on
 image digest, a named `db-data` volume, and an initialization script that creates
 two development-only application roles:
 
-- `app_migrator`: owns schema changes and is used only by migrate/rollback;
+- `app_migrator`: owns schema changes and is used only by migrate/rollback and
+  the explicit one-time `bootstrap-account` command;
 - `app_runtime`: has data privileges, no schema ownership and `NOBYPASSRLS`.
 
 The PostgreSQL health check does not become healthy until the application database
@@ -124,10 +125,12 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_SHUTDOWN_GRACE_SECS` | `15` | Drain deadline for in-flight requests after SIGTERM/SIGINT. |
 | `FORGE_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes. |
 | `FORGE_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. Extra connections wait for a slot (backpressure) instead of being served without bound. |
+| `FORGE_TRUSTED_PROXIES` | none | Comma-separated IPs/CIDRs permitted to supply `X-Forwarded-For`; forwarding headers from every other peer are ignored. Configure only proxy addresses that sanitize/append the chain. |
+| `FORGE_PUBLIC_ORIGIN` | none | Canonical HTTPS origin used for browser login Origin/CSRF checks. HTTP is accepted only for localhost or a loopback IP in local development; paths, query strings, fragments, and credentials are rejected. Authentication routes must remain unavailable when this value is unset. |
 | `FORGE_LOG` | `info` | `tracing` filter directive, for example `info,shop=debug`. |
 | `FORGE_LOG_FORMAT` | `json` in production, `text` otherwise | `json` or `text`. |
 | `FORGE_DATABASE_URL` | none | Least-privilege PostgreSQL runtime connection URL. Treated as a secret and redacted from ordinary diagnostics. |
-| `FORGE_MIGRATION_DATABASE_URL` | none | PostgreSQL schema-owner/migration URL used only by `migrate` and `rollback`. Treated as a secret and redacted. |
+| `FORGE_MIGRATION_DATABASE_URL` | none | PostgreSQL schema-owner URL used only by `migrate`, `rollback`, and one-time `bootstrap-account`. Treated as a secret; never available to the serving process. |
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
 collects them. The HTTP layer also enforces a header-read timeout and adds
@@ -135,15 +138,25 @@ collects them. The HTTP layer also enforces a header-read timeout and adds
 `x-request-id` to responses. Transient `accept` errors, such as running out of
 file descriptors, do not stop the server.
 
+Applications behind trusted reverse proxies must set `FORGE_TRUSTED_PROXIES`
+to the proxy peer CIDRs and use `Request::client_ip` with the validated list.
+Forge ignores forwarding headers by default; never list an address range that
+untrusted clients can connect from directly.
+
 Do not put secrets in the image or in build arguments. Both database URLs contain
 credentials and must come from the deployment platform's secret mechanism.
 Forge's typed configuration redacts them from normal Debug/serialization output,
 but adapters must still avoid logging exposed URLs.
 
 Do **not** inject `FORGE_MIGRATION_DATABASE_URL` into the long-running serving
-process. Run migrations as a separate deployment job/task with the migration
-credential, then start the application with only `FORGE_DATABASE_URL`. The
-runtime database role should be `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`,
+process. Run migrations and, once, `bootstrap-account <login> <tenant-name>` as
+separate operator commands with the migration credential; the latter prompts
+for the password without echo, refuses existing principals/tenants, and writes
+the initial tenant, principal, active owner membership and audit events
+atomically. The `owner` role is still deny-by-default until the app's RBAC policy
+explicitly grants permissions to it. Unset the migration URL before starting
+the application with only `FORGE_DATABASE_URL`.
+The runtime database role should be `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`,
 `NOBYPASSRLS`, and should not own application schemas. See
 [ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md).
 

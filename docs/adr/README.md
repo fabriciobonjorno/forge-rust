@@ -20,6 +20,12 @@ does not mean implementation exists.
 | [0012](0012-structured-append-only-audit-evidence.md) | Structured append-only security audit evidence | Accepted |
 | [0013](0013-persistent-principals-sessions-and-memberships.md) | Persistent principals, credential-digest sessions, and memberships | Accepted |
 | [0014](0014-argon2-session-cookie-and-csrf.md) | Argon2id password authentication, opaque session cookies, and CSRF | Accepted |
+| [0015](0015-persistent-login-throttling.md) | Shared PostgreSQL login-attempt throttling | Accepted |
+| [0016](0016-trusted-proxy-client-addresses.md) | Explicit trusted-proxy client address resolution | Accepted |
+| [0017](0017-version-bound-login-session-issuance.md) | Version-bound login with atomic session and audit persistence | Accepted |
+| [0018](0018-pre-session-login-csrf.md) | Exact-origin and double-submit CSRF for pre-session login | Accepted |
+| [0019](0019-atomic-session-logout.md) | Atomic session revocation and logout audit | Accepted |
+| [0020](0020-one-time-first-account-bootstrap.md) | One-time first-account bootstrap with no-echo password input and atomic audit | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to

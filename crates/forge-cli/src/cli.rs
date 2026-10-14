@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -8,13 +8,16 @@ use clap::{Parser, Subcommand};
     arg_required_else_help = true
 )]
 pub(crate) struct Cli {
+    /// Render Forge execution errors as JSON on stderr for automation.
+    #[arg(long, global = true)]
+    pub(crate) json_errors: bool,
     #[command(subcommand)]
     pub(crate) command: Command,
 }
 
 impl Cli {
-    pub(crate) fn parse_process() -> Self {
-        Self::parse()
+    pub(crate) fn parse_process() -> Result<Self, clap::Error> {
+        Self::try_parse()
     }
 }
 
@@ -58,6 +61,31 @@ pub(crate) enum Command {
     Lint,
     /// Build the optimized release binary from the locked dependency graph.
     Build,
+    /// Print the generated application's versioned capability manifest.
+    Capabilities {
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
+    },
+    /// Diagnose the current Forge project using read-only local checks.
+    Doctor {
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
+        /// Attempt bounded TCP connection checks for configured PostgreSQL URLs.
+        #[arg(long)]
+        probe_database: bool,
+        /// Per-host connection timeout in milliseconds (100..=10000).
+        #[arg(long, default_value_t = 1500, value_parser = clap::value_parser!(u64).range(100..=10000))]
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub(crate) enum OutputFormat {
+    /// Versioned JSON for tools and coding agents.
+    #[default]
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -66,5 +94,39 @@ pub(crate) enum GenerateCommand {
     Migration {
         /// Human-readable migration name.
         name: String,
+        /// Stable SQLx migration version. Supply this for reproducible previews and output.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=9223372036854775807))]
+        version: Option<u64>,
+        /// Print a versioned JSON preview without writing files.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Generate a typed resource, application port/use cases and PostgreSQL migration.
+    Resource {
+        /// Resource name in PascalCase (e.g., Project, UserAccount).
+        name: String,
+        /// Comma-separated field definitions: name:type (string, text, uuid, bool, enum).
+        #[arg(long)]
+        fields: String,
+        /// Generate a global resource without tenant isolation.
+        #[arg(long, conflicts_with = "tenant_scoped")]
+        global: bool,
+        /// Explicitly generate tenant-scoped storage (the default).
+        #[arg(long)]
+        tenant_scoped: bool,
+        /// Stable SQLx migration version. Supply this for reproducible previews and output.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=9223372036854775807))]
+        version: Option<u64>,
+        /// Print a versioned JSON preview without writing files.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Generate an HTML page, escaped renderer and GET route registration.
+    Page {
+        /// PascalCase page name (e.g., Home, UserProfile).
+        name: String,
+        /// Print a versioned JSON preview without writing files.
+        #[arg(long)]
+        dry_run: bool,
     },
 }

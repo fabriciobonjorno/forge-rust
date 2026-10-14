@@ -1,0 +1,27 @@
+-- Forge tenant registry and explicit tenant ownership.
+CREATE TABLE forge_tenants (
+    id uuid PRIMARY KEY,
+    name text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CHECK (char_length(name) BETWEEN 1 AND 200),
+    CHECK (name = btrim(name)),
+    CHECK (name !~ '[[:cntrl:]]')
+);
+
+CREATE UNIQUE INDEX forge_tenants_name_unique
+ON forge_tenants (lower(name));
+
+ALTER TABLE forge_tenant_memberships
+    ADD CONSTRAINT forge_tenant_memberships_tenant_fk
+    FOREIGN KEY (tenant_id) REFERENCES forge_tenants(id) ON DELETE RESTRICT;
+
+REVOKE ALL ON TABLE forge_tenants FROM PUBLIC;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+        REVOKE ALL ON TABLE forge_tenants FROM app_runtime;
+    END IF;
+END
+$$;

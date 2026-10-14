@@ -25,6 +25,10 @@ Binary commands: `serve` (default), `healthcheck`, `version`, `help`.
 
 Configuration uses `FORGE_*` environment variables; unknown `FORGE_*` keys are
 rejected at startup. Run `cargo run -- help` for the full list.
+Forwarded client addresses are ignored by default. Behind a reverse proxy, set
+`FORGE_TRUSTED_PROXIES` to the proxy's exact IP or narrow CIDR only when it
+sanitizes/appends `X-Forwarded-For`; never trust a client-controlled forwarding
+header by itself.
 
 ## Container
 

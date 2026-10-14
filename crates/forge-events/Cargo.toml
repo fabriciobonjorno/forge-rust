@@ -1,0 +1,23 @@
+[package]
+name = "forge-events"
+description = "Event outbox and consumer contracts for Forge applications"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+forge-core = { path = "../forge-core" }
+forge-db = { path = "../forge-db" }
+forge-jobs = { path = "../forge-jobs" }
+forge-tenancy = { path = "../forge-tenancy" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

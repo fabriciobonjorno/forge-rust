@@ -1,0 +1,25 @@
+-- Shared PostgreSQL fixed-window state for login-attempt throttling.
+-- Only fixed-width digests are stored, never login identifiers or IP addresses.
+
+CREATE TABLE forge_login_attempt_buckets (
+    scope smallint NOT NULL CHECK (scope IN (1, 2)),
+    key_digest bytea NOT NULL CHECK (octet_length(key_digest) = 32),
+    window_started_at timestamptz NOT NULL,
+    attempt_count integer NOT NULL CHECK (attempt_count > 0),
+    PRIMARY KEY (scope, key_digest)
+);
+
+CREATE INDEX forge_login_attempt_buckets_expiry_idx
+ON forge_login_attempt_buckets (window_started_at);
+
+REVOKE ALL ON TABLE forge_login_attempt_buckets FROM PUBLIC;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+        REVOKE ALL ON TABLE forge_login_attempt_buckets FROM app_runtime;
+        GRANT SELECT, INSERT, UPDATE, DELETE
+            ON TABLE forge_login_attempt_buckets TO app_runtime;
+    END IF;
+END
+$$;
