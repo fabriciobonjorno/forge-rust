@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use forge_config::{AppConfig, Environment, SecretString};
+use forge_config::{AppConfig, ConfigError, Environment, SecretString};
 use forge_http::{RouteError, Router, Server, ServerError};
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -20,12 +20,15 @@ use tracing::{error, info};
 
 use crate::{
     cli::{self, Command},
+    compose::{ComposeError, ComposeHook, Composition},
+    database::{DatabaseHandle, Declaration, MigrationCommand, UrlPurpose, register_health},
     logging, probe, signal,
 };
 
 /// `sysexits.h` `EX_USAGE`-style code for an invalid command line.
 const EXIT_USAGE: u8 = 2;
-/// `sysexits.h` `EX_CONFIG`: the configuration is invalid.
+/// `sysexits.h` `EX_CONFIG`: the configuration is invalid (including a
+/// database URL that does not match the declared backend).
 const EXIT_CONFIG: u8 = 78;
 /// Upper bound for runtime teardown after the server has already drained.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -49,6 +52,8 @@ pub struct App {
     registrations: Vec<RouteRegistration>,
     migrate: Option<DatabaseCommandHandler>,
     rollback: Option<DatabaseCommandHandler>,
+    declarations: Vec<Declaration>,
+    compose_hooks: Vec<ComposeHook>,
 }
 
 impl fmt::Debug for App {
@@ -59,6 +64,14 @@ impl fmt::Debug for App {
             .field("version", &self.version)
             .field("route_registrations", &self.registrations.len())
             .field("database_migrations", &self.migrate.is_some())
+            .field(
+                "declared_databases",
+                &self
+                    .declarations
+                    .iter()
+                    .map(Declaration::method)
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -75,6 +88,8 @@ impl App {
             registrations: Vec::new(),
             migrate: None,
             rollback: None,
+            declarations: Vec::new(),
+            compose_hooks: Vec::new(),
         }
     }
 
@@ -135,24 +150,92 @@ impl App {
         self
     }
 
+    /// Declares PostgreSQL as the application's database, with its embedded
+    /// migrations (`sqlx::migrate!()`).
+    ///
+    /// The declaration makes `FORGE_DATABASE_URL` (`postgres://` or
+    /// `postgresql://`) mandatory for `serve`, creates a lazily connecting
+    /// pool that [`Composition::postgres`] hands to [`App::compose`] hooks,
+    /// makes `/health/ready` ping the database, and runs `migrate` and
+    /// `rollback` with `FORGE_MIGRATION_DATABASE_URL`. A URL for another
+    /// engine fails startup with exit code 78. Declaring two backends exits
+    /// with code 1. Takes precedence over [`App::migrations`].
+    #[cfg(feature = "postgres")]
+    #[must_use]
+    pub fn postgres(mut self, migrator: forge_db::Migrator) -> Self {
+        self.declarations.push(Declaration::Postgres(migrator));
+        self
+    }
+
+    /// Declares MySQL 8.4+ or MariaDB 11.4+ as the application's database.
+    ///
+    /// Behaves like [`App::postgres`] with `mysql://` or `mariadb://` URLs and
+    /// [`Composition::mysql`].
+    #[cfg(feature = "mysql")]
+    #[must_use]
+    pub fn mysql(mut self, migrator: forge_db::Migrator) -> Self {
+        self.declarations.push(Declaration::MySql(migrator));
+        self
+    }
+
+    /// Declares SQLite as the application's database.
+    ///
+    /// Behaves like [`App::postgres`] with `sqlite:` URLs and
+    /// [`Composition::sqlite`]; SQLite has no separate migration role, so
+    /// `FORGE_MIGRATION_DATABASE_URL` normally points at the same file.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn sqlite(mut self, migrator: forge_db::Migrator) -> Self {
+        self.declarations.push(Declaration::Sqlite(migrator));
+        self
+    }
+
+    /// Registers a composition hook that wires adapters and routes with the
+    /// declared database.
+    ///
+    /// Hooks run in registration order inside the Tokio runtime, after the
+    /// standard health routes and the [`App::routes`] registrations and before
+    /// the server accepts connections. A [`ComposeError`] aborts startup with
+    /// exit code 1.
+    #[must_use]
+    pub fn compose(
+        mut self,
+        hook: impl FnOnce(&mut Composition<'_>) -> Result<(), ComposeError> + Send + 'static,
+    ) -> Self {
+        self.compose_hooks.push(Box::new(hook));
+        self
+    }
+
     /// Parses process arguments, runs the selected command and returns the
     /// process exit code.
     ///
     /// Commands: serve (default), healthcheck, migrate, rollback, version
     /// (--version, -V) and help (--help, -h). Exit codes: 0 success, 1 runtime
-    /// failure or unhealthy probe, `2` invalid command line, `78` invalid
-    /// configuration.
+    /// failure, unhealthy probe or an invalid application declaration (more
+    /// than one database backend), `2` invalid command line, `78` invalid
+    /// configuration (including a database URL that does not match the
+    /// declared backend).
     #[must_use]
     pub fn run(self) -> ExitCode {
-        self.run_with_args(std::env::args_os().skip(1))
+        self.run_with(std::env::args_os().skip(1), AppConfig::from_env)
     }
 
-    fn run_with_args(self, args: impl IntoIterator<Item = OsString>) -> ExitCode {
+    /// Runs with an explicit command line and configuration source so tests
+    /// need no process environment.
+    fn run_with(
+        self,
+        args: impl IntoIterator<Item = OsString>,
+        load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
+    ) -> ExitCode {
         match cli::parse(args) {
-            Ok(Command::Serve) => self.serve(),
+            Ok(Command::Serve) => self.checked(|app| app.serve(load_config)),
             Ok(Command::Healthcheck) => healthcheck(),
-            Ok(Command::Migrate) => self.run_database_command(DatabaseCommand::Migrate),
-            Ok(Command::Rollback) => self.run_database_command(DatabaseCommand::Rollback),
+            Ok(Command::Migrate) => {
+                self.checked(|app| app.run_database_command(DatabaseCommand::Migrate, load_config))
+            }
+            Ok(Command::Rollback) => {
+                self.checked(|app| app.run_database_command(DatabaseCommand::Rollback, load_config))
+            }
             Ok(Command::Version) => write_stdout(&format!("{} {}\n", self.name, self.version)),
             Ok(Command::Help) => write_stdout(&cli::usage(self.name)),
             Err(error) => {
@@ -162,29 +245,45 @@ impl App {
         }
     }
 
-    fn serve(self) -> ExitCode {
+    /// Rejects an application that declared more than one database backend.
+    fn checked(self, run: impl FnOnce(Self) -> ExitCode) -> ExitCode {
+        if self.declarations.len() > 1 {
+            let methods: Vec<_> = self.declarations.iter().map(Declaration::method).collect();
+            write_stderr(&format!(
+                "error: the application declared more than one database backend ({}); declare exactly one\n",
+                methods.join(", ")
+            ));
+            return ExitCode::FAILURE;
+        }
+        run(self)
+    }
+
+    fn serve(self, load_config: impl FnOnce() -> Result<AppConfig, ConfigError>) -> ExitCode {
         let Self {
             name,
             version,
             registrations,
             migrate: _,
             rollback: _,
+            mut declarations,
+            compose_hooks,
         } = self;
+        let declaration = declarations.pop();
 
-        let config = match AppConfig::from_env() {
+        let config = match load_config() {
             Ok(config) => config,
             Err(error) => return config_error(&error),
         };
         if let Err(error) = logging::init(&config.log) {
             return config_error(&error);
         }
-
-        let router = match build_router(registrations) {
-            Ok(router) => router,
-            Err(error) => {
-                error!(app = name, error = %ErrorChain(&error), "failed to register routes");
-                return ExitCode::FAILURE;
-            }
+        let url = match declaration
+            .as_ref()
+            .map(|declaration| declaration.validate(&config.database, UrlPurpose::Runtime))
+            .transpose()
+        {
+            Ok(url) => url,
+            Err(error) => return config_error(&error),
         };
 
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -198,7 +297,24 @@ impl App {
             }
         };
 
-        let result = runtime.block_on(serve_until_signal(name, version, config, router));
+        // SQLx pools and the adapters composed around them need a Tokio
+        // context even before the first request arrives.
+        let composed = {
+            let _guard = runtime.enter();
+            compose(
+                name,
+                &config,
+                registrations,
+                compose_hooks,
+                declaration.zip(url),
+            )
+        };
+        let (router, database) = match composed {
+            Ok(composed) => composed,
+            Err(code) => return code,
+        };
+
+        let result = runtime.block_on(serve_until_signal(name, version, config, router, database));
         runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
         match result {
@@ -212,8 +328,13 @@ impl App {
             }
         }
     }
-    fn run_database_command(self, command: DatabaseCommand) -> ExitCode {
-        let config = match AppConfig::from_env() {
+
+    fn run_database_command(
+        mut self,
+        command: DatabaseCommand,
+        load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
+    ) -> ExitCode {
+        let config = match load_config() {
             Ok(config) => config,
             Err(error) => return config_error(&error),
         };
@@ -221,18 +342,23 @@ impl App {
             return config_error(&error);
         }
 
-        let Some(url) = config.database.migration_url else {
-            write_stderr("error: FORGE_MIGRATION_DATABASE_URL is required for database commands\n");
-            return ExitCode::from(EXIT_CONFIG);
-        };
-
-        let handler = match command {
-            DatabaseCommand::Migrate => self.migrate,
-            DatabaseCommand::Rollback => self.rollback,
-        };
-        let Some(handler) = handler else {
-            write_stderr("error: database migrations are not configured for this application\n");
-            return ExitCode::FAILURE;
+        let declaration = self.declarations.pop();
+        let url = match &declaration {
+            Some(declaration) => {
+                match declaration.validate(&config.database, UrlPurpose::Migration) {
+                    Ok(url) => url.clone(),
+                    Err(error) => return config_error(&error),
+                }
+            }
+            None => {
+                let Some(url) = &config.database.migration_url else {
+                    write_stderr(
+                        "error: FORGE_MIGRATION_DATABASE_URL is required for database commands\n",
+                    );
+                    return ExitCode::from(EXIT_CONFIG);
+                };
+                url.clone()
+            }
         };
 
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -244,6 +370,27 @@ impl App {
                 error!(app = self.name, error = %ErrorChain(&error), "failed to start async runtime");
                 return ExitCode::FAILURE;
             }
+        };
+
+        if let Some(declaration) = declaration {
+            let migration = match command {
+                DatabaseCommand::Migrate => MigrationCommand::Migrate,
+                DatabaseCommand::Rollback => MigrationCommand::Rollback,
+            };
+            let code =
+                runtime.block_on(declaration.run_migration_command(self.name, &url, migration));
+            runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+            return code;
+        }
+
+        // Applications written before `App::postgres`: their own handlers.
+        let handler = match command {
+            DatabaseCommand::Migrate => self.migrate,
+            DatabaseCommand::Rollback => self.rollback,
+        };
+        let Some(handler) = handler else {
+            write_stderr("error: database migrations are not configured for this application\n");
+            return ExitCode::FAILURE;
         };
 
         let result = runtime.block_on(handler(url));
@@ -263,6 +410,44 @@ impl App {
     }
 }
 
+/// Builds the route table and the declared database pool, then runs the
+/// composition hooks. Must run inside the Tokio runtime context.
+fn compose(
+    name: &'static str,
+    config: &AppConfig,
+    registrations: Vec<RouteRegistration>,
+    hooks: Vec<ComposeHook>,
+    declared: Option<(Declaration, &forge_config::SecretString)>,
+) -> Result<(Router, Option<DatabaseHandle>), ExitCode> {
+    let database = match declared {
+        Some((declaration, url)) => match declaration.connect_lazy(url) {
+            Ok(database) => Some(database),
+            Err(error) => {
+                error!(app = name, error = %ErrorChain(&error), "failed to create the database pool");
+                return Err(ExitCode::FAILURE);
+            }
+        },
+        None => None,
+    };
+    let mut router = match build_router(registrations, database.clone()) {
+        Ok(router) => router,
+        Err(error) => {
+            error!(app = name, error = %ErrorChain(&error), "failed to register routes");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    if !hooks.is_empty() {
+        let mut composition = Composition::new(&mut router, config, database.clone());
+        for hook in hooks {
+            if let Err(error) = hook(&mut composition) {
+                error!(app = name, error = %ErrorChain(&error), "composition hook failed");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+    Ok((router, database))
+}
+
 #[derive(Clone, Copy)]
 enum DatabaseCommand {
     Migrate,
@@ -280,9 +465,12 @@ impl DatabaseCommand {
 
 /// Builds the route table: framework health routes first, then the
 /// application's registrations in order.
-fn build_router(registrations: Vec<RouteRegistration>) -> Result<Router, RouteError> {
+fn build_router(
+    registrations: Vec<RouteRegistration>,
+    database: Option<DatabaseHandle>,
+) -> Result<Router, RouteError> {
     let mut router = Router::new();
-    router.standard_health_routes()?;
+    register_health(&mut router, database)?;
     for register in registrations {
         register(&mut router)?;
     }
@@ -305,6 +493,20 @@ enum ServeError {
 }
 
 async fn serve_until_signal(
+    name: &'static str,
+    version: &'static str,
+    config: AppConfig,
+    router: Router,
+    database: Option<DatabaseHandle>,
+) -> Result<(), ServeError> {
+    let result = serve(name, version, config, router).await;
+    if let Some(database) = database {
+        database.close().await;
+    }
+    result
+}
+
+async fn serve(
     name: &'static str,
     version: &'static str,
     config: AppConfig,
@@ -392,7 +594,7 @@ fn write_stderr(text: &str) {
 }
 
 /// Displays an error followed by each of its sources, separated by `: `.
-struct ErrorChain<'a>(&'a (dyn Error + 'static));
+pub(crate) struct ErrorChain<'a>(pub(crate) &'a (dyn Error + 'static));
 
 impl fmt::Display for ErrorChain<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -412,6 +614,17 @@ mod tests {
 
     use super::*;
 
+    fn no_config() -> Result<AppConfig, ConfigError> {
+        Ok(AppConfig::default())
+    }
+
+    fn config_with(vars: &[(&str, &str)]) -> Result<AppConfig, ConfigError> {
+        AppConfig::from_vars(
+            vars.iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        )
+    }
+
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
     }
@@ -427,7 +640,7 @@ mod tests {
     #[test]
     fn informational_commands_succeed() {
         for command in ["--version", "-V", "version", "--help", "-h", "help"] {
-            let code = App::new("demo").run_with_args(args(&[command]));
+            let code = App::new("demo").run_with(args(&[command]), no_config);
             assert_eq!(code, ExitCode::SUCCESS, "{command}");
         }
     }
@@ -445,7 +658,7 @@ mod tests {
 
     #[test]
     fn invalid_command_line_exits_with_usage_code() {
-        let code = App::new("demo").run_with_args(args(&["frobnicate"]));
+        let code = App::new("demo").run_with(args(&["frobnicate"]), no_config);
 
         assert_eq!(code, ExitCode::from(EXIT_USAGE));
     }
@@ -466,7 +679,7 @@ mod tests {
                 Ok(())
             });
 
-        let router = build_router(app.registrations).expect("routes must register");
+        let router = build_router(app.registrations, None).expect("routes must register");
         let debug = format!("{router:?}");
 
         for route in [
@@ -491,7 +704,7 @@ mod tests {
     fn function_items_can_register_routes() {
         let app = App::new("demo").routes(register_index);
 
-        let router = build_router(app.registrations).expect("routes must register");
+        let router = build_router(app.registrations, None).expect("routes must register");
 
         assert!(format!("{router:?}").contains("\"GET /\""));
     }
@@ -505,7 +718,7 @@ mod tests {
             Ok(())
         });
 
-        let error = build_router(app.registrations).expect_err("duplicate must be rejected");
+        let error = build_router(app.registrations, None).expect_err("duplicate must be rejected");
 
         assert!(matches!(error, RouteError::Duplicate { .. }));
     }
@@ -521,5 +734,255 @@ mod tests {
             ErrorChain(&error).to_string(),
             "failed to bind HTTP listener on 127.0.0.1:1: address in use"
         );
+    }
+
+    #[cfg(all(feature = "postgres", feature = "mysql"))]
+    #[test]
+    fn declaring_two_backends_exits_with_failure_before_touching_configuration() {
+        let migrator = || forge_db::Migrator::DEFAULT;
+        for command in ["serve", "migrate", "rollback"] {
+            let app = App::new("demo").postgres(migrator()).mysql(migrator());
+            let code = app.run_with(args(&[command]), || {
+                Err(ConfigError::NotUnicode { key: "FORGE_BIND" })
+            });
+            assert_eq!(code, ExitCode::FAILURE, "{command}");
+        }
+        // Informational commands do not care.
+        let app = App::new("demo").postgres(migrator()).mysql(migrator());
+        assert_eq!(
+            app.run_with(args(&["--version"]), no_config),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn a_url_for_another_engine_is_a_configuration_error_that_never_echoes_it() {
+        let config = config_with(&[
+            (
+                "FORGE_DATABASE_URL",
+                "mysql://user:hunter2@db.example.test/app",
+            ),
+            ("FORGE_MIGRATION_DATABASE_URL", "sqlite:secret.db"),
+        ])
+        .expect("both URLs are supported schemes");
+        let declaration = Declaration::Postgres(forge_db::Migrator::DEFAULT);
+
+        for purpose in [UrlPurpose::Runtime, UrlPurpose::Migration] {
+            let error = declaration
+                .validate(&config.database, purpose)
+                .expect_err("scheme must not match");
+            let message = error.to_string();
+            assert!(
+                message.contains("postgres:// or postgresql://"),
+                "{message}"
+            );
+            assert!(message.contains("App::postgres"), "{message}");
+            assert!(!message.contains("hunter2") && !message.contains("secret.db"));
+        }
+
+        let missing = declaration
+            .validate(&AppConfig::default().database, UrlPurpose::Runtime)
+            .expect_err("URL is required");
+        assert_eq!(
+            missing.to_string(),
+            "FORGE_DATABASE_URL is required by App::postgres"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn a_mismatched_url_exits_with_the_configuration_code() {
+        let vars = [("FORGE_DATABASE_URL", "mysql://u:p@h/app")];
+        let app = App::new("demo").postgres(forge_db::Migrator::DEFAULT);
+        assert_eq!(
+            app.run_with(args(&["serve"]), || config_with(&vars)),
+            ExitCode::from(EXIT_CONFIG)
+        );
+        let vars = [("FORGE_MIGRATION_DATABASE_URL", "mariadb://u:p@h/app")];
+        let app = App::new("demo").postgres(forge_db::Migrator::DEFAULT);
+        assert_eq!(
+            app.run_with(args(&["migrate"]), || config_with(&vars)),
+            ExitCode::from(EXIT_CONFIG)
+        );
+        let app = App::new("demo").postgres(forge_db::Migrator::DEFAULT);
+        assert_eq!(
+            app.run_with(args(&["rollback"]), no_config),
+            ExitCode::from(EXIT_CONFIG)
+        );
+    }
+
+    #[test]
+    fn legacy_migration_handlers_still_run_without_a_declaration() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let app = App::new("demo").migrations(
+            move |_url| {
+                let flag = Arc::clone(&flag);
+                async move {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok::<(), io::Error>(())
+                }
+            },
+            |_url| async { Ok::<(), io::Error>(()) },
+        );
+        let vars = [("FORGE_MIGRATION_DATABASE_URL", "postgres://u:p@h/app")];
+
+        let code = app.run_with(args(&["migrate"]), || config_with(&vars));
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[cfg(feature = "sqlite")]
+    mod sqlite {
+        use forge_http::{HeaderMap, Request, Uri};
+
+        use super::*;
+
+        fn migrations() -> forge_db::Migrator {
+            sqlx::migrate!("tests/migrations/sqlite")
+        }
+
+        fn url(directory: &tempfile::TempDir) -> String {
+            format!(
+                "sqlite://{}?mode=rwc",
+                directory.path().join("app.db").display()
+            )
+        }
+
+        async fn table_exists(url: &str) -> bool {
+            let database = forge_db::SqliteDatabase::connect(&SecretString::new(url))
+                .await
+                .expect("connect");
+            let exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'notes'",
+            )
+            .fetch_one(database.pool())
+            .await
+            .expect("query")
+                == 1;
+            database.close().await;
+            exists
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn migrate_and_rollback_commands_use_the_declared_backend() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let url = url(&directory);
+            let run = |command: &'static str| {
+                let url = url.clone();
+                tokio::task::spawn_blocking(move || {
+                    App::new("demo")
+                        .sqlite(migrations())
+                        .run_with(args(&[command]), || {
+                            config_with(&[("FORGE_MIGRATION_DATABASE_URL", url.as_str())])
+                        })
+                })
+            };
+
+            assert_eq!(run("migrate").await.expect("join"), ExitCode::SUCCESS);
+            assert!(table_exists(&url).await);
+            assert_eq!(run("migrate").await.expect("join"), ExitCode::SUCCESS);
+            assert_eq!(run("rollback").await.expect("join"), ExitCode::SUCCESS);
+            assert!(!table_exists(&url).await);
+            assert_eq!(run("rollback").await.expect("join"), ExitCode::SUCCESS);
+        }
+
+        fn request(path: &str) -> Request {
+            Request::new_for_test(
+                Method::GET,
+                path.parse::<Uri>().expect("uri"),
+                HeaderMap::new(),
+                bytes::Bytes::new(),
+                "127.0.0.1:1".parse().expect("address"),
+                uuid::Uuid::now_v7(),
+            )
+        }
+
+        #[tokio::test]
+        async fn readiness_pings_the_declared_database() {
+            let database = forge_db::SqliteDatabase::connect(&SecretString::new("sqlite::memory:"))
+                .await
+                .expect("memory database");
+            let router = build_router(Vec::new(), Some(DatabaseHandle::Sqlite(database.clone())))
+                .expect("routes");
+
+            for path in ["/health", "/health/live", "/health/ready"] {
+                let response = router.dispatch(request(path)).await;
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                assert_eq!(response.headers()["content-type"], "application/json");
+            }
+            let ready = router.dispatch(request("/health/ready")).await;
+            assert_eq!(ready.body(), r#"{"status":"ready"}"#);
+
+            database.close().await;
+            let down = router.dispatch(request("/health/ready")).await;
+            assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                down.body(),
+                r#"{"status":"unavailable","checks":{"database":"unavailable"}}"#
+            );
+            // Liveness never depends on the database.
+            let live = router.dispatch(request("/health/live")).await;
+            assert_eq!(live.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn composition_receives_only_the_declared_database() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let config =
+                config_with(&[("FORGE_DATABASE_URL", url(&directory).as_str())]).expect("config");
+            let url = config.database.url.as_ref().expect("url");
+
+            let hook: ComposeHook = Box::new(|composition| {
+                composition.sqlite()?;
+                #[cfg(feature = "postgres")]
+                assert!(matches!(
+                    composition.postgres(),
+                    Err(ComposeError::DatabaseNotDeclared {
+                        requested: "postgres"
+                    })
+                ));
+                composition
+                    .router()
+                    .route(Method::GET, "/composed", |_| async {
+                        Response::empty(StatusCode::NO_CONTENT)
+                    })?;
+                Ok(())
+            });
+            let (router, database) = compose(
+                "demo",
+                &config,
+                Vec::new(),
+                vec![hook],
+                Some((Declaration::Sqlite(forge_db::Migrator::DEFAULT), url)),
+            )
+            .expect("composition succeeds");
+            assert!(format!("{router:?}").contains("GET /composed"));
+            database.expect("pool was created").close().await;
+
+            // A hook asking for an undeclared backend aborts startup.
+            #[cfg(feature = "postgres")]
+            {
+                let hook: ComposeHook = Box::new(|composition| {
+                    composition.postgres()?;
+                    Ok(())
+                });
+                let outcome = compose(
+                    "demo",
+                    &config,
+                    Vec::new(),
+                    vec![hook],
+                    Some((Declaration::Sqlite(forge_db::Migrator::DEFAULT), url)),
+                );
+                assert_eq!(outcome.err(), Some(ExitCode::FAILURE));
+            }
+        }
     }
 }

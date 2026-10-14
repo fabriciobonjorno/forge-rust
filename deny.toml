@@ -39,6 +39,14 @@ confidence-threshold = 0.93
 # The list states policy; a license need not be in use to be acceptable.
 unused-allowed-license = "allow"
 
+# Scoped exceptions: a license accepted for one crate only, with its reason.
+[[licenses.exceptions]]
+# Mozilla's CA root bundle used by SQLx's rustls TLS (`tls-rustls-ring-webpki`).
+# CDLA-Permissive-2.0 is a permissive data license (no copyleft); keep its text
+# with binary distributions. Reviewed 2026-10-14; revisit if the bundle changes.
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 # Duplicate versions are reviewed (docs/dependency-policy.md), not auto-failed.
 multiple-versions = "warn"

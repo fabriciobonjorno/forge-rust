@@ -3,7 +3,9 @@
 //! Environment access is isolated at the process boundary. Application code
 //! receives a validated [`AppConfig`] and never needs to parse ad-hoc strings.
 
-use std::{collections::HashMap, ffi::OsString, net::SocketAddr, str::FromStr, time::Duration};
+use std::{
+    collections::HashMap, ffi::OsString, fmt, net::SocketAddr, str::FromStr, time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +16,9 @@ const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 15;
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 const DEFAULT_LOG_FILTER: &str = "info";
+const REDACTED: &str = "[REDACTED]";
+const DATABASE_URL_CONTRACT: &str =
+    "a connection URL starting with postgres://, postgresql://, mysql://, mariadb:// or sqlite:";
 
 /// Prefix reserved for Forge configuration keys.
 ///
@@ -152,6 +157,74 @@ impl Default for LogConfig {
     }
 }
 
+/// The database engine a connection URL selects.
+///
+/// `FORGE_DATABASE_URL` and `FORGE_MIGRATION_DATABASE_URL` accept
+/// `postgres://` and `postgresql://` (PostgreSQL), `mysql://` and
+/// `mariadb://` (MySQL 8.4+ and MariaDB 11.4+, one wire protocol and one
+/// backend) and `sqlite:` (a file path, `sqlite::memory:` or a `sqlite://`
+/// URL). The scheme is matched case-insensitively.
+///
+/// ```
+/// use forge_config::DatabaseScheme;
+///
+/// assert_eq!(DatabaseScheme::of_url("postgresql://db/app"), Some(DatabaseScheme::Postgres));
+/// assert_eq!(DatabaseScheme::of_url("mariadb://db/app"), Some(DatabaseScheme::MySql));
+/// assert_eq!(DatabaseScheme::of_url("sqlite::memory:"), Some(DatabaseScheme::Sqlite));
+/// assert_eq!(DatabaseScheme::of_url("redis://cache"), None);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DatabaseScheme {
+    /// PostgreSQL: `postgres://` or `postgresql://`.
+    Postgres,
+    /// MySQL or MariaDB: `mysql://` or `mariadb://`.
+    MySql,
+    /// SQLite: `sqlite:`.
+    Sqlite,
+}
+
+impl DatabaseScheme {
+    /// Returns the engine selected by the scheme of `url`, or `None` when the
+    /// scheme is missing or not supported. The URL is only inspected up to its
+    /// first `:`, so no part of it can leak through this function.
+    #[must_use]
+    pub fn of_url(url: &str) -> Option<Self> {
+        let (scheme, _) = url.trim_start().split_once(':')?;
+        match scheme.to_ascii_lowercase().as_str() {
+            "postgres" | "postgresql" => Some(Self::Postgres),
+            "mysql" | "mariadb" => Some(Self::MySql),
+            "sqlite" => Some(Self::Sqlite),
+            _ => None,
+        }
+    }
+
+    /// Human-readable engine name, e.g. for log lines and diagnostics.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Postgres => "PostgreSQL",
+            Self::MySql => "MySQL/MariaDB",
+            Self::Sqlite => "SQLite",
+        }
+    }
+
+    /// The URL schemes that select this engine, formatted for messages.
+    #[must_use]
+    pub const fn accepted_schemes(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres:// or postgresql://",
+            Self::MySql => "mysql:// or mariadb://",
+            Self::Sqlite => "sqlite:",
+        }
+    }
+}
+
+impl fmt::Display for DatabaseScheme {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
 /// A secret configuration value.
 ///
 /// Debug and serialization are deliberately redacted so credentials cannot be
@@ -193,10 +266,29 @@ impl Serialize for SecretString {
 /// Database settings after validation.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DatabaseConfig {
-    /// Least-privilege PostgreSQL runtime URL. Optional for database-free apps.
+    /// Least-privilege runtime URL (PostgreSQL, MySQL/MariaDB or SQLite).
+    /// Optional for database-free apps.
     pub url: Option<SecretString>,
-    /// Privileged PostgreSQL URL used only by migrate/rollback commands.
+    /// Privileged URL used only by migrate/rollback commands.
     pub migration_url: Option<SecretString>,
+}
+
+impl DatabaseConfig {
+    /// The engine selected by the runtime URL, if one is configured.
+    #[must_use]
+    pub fn scheme(&self) -> Option<DatabaseScheme> {
+        self.url
+            .as_ref()
+            .and_then(|url| DatabaseScheme::of_url(url.expose()))
+    }
+
+    /// The engine selected by the migration URL, if one is configured.
+    #[must_use]
+    pub fn migration_scheme(&self) -> Option<DatabaseScheme> {
+        self.migration_url
+            .as_ref()
+            .and_then(|url| DatabaseScheme::of_url(url.expose()))
+    }
 }
 
 /// Complete process configuration.
@@ -342,7 +434,15 @@ fn parse_secret_url(key: &'static str, value: String) -> Result<SecretString, Co
         return Err(ConfigError::InvalidValue {
             key,
             value,
-            expected: "a non-empty PostgreSQL connection URL",
+            expected: DATABASE_URL_CONTRACT,
+        });
+    }
+    if DatabaseScheme::of_url(trimmed).is_none() {
+        // The rejected value is a credential-bearing URL: never echo it.
+        return Err(ConfigError::InvalidValue {
+            key,
+            value: REDACTED.to_owned(),
+            expected: DATABASE_URL_CONTRACT,
         });
     }
     Ok(SecretString::new(trimmed))
@@ -639,6 +739,62 @@ mod tests {
                 ConfigError::InvalidValue { key: actual, .. } if actual == key
             ));
         }
+    }
+
+    #[test]
+    fn database_url_schemes_select_the_engine() {
+        let cases = [
+            ("postgres://u:p@h/db", DatabaseScheme::Postgres),
+            ("postgresql://u:p@h/db", DatabaseScheme::Postgres),
+            ("POSTGRES://u:p@h/db", DatabaseScheme::Postgres),
+            ("mysql://u:p@h/db", DatabaseScheme::MySql),
+            ("mariadb://u:p@h/db", DatabaseScheme::MySql),
+            ("sqlite:data/app.db", DatabaseScheme::Sqlite),
+            ("sqlite://data/app.db?mode=rwc", DatabaseScheme::Sqlite),
+            ("sqlite::memory:", DatabaseScheme::Sqlite),
+        ];
+        for (url, expected) in cases {
+            let config = AppConfig::from_vars(vars(&[
+                ("FORGE_DATABASE_URL", url),
+                ("FORGE_MIGRATION_DATABASE_URL", url),
+            ]))
+            .expect("supported database URL must be accepted");
+            assert_eq!(config.database.scheme(), Some(expected), "{url}");
+            assert_eq!(config.database.migration_scheme(), Some(expected), "{url}");
+        }
+        assert_eq!(AppConfig::default().database.scheme(), None);
+    }
+
+    #[test]
+    fn unsupported_database_schemes_are_rejected_without_echoing_the_url() {
+        for key in ["FORGE_DATABASE_URL", "FORGE_MIGRATION_DATABASE_URL"] {
+            for url in [
+                "redis://user:hunter2@cache/0",
+                "mssql://sa:hunter2@host/db",
+                "user:hunter2@host/db",
+                "hunter2",
+            ] {
+                let error = AppConfig::from_vars(vars(&[(key, url)]))
+                    .expect_err("unsupported scheme must be rejected");
+                let rendered = format!("{error} {error:?}");
+                assert!(!rendered.contains("hunter2"), "{key}: {rendered}");
+                assert!(rendered.contains("mariadb://"), "{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn scheme_helpers_describe_each_engine() {
+        assert_eq!(
+            DatabaseScheme::MySql.accepted_schemes(),
+            "mysql:// or mariadb://"
+        );
+        assert_eq!(DatabaseScheme::Postgres.to_string(), "PostgreSQL");
+        assert_eq!(
+            DatabaseScheme::of_url("  sqlite:x"),
+            Some(DatabaseScheme::Sqlite)
+        );
+        assert_eq!(DatabaseScheme::of_url("no-scheme"), None);
     }
 
     #[test]
