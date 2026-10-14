@@ -1,5 +1,6 @@
 [package]
 name = "forge-http"
+publish = false
 description = "Forge HTTP server, routing, request limits, and lifecycle"
 version.workspace = true
 edition.workspace = true
