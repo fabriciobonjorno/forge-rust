@@ -60,7 +60,7 @@ Do not weaken architecture tests to make an implementation convenient.
 ## Database rules
 
 PostgreSQL is the default and primary backend. Owner decision (2026-10-14): like
-`rails new -d`, `forge new -d postgresql|mysql|sqlite3` selects the backend
+`rails new -d`, `forge new -d postgresql|mysql|mariadb|sqlite3` selects the backend
 (ADR 0021). PostgreSQL-only capabilities (RLS, runtime/migrator roles,
 `LISTEN/NOTIFY`) stay first-class; on other backends they are refused explicitly,
 never emulated silently, and tenant isolation is enforced by mandatory

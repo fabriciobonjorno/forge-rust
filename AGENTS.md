@@ -64,7 +64,7 @@ Do not introduce a custom ORM that hides SQL. SQLx/vendor types must not leak in
 
 Required persistence capabilities include migrations, transactions, pooling, advisory locks, optimistic locking, cursor pagination, JSONB, constraints, indexes, PostgreSQL RLS, and checked queries where practical.
 
-PostgreSQL is the default backend. The owner decided (2026-10-14) that, like `rails new -d`, `forge new -d postgresql|mysql|sqlite3` selects the backend; ADR 0021 is the capability and architecture review. PostgreSQL-only capabilities (RLS, runtime/migrator roles, `LISTEN/NOTIFY`) are refused explicitly on other backends, never emulated silently. Generated SQL never uses database UUID generators; IDs are UUIDv7 generated in Rust.
+PostgreSQL is the default backend. The owner decided (2026-10-14) that, like `rails new -d`, `forge new -d postgresql|mysql|mariadb|sqlite3` selects the backend; ADR 0021 is the capability and architecture review. PostgreSQL-only capabilities (RLS, runtime/migrator roles, `LISTEN/NOTIFY`) are refused explicitly on other backends, never emulated silently. Generated SQL never uses database UUID generators; IDs are UUIDv7 generated in Rust.
 
 ## Views
 
