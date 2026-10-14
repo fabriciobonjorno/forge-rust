@@ -16,42 +16,9 @@
 use std::{error::Error as StdError, str::FromStr};
 
 use forge_core::{ErrorCategory, ForgeError};
-use forge_http::{HeaderValue, PathParamError, Request, Response, StatusCode, header};
+use forge_http::{PathParamError, Request, Response, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::{error, warn};
-
-/// Creates a UTF-8 HTML response with an explicit content type.
-#[must_use]
-pub fn html(status: StatusCode, document: impl Into<String>) -> Response {
-    let mut response = Response::new(status, document.into());
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    response
-}
-
-/// Escapes a text value for insertion into HTML text or quoted attribute
-/// content. Generated views use this by default; trusted markup must be
-/// represented separately rather than passed through this function.
-#[must_use]
-pub fn escape_html(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        escaped.push_str(match character {
-            '&' => "&amp;",
-            '<' => "&lt;",
-            '>' => "&gt;",
-            '"' => "&quot;",
-            '\'' => "&#x27;",
-            _ => {
-                escaped.push(character);
-                continue;
-            }
-        });
-    }
-    escaped
-}
 
 /// Serializes `value` as a JSON response. Serialization failures (a bug in a
 /// `Serialize` implementation) become an empty `500` and are logged.
@@ -198,26 +165,6 @@ mod tests {
     }
 
     #[test]
-    fn html_response_sets_utf8_content_type() {
-        let response = html(StatusCode::OK, "<main>hello</main>");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()[forge_http::header::CONTENT_TYPE],
-            "text/html; charset=utf-8"
-        );
-        assert_eq!(response.body().as_ref(), b"<main>hello</main>");
-    }
-
-    #[test]
-    fn html_escaping_covers_markup_delimiters_and_preserves_unicode() {
-        assert_eq!(
-            escape_html("<script a=\"x\">é & 'hi'</script>"),
-            "&lt;script a=&quot;x&quot;&gt;é &amp; &#x27;hi&#x27;&lt;/script&gt;"
-        );
-    }
-
-    #[test]
     fn errors_use_category_status_and_hide_sources() {
         let failure = ForgeError::new(
             ErrorCategory::Infrastructure,
@@ -251,8 +198,8 @@ mod tests {
     fn decode_json_maps_malformed_bodies_to_validation() {
         #[derive(serde::Deserialize, Debug)]
         struct Input {
-            #[allow(dead_code)]
-            name: String,
+            #[serde(rename = "name")]
+            _name: String,
         }
         let req = request(forge_http::Method::POST, "/products");
 
@@ -325,17 +272,48 @@ mod tests {
         assert!(decode_query::<()>(&query_request("/p?x=1")).is_err());
     }
 
-    #[tokio::test]
-    async fn path_param_returns_missing_when_not_captured() {
+    #[test]
+    fn path_param_outside_a_dynamic_route_is_a_validation_error() {
         let id = forge_core::Id::<Paging>::new();
         let req = request(forge_http::Method::GET, &format!("/products/{id}"));
-        let response = path_param::<forge_core::Id<Paging>>(&req, "id");
 
-        // Should return Missing since path parameters aren't extracted by the simple router
-        assert!(response.is_err());
-        let failure = response.unwrap_err();
+        let failure = path_param::<forge_core::Id<Paging>>(&req, "id").expect_err("no capture");
+
         assert_eq!(failure.code(), "invalid_path_parameter");
         assert_eq!(failure.category(), ErrorCategory::Validation);
+        assert_eq!(parameter(&failure), Some("id"));
+    }
+
+    #[tokio::test]
+    async fn path_param_parses_captures_and_rejects_invalid_values() {
+        let mut router = forge_http::Router::new();
+        router
+            .route(
+                forge_http::Method::GET,
+                "/products/{id}",
+                |req: Request| async move {
+                    match path_param::<forge_core::Id<Paging>>(&req, "id") {
+                        Ok(_) => Response::empty(StatusCode::OK),
+                        Err(failure) => error(&failure),
+                    }
+                },
+            )
+            .expect("route registers");
+        let id = forge_core::Id::<Paging>::new();
+
+        let found = router
+            .dispatch(request(forge_http::Method::GET, &format!("/products/{id}")))
+            .await;
+        let invalid = router
+            .dispatch(request(forge_http::Method::GET, "/products/secret-value"))
+            .await;
+
+        assert_eq!(found.status(), StatusCode::OK);
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let rendered = body(&invalid);
+        assert_eq!(rendered["code"], "invalid_path_parameter");
+        assert_eq!(rendered["metadata"]["parameter"], "id");
+        assert!(!rendered.to_string().contains("secret-value"));
     }
 
     #[test]
