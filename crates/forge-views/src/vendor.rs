@@ -13,6 +13,15 @@ pub const STIMULUS_VERSION: &str = "3.2.2";
 pub const STIMULUS_SHA256: &str =
     "23deecdac6f36c08e8f39fbed6b27f60c850cacad3a34eb71194462b7b1647f3";
 
+/// Turbo 8.0.23 ES module build (`@hotwired/turbo`, MIT).
+pub const TURBO_JS: &str = include_str!("../vendor/turbo/turbo.js");
+
+/// Version of [`TURBO_JS`].
+pub const TURBO_VERSION: &str = "8.0.23";
+
+/// Lower-case hex SHA-256 of [`TURBO_JS`], pinned when the file was vendored.
+pub const TURBO_SHA256: &str = "b9d35d123a07614f55eaaf993f74d687a503ae41ba50ef835aafa18dbb265a13";
+
 #[cfg(test)]
 mod tests {
     use sha2::{Digest, Sha256};
